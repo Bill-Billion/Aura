@@ -1,0 +1,56 @@
+{
+  "id": "apartment_v1",
+  "name": "标准公寓",
+  "rooms": [
+    {
+      "id": "living_room",
+      "type": "living_room",
+      "model": "models/rooms/living_room.glb",
+      "position": [-4, 0, 0],
+      "rotation": [0, 0, 0],
+      "devices": {
+        "light_living_01": {
+          "anchor": [0, 2.5, 0],
+          "type": "light"
+        },
+        "ac_living_01": {
+          "anchor": [1.5, 2.2, -1],
+          "type": "hvac"
+        },
+        "curtain_living_01": {
+          "anchor": [-1, 1.5, -2],
+          "type": "curtain"
+        }
+      }
+    },
+    {
+      "id": "bedroom",
+      "type": "bedroom",
+      "model": "models/rooms/bedroom.glb",
+      "position": [4, 0, 0],
+      "rotation": [0, 0, 0],
+      "devices": {
+        "light_bedroom_01": {
+          "anchor": [0, 2.5, 0],
+          "type": "light"
+        }
+      }
+    },
+    {
+      "id": "kitchen",
+      "type": "kitchen",
+      "model": "models/rooms/kitchen.glb",
+      "position": [-4, 0, 5],
+      "rotation": [0, 0, 0],
+      "devices": {}
+    },
+    {
+      "id": "bathroom",
+      "type": "bathroom",
+      "model": "models/rooms/bathroom.glb",
+      "position": [4, 0, 5],
+      "rotation": [0, 0, 0],
+      "devices": {}
+    }
+  ]
+}
