@@ -12,7 +12,7 @@ const disconnected = computed(() => simulationStore.connectionStatus === 'discon
 
 function getWsUrl(): string {
   const proto = window.location.protocol === 'https:' ? 'wss' : 'ws'
-  return `${proto}://${window.location.host}/ws`
+  return `${proto}://${window.location.host}/ws/simulation`
 }
 
 function handleConnect() {

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
+import { TresCanvas } from '@tresjs/core'
 import { useWorldStore } from '@/stores/worldStore'
 import DeviceMesh from './DeviceMesh.vue'
 
