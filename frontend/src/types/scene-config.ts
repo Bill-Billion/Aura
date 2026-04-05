@@ -10,7 +10,7 @@ export interface DeviceAnchor {
 export interface RoomConfig {
   id: string
   type: string
-  model: string
+  model?: string
   position: Vec3
   rotation: Vec3
   devices: Record<string, DeviceAnchor>

@@ -1,55 +1,51 @@
 <script setup lang="ts">
-import { useGLTF } from '@tresjs/cientos'
 import type { RoomConfig } from '@/types/scene-config'
 import DeviceVisual from './DeviceVisual.vue'
+import RoomShell from './rooms/RoomShell.vue'
+import LivingRoomFurniture from './rooms/LivingRoomFurniture.vue'
+import BedroomFurniture from './rooms/BedroomFurniture.vue'
+import KitchenFurniture from './rooms/KitchenFurniture.vue'
+import BathroomFurniture from './rooms/BathroomFurniture.vue'
 
 const props = defineProps<{
   room: RoomConfig
 }>()
 
-let scene: any = null
-let loadError = false
+const deviceEntries = Object.entries(props.room.devices)
 
-try {
-  const { execute } = useGLTF(props.room.model, { draco: false })
-  const gltf = await execute()
-  scene = gltf.scene
-} catch {
-  loadError = true
+const roomConfigs: Record<string, { width: number; depth: number; height: number; wallColor: string; floorColor: string }> = {
+  living_room: { width: 5, depth: 5, height: 3, wallColor: '#f0ece4', floorColor: '#d4c4a8' },
+  bedroom:     { width: 5, depth: 5, height: 3, wallColor: '#eee8e0', floorColor: '#c8b898' },
+  kitchen:     { width: 4.5, depth: 4.5, height: 3, wallColor: '#f0ece4', floorColor: '#d8d0c0' },
+  bathroom:    { width: 3.5, depth: 4.5, height: 3, wallColor: '#e8e8e4', floorColor: '#c8c4bc' },
 }
 
-const deviceEntries = Object.entries(props.room.devices)
+const cfg = roomConfigs[props.room.type] ?? roomConfigs.living_room
 </script>
 
 <template>
-  <!-- Real GLB model -->
-  <primitive
-    v-if="scene"
-    :object="scene"
+  <!-- Room shell: walls, floor, ceiling -->
+  <RoomShell
     :position="room.position"
-    :rotation="room.rotation"
+    :width="cfg.width"
+    :depth="cfg.depth"
+    :height="cfg.height"
+    :wall-color="cfg.wallColor"
+    :floor-color="cfg.floorColor"
   />
 
-  <!-- Fallback: procedural room box when GLB fails to load -->
-  <template v-if="loadError">
-    <!-- Room walls -->
-    <TresMesh :position="room.position">
-      <TresBoxGeometry :args="[4, 3, 4]" />
-      <TresMeshStandardMaterial color="#3a3a5e" />
-    </TresMesh>
-    <!-- Floor -->
-    <TresMesh :position="[room.position[0], -0.05, room.position[2]]">
-      <TresBoxGeometry :args="[4, 0.1, 4]" />
-      <TresMeshStandardMaterial color="#2a2a4e" />
-    </TresMesh>
-  </template>
+  <!-- Room-type furniture -->
+  <LivingRoomFurniture v-if="room.type === 'living_room'" :position="room.position" />
+  <BedroomFurniture v-else-if="room.type === 'bedroom'" :position="room.position" />
+  <KitchenFurniture v-else-if="room.type === 'kitchen'" :position="room.position" />
+  <BathroomFurniture v-else-if="room.type === 'bathroom'" :position="room.position" />
 
   <!-- Devices at world-space anchors -->
   <DeviceVisual
-    v-for="[deviceId, cfg] in deviceEntries"
+    v-for="[deviceId, devCfg] in deviceEntries"
     :key="deviceId"
     :device-id="deviceId"
-    :anchor="[room.position[0] + cfg.anchor[0], room.position[1] + cfg.anchor[1], room.position[2] + cfg.anchor[2]]"
-    :device-type="cfg.type"
+    :anchor="[room.position[0] + devCfg.anchor[0], room.position[1] + devCfg.anchor[1], room.position[2] + devCfg.anchor[2]]"
+    :device-type="devCfg.type"
   />
 </template>

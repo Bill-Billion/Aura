@@ -20,12 +20,10 @@ const { config, loading, error } = useSceneConfig()
 
   <!-- Loaded: render rooms -->
   <template v-else-if="config">
-    <Suspense>
-      <RoomModule
-        v-for="room in config.rooms"
-        :key="room.id"
-        :room="room"
-      />
-    </Suspense>
+    <RoomModule
+      v-for="room in config.rooms"
+      :key="room.id"
+      :room="room"
+    />
   </template>
 </template>
