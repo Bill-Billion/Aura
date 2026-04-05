@@ -20,6 +20,8 @@ from backend.engine.state import (
     UserState,
     WorldState,
 )
+from backend.engine.event_bus import EventBus
+from backend.engine.simulation import SimulationEngine
 from backend.engine.state_manager import StateManager
 from backend.models.schemas import WSMessage
 
@@ -29,7 +31,9 @@ from backend.models.schemas import WSMessage
 # ---------------------------------------------------------------------------
 
 manager = ConnectionManager()
+event_bus = EventBus()
 state_manager: StateManager | None = None
+simulation_engine: SimulationEngine | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -127,10 +131,18 @@ def _init_default_state() -> StateManager:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    global state_manager
+    global state_manager, simulation_engine
     state_manager = _init_default_state()
+    simulation_engine = SimulationEngine(
+        event_bus=event_bus,
+        state_manager=state_manager,
+        connection_manager=manager,
+    )
     log.info("app_started", scene=state_manager.world.scene_id)
     yield
+    # Gracefully stop the simulation if running
+    if simulation_engine is not None:
+        await simulation_engine.stop()
     log.info("app_shutdown")
 
 
@@ -158,7 +170,7 @@ app.include_router(api_router)
 
 @app.websocket("/ws/simulation")
 async def ws_simulation(ws: WebSocket) -> None:
-    global state_manager
+    global state_manager, simulation_engine
     assert state_manager is not None
 
     full_state = state_manager.get_full_snapshot()
@@ -196,19 +208,29 @@ async def ws_simulation(ws: WebSocket) -> None:
                         )
 
             elif msg_type == "CMD_SIM_START":
-                state_manager.world.is_running = True
+                if simulation_engine is not None:
+                    await simulation_engine.start()
                 await manager.broadcast(
                     WSMessage(type="SIM_STATUS", payload={"is_running": True})
                 )
 
             elif msg_type == "CMD_SIM_PAUSE":
-                state_manager.world.is_running = False
+                if simulation_engine is not None:
+                    await simulation_engine.pause()
                 await manager.broadcast(
                     WSMessage(type="SIM_STATUS", payload={"is_running": False})
                 )
 
             elif msg_type == "CMD_SIM_RESET":
+                if simulation_engine is not None:
+                    await simulation_engine.reset()
                 state_manager = _init_default_state()
+                # Re-create the engine with the fresh state manager
+                simulation_engine = SimulationEngine(
+                    event_bus=event_bus,
+                    state_manager=state_manager,
+                    connection_manager=manager,
+                )
                 full = state_manager.get_full_snapshot()
                 await manager.broadcast(
                     WSMessage(type="STATE_FULL", payload=full)
@@ -216,6 +238,8 @@ async def ws_simulation(ws: WebSocket) -> None:
 
             elif msg_type == "CMD_SIM_SPEED":
                 speed = payload.get("speed", 1.0)
+                if simulation_engine is not None:
+                    simulation_engine.speed = float(speed)
                 state_manager.world.simulation_speed = float(speed)
                 await manager.broadcast(
                     WSMessage(
