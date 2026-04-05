@@ -1,0 +1,11 @@
+[server]
+host = "0.0.0.0"
+port = 8000
+
+[simulation]
+tick_interval = 0.1
+physics_substeps = 3
+default_speed = 1.0
+
+[scene]
+default_scene = "apartment_v1"
