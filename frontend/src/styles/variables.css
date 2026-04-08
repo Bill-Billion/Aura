@@ -1,0 +1,46 @@
+@layer base {
+  :root {
+    /* Colors */
+    --color-primary: #ffe74a;
+    --color-primary-dim: rgba(255, 231, 74, 0.6);
+    --color-primary-bg: rgba(255, 231, 74, 0.12);
+    --color-bg: #000000;
+    --color-surface: #1c2024;
+    --color-surface-elevated: #282c30;
+    --color-border: rgba(79, 79, 79, 0.4);
+    --color-border-strong: #4f4f4f;
+    --color-text-primary: #ffffff;
+    --color-text-secondary: #878787;
+    --color-text-muted: #555555;
+    --color-indicator-active: #ffe74a;
+    --color-indicator-inactive: #ffffff;
+    --color-success: #4ade80;
+    --color-danger: #ef4444;
+    --color-cool: #4FC3F7;
+    --color-heat: #EF5350;
+
+    /* Panel */
+    --panel-blur: blur(10px);
+    --panel-bg: rgba(28, 32, 36, 0.75);
+    --panel-bg-solid: #1c2024;
+    --panel-border: 1px solid rgba(79, 79, 79, 0.4);
+    --panel-radius: 8px;
+
+    /* Transitions */
+    --transition-fast: 150ms ease;
+    --transition-normal: 250ms ease;
+    --transition-slow: 400ms ease;
+
+    /* Z-index layers */
+    --z-scene: 0;
+    --z-overlay: 10;
+    --z-panel: 20;
+    --z-sidebar: 30;
+    --z-modal: 40;
+    --z-toast: 50;
+
+    /* Spacing */
+    --spacing-panel: 20px;
+    --spacing-panel-right: 24px;
+  }
+}
