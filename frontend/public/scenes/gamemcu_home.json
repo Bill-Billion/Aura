@@ -1,0 +1,72 @@
+{
+  "id": "gamemcu_home",
+  "name": "Gamemcu智能公寓",
+  "floors": [
+    {
+      "id": "F1",
+      "modelPath": "/models/F1.glb",
+      "collapsedY": 0,
+      "expandedY": 0,
+      "numLights": 3,
+      "lights": [
+        { "position": [-2, 0, -1.5], "intensity": 1 },
+        { "position": [-2, 0, 1], "intensity": 1 },
+        { "position": [-1, 0, 4], "intensity": 1 }
+      ],
+      "deviceMap": {}
+    },
+    {
+      "id": "F2",
+      "modelPath": "/models/F2.glb",
+      "collapsedY": 7,
+      "expandedY": 18,
+      "numLights": 2,
+      "lights": [
+        { "position": [-4, 0, -1.5], "intensity": 1 },
+        { "position": [3, 0, -2.5], "intensity": 1 }
+      ],
+      "deviceMap": {}
+    },
+    {
+      "id": "F3",
+      "modelPath": "/models/F3.glb",
+      "collapsedY": 13,
+      "expandedY": 35,
+      "numLights": 2,
+      "lights": [
+        { "position": [-1, 0, 3], "intensity": 1 },
+        { "position": [3, 0, -2.5], "intensity": 1 }
+      ],
+      "deviceMap": {}
+    }
+  ],
+  "camera": {
+    "overview": {
+      "springLength": 120,
+      "lookAt": [-4.66, 6.44, 1.87],
+      "theta": 2.38,
+      "phi": 1.25,
+      "fov": 12
+    },
+    "floorFocus": {
+      "springLength": 60.7,
+      "lookAt": [0, 0, 0],
+      "theta": 2.35,
+      "phi": 0.84,
+      "smoothing": 4,
+      "rotateSmoothing": 4
+    },
+    "floorOffset": [-1.63, 1.62, -0.03]
+  },
+  "textures": {
+    "matcapRoughness": "/textures/matcap_roughness_3.png",
+    "matcapReflection": "/textures/matcap_reflection.png",
+    "hdr": "/textures/roomhdr_blue.hdr"
+  },
+  "lightsInfo": {
+    "smoothMin": -2,
+    "smoothMax": 2,
+    "cornerRadius": 0.2
+  },
+  "lightSize": [3, 2, 1.5]
+}
