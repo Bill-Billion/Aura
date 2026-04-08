@@ -8,92 +8,147 @@ const simulationStore = useSimulationStore()
 
 const timeOfDay = computed(() => worldStore.environment.time_of_day)
 const outdoorTemp = computed(() => worldStore.environment.outdoor_temp)
-const tickCount = computed(() => worldStore.simulationTick)
+const humidity = computed(() => worldStore.environment.outdoor_humidity)
+const weather = computed(() => worldStore.environment.weather)
 const isRunning = computed(() => simulationStore.isRunning)
+const tickCount = computed(() => worldStore.simulationTick)
 
-const statusDotClass = computed(() => {
-  return isRunning.value ? 'status-running' : 'status-paused'
-})
+const WEATHER_ICONS: Record<string, string> = {
+  clear: '☀️',
+  cloudy: '☁️',
+  rainy: '🌧️',
+  snowy: '❄️',
+  stormy: '⛈️',
+}
 
-const statusText = computed(() => {
-  return isRunning.value ? '运行中' : '已暂停'
-})
+const weatherIcon = computed(() => WEATHER_ICONS[weather.value] ?? '☀️')
 </script>
 
 <template>
   <div class="status-bar glass-panel">
-    <div class="status-item">
-      <span class="status-icon">&#9200;</span>
-      <span class="status-value">{{ timeOfDay }}</span>
+    <div class="weather-section">
+      <span class="weather-icon">{{ weatherIcon }}</span>
+      <div class="weather-info">
+        <span class="temp-value">{{ outdoorTemp }}<span class="temp-unit">°C</span></span>
+        <span class="humidity">💧 {{ humidity }}%</span>
+      </div>
     </div>
-    <div class="status-divider" />
-    <div class="status-item">
-      <span class="status-icon">&#127777;&#65039;</span>
-      <span class="status-value">{{ outdoorTemp }}°C</span>
+    <div class="divider" />
+    <div class="time-section">
+      <span class="time-value">{{ timeOfDay }}</span>
     </div>
-    <div class="status-divider" />
-    <div class="status-item">
-      <span class="status-dot" :class="statusDotClass" />
-      <span class="status-value">{{ statusText }}</span>
+    <div class="divider" />
+    <div class="status-section">
+      <span class="status-dot" :class="{ running: isRunning }" />
+      <span class="status-text">{{ isRunning ? '运行中' : '已暂停' }}</span>
     </div>
-    <div class="status-divider" />
-    <div class="status-item">
-      <span class="status-icon">&#9201;</span>
-      <span class="status-value">Tick: {{ tickCount }}</span>
+    <div class="divider" />
+    <div class="tick-section">
+      <span class="tick-label">T:</span>
+      <span class="tick-value">{{ tickCount }}</span>
     </div>
   </div>
 </template>
 
 <style scoped>
 .status-bar {
-  position: absolute;
-  bottom: 16px;
-  left: 50%;
-  transform: translateX(-50%);
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 10px 24px;
-  z-index: 20;
+  gap: 14px;
+  padding: 10px 20px;
 }
 
-.status-item {
+.weather-section {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.weather-icon {
+  font-size: 24px;
+}
+
+.weather-info {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.temp-value {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--color-primary);
+  line-height: 1.1;
+}
+
+.temp-unit {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--color-text-secondary);
+}
+
+.humidity {
+  font-size: 10px;
+  color: var(--color-text-secondary);
+}
+
+.divider {
+  width: 1px;
+  height: 24px;
+  background: var(--color-border);
+}
+
+.time-section {
+  display: flex;
+  align-items: center;
+}
+
+.time-value {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--color-text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+.status-section {
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 13px;
-  color: #c0c0d0;
-  white-space: nowrap;
-}
-
-.status-icon {
-  font-size: 14px;
-}
-
-.status-value {
-  font-weight: 500;
-}
-
-.status-divider {
-  width: 1px;
-  height: 16px;
-  background: rgba(255, 255, 255, 0.12);
 }
 
 .status-dot {
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  display: inline-block;
+  background: var(--color-text-muted);
+  transition: all var(--transition-normal);
 }
 
-.status-dot.status-running {
-  background: #4ade80;
-  box-shadow: 0 0 6px rgba(74, 222, 128, 0.5);
+.status-dot.running {
+  background: var(--color-primary);
+  box-shadow: 0 0 8px rgba(255, 231, 74, 0.5);
+  animation: pulse-glow 2s ease-in-out infinite;
 }
 
-.status-dot.status-paused {
-  background: #facc15;
-  box-shadow: 0 0 6px rgba(250, 204, 21, 0.5);
+.status-text {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+
+.tick-section {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.tick-label {
+  font-size: 10px;
+  color: var(--color-text-muted);
+}
+
+.tick-value {
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  font-variant-numeric: tabular-nums;
 }
 </style>
