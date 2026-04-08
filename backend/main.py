@@ -190,35 +190,56 @@ async def ws_simulation(ws: WebSocket) -> None:
 
             if msg_type == "CMD_DEVICE_CONTROL":
                 device_id = payload.get("device_id", "")
+                action = payload.get("action", "")
+                params = payload.get("params", {})
+                # Legacy format support
                 prop = payload.get("property", "")
                 value = payload.get("value")
-                if device_id and prop and value is not None:
-                    deltas = state_manager.apply_action(
-                        agent_id="user",
-                        device_id=device_id,
-                        property_path=prop,
-                        new_value=value,
-                    )
-                    if deltas:
-                        delta_payload = {
-                            "deltas": [d.model_dump() for d in deltas],
-                        }
-                        await manager.broadcast(
-                            WSMessage(type="STATE_DELTA", payload=delta_payload)
+
+                deltas: list = []
+                if device_id and action:
+                    # action/params format (from frontend UI)
+                    if action == "turn_on":
+                        deltas = state_manager.apply_action(
+                            "user", device_id, "power", True
                         )
+                    elif action == "turn_off":
+                        deltas = state_manager.apply_action(
+                            "user", device_id, "power", False
+                        )
+                    elif action == "set_state" and params:
+                        for k, v in params.items():
+                            deltas.extend(
+                                state_manager.apply_action(
+                                    "user", device_id, f"extra.{k}", v
+                                )
+                            )
+                elif device_id and prop and value is not None:
+                    # property/value format (legacy)
+                    deltas = state_manager.apply_action(
+                        "user", device_id, prop, value
+                    )
+
+                if deltas:
+                    delta_payload = {
+                        "deltas": [d.model_dump() for d in deltas],
+                    }
+                    await manager.broadcast(
+                        WSMessage(type="STATE_DELTA", payload=delta_payload)
+                    )
 
             elif msg_type == "CMD_SIM_START":
                 if simulation_engine is not None:
                     await simulation_engine.start()
                 await manager.broadcast(
-                    WSMessage(type="SIM_STATUS", payload={"is_running": True})
+                    WSMessage(type="SIMULATION_STATUS", payload={"is_running": True})
                 )
 
             elif msg_type == "CMD_SIM_PAUSE":
                 if simulation_engine is not None:
                     await simulation_engine.pause()
                 await manager.broadcast(
-                    WSMessage(type="SIM_STATUS", payload={"is_running": False})
+                    WSMessage(type="SIMULATION_STATUS", payload={"is_running": False})
                 )
 
             elif msg_type == "CMD_SIM_RESET":
@@ -243,8 +264,8 @@ async def ws_simulation(ws: WebSocket) -> None:
                 state_manager.world.simulation_speed = float(speed)
                 await manager.broadcast(
                     WSMessage(
-                        type="SIM_STATUS",
-                        payload={"simulation_speed": float(speed)},
+                        type="SIMULATION_STATUS",
+                        payload={"speed": float(speed)},
                     )
                 )
 

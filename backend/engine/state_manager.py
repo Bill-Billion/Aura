@@ -55,7 +55,7 @@ class StateManager:
 
         deltas.append(
             DeltaChange(
-                path=f"devices.{device_id}.state.{property_path}",
+                path=f"devices[{device_id}].state.{property_path}",
                 old_value=old_value,
                 new_value=new_value,
                 caused_by=agent_id,
@@ -70,7 +70,7 @@ class StateManager:
             if prev_agent != agent_id:
                 deltas.append(
                     DeltaChange(
-                        path=f"devices.{device_id}.state.last_changed_by",
+                        path=f"devices[{device_id}].state.last_changed_by",
                         old_value=prev_agent,
                         new_value=agent_id,
                         caused_by=agent_id,

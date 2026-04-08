@@ -25,7 +25,7 @@ onMounted(() => {
 </script>
 
 <template>
-  <div class="w-screen h-screen relative overflow-hidden bg-[#0a0a0f]">
+  <div class="app-root">
     <SceneRenderer />
     <DashboardOverlay />
     <div v-if="disconnected" class="connect-overlay glass-panel">
@@ -38,6 +38,14 @@ onMounted(() => {
 </template>
 
 <style scoped>
+.app-root {
+  width: 100vw;
+  height: 100vh;
+  position: relative;
+  overflow: hidden;
+  background: #000;
+}
+
 .connect-overlay {
   position: absolute;
   top: 50%;
@@ -45,27 +53,28 @@ onMounted(() => {
   transform: translate(-50%, -50%);
   padding: 32px 48px;
   text-align: center;
-  z-index: 50;
+  z-index: var(--z-modal);
 }
 
 .connect-text {
   font-size: 16px;
-  color: #c0c0d0;
+  color: var(--color-text-secondary);
   margin: 0 0 16px 0;
 }
 
 .connect-btn {
   padding: 8px 24px;
-  border: 1px solid rgba(99, 102, 241, 0.4);
+  border: 1px solid rgba(255, 231, 74, 0.4);
   border-radius: 8px;
-  background: rgba(99, 102, 241, 0.15);
-  color: #a5b4fc;
+  background: rgba(255, 231, 74, 0.12);
+  color: var(--color-primary);
   font-size: 14px;
+  font-weight: 500;
   cursor: pointer;
-  transition: all 0.2s;
+  transition: all var(--transition-normal);
 }
 
 .connect-btn:hover {
-  background: rgba(99, 102, 241, 0.3);
+  background: rgba(255, 231, 74, 0.25);
 }
 </style>
