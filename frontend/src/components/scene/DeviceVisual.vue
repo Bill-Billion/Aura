@@ -2,6 +2,7 @@
 import { computed, watch, ref } from 'vue'
 import gsap from 'gsap'
 import { useWorldStore } from '@/stores/worldStore'
+import { useUIStore } from '@/stores/uiStore'
 import type { Vec3 } from '@/types/scene-config'
 
 const props = defineProps<{
@@ -11,7 +12,26 @@ const props = defineProps<{
 }>()
 
 const worldStore = useWorldStore()
+const uiStore = useUIStore()
 const device = computed(() => worldStore.devices[props.deviceId])
+
+// --- Hover state ---
+const hovered = ref(false)
+const hoverEmissive = ref(0)
+
+function onPointerEnter() {
+  hovered.value = true
+  gsap.to(hoverEmissive, { value: 0.3, duration: 0.2 })
+}
+
+function onPointerLeave() {
+  hovered.value = false
+  gsap.to(hoverEmissive, { value: 0, duration: 0.2 })
+}
+
+function onClick() {
+  uiStore.setActiveDevice(props.deviceId)
+}
 
 // --- Light ---
 const emissiveIntensity = ref(0)
@@ -34,6 +54,17 @@ watch(
     gsap.to(lightIntensity, { value: targetIntensity * 2, duration: 0.8, ease: 'power2.out' })
   },
   { immediate: true },
+)
+
+// Also watch power state
+watch(
+  () => device.value?.state.power,
+  (power) => {
+    if (!power) {
+      gsap.to(emissiveIntensity, { value: 0, duration: 0.5, ease: 'power2.out' })
+      gsap.to(lightIntensity, { value: 0, duration: 0.5, ease: 'power2.out' })
+    }
+  },
 )
 
 // --- HVAC ---
@@ -67,12 +98,18 @@ const curtainColor = computed(() => {
 
 <template>
   <template v-if="deviceType === 'light'">
-    <TresMesh :position="anchor">
+    <TresMesh
+      :position="anchor"
+      :name="deviceId"
+      @pointer-enter="onPointerEnter"
+      @pointer-leave="onPointerLeave"
+      @click="onClick"
+    >
       <TresSphereGeometry :args="[0.12, 16, 16]" />
       <TresMeshStandardMaterial
         :color="lightColor"
         :emissive="lightColor"
-        :emissive-intensity="emissiveIntensity"
+        :emissive-intensity="emissiveIntensity + hoverEmissive"
       />
     </TresMesh>
     <TresPointLight
@@ -84,9 +121,19 @@ const curtainColor = computed(() => {
   </template>
 
   <template v-else-if="deviceType === 'hvac'">
-    <TresMesh :position="anchor">
+    <TresMesh
+      :position="anchor"
+      :name="deviceId"
+      @pointer-enter="onPointerEnter"
+      @pointer-leave="onPointerLeave"
+      @click="onClick"
+    >
       <TresBoxGeometry :args="[0.8, 0.25, 0.18]" />
-      <TresMeshStandardMaterial :color="hvacColor" :emissive="hvacColor" :emissive-intensity="device?.state.power ? 0.3 : 0" />
+      <TresMeshStandardMaterial
+        :color="hvacColor"
+        :emissive="hvacColor"
+        :emissive-intensity="(device?.state.power ? 0.3 : 0) + hoverEmissive"
+      />
     </TresMesh>
     <TresMesh :position="[anchor[0], anchor[1] - 0.18, anchor[2]]">
       <TresBoxGeometry :args="[0.6, 0.06, 0.04]" />
@@ -95,12 +142,20 @@ const curtainColor = computed(() => {
   </template>
 
   <template v-else-if="deviceType === 'curtain'">
-    <TresMesh :position="anchor">
+    <TresMesh
+      :position="anchor"
+      :name="deviceId"
+      @pointer-enter="onPointerEnter"
+      @pointer-leave="onPointerLeave"
+      @click="onClick"
+    >
       <TresBoxGeometry :args="[1.2 * curtainScaleX, 2.0, 0.04]" />
       <TresMeshStandardMaterial
         :color="curtainColor"
         :opacity="curtainOpacity"
         :transparent="true"
+        :emissive="curtainColor"
+        :emissive-intensity="hoverEmissive"
       />
     </TresMesh>
   </template>

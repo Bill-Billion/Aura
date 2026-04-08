@@ -13,18 +13,18 @@ const props = defineProps<{
 
 const deviceEntries = Object.entries(props.room.devices)
 
+// Modern smart-home palette (Mi Home style)
 const roomConfigs: Record<string, { width: number; depth: number; height: number; wallColor: string; floorColor: string }> = {
-  living_room: { width: 5, depth: 5, height: 3, wallColor: '#f0ece4', floorColor: '#d4c4a8' },
-  bedroom:     { width: 5, depth: 5, height: 3, wallColor: '#eee8e0', floorColor: '#c8b898' },
-  kitchen:     { width: 4.5, depth: 4.5, height: 3, wallColor: '#f0ece4', floorColor: '#d8d0c0' },
-  bathroom:    { width: 3.5, depth: 4.5, height: 3, wallColor: '#e8e8e4', floorColor: '#c8c4bc' },
+  living_room: { width: 5.5, depth: 5.5, height: 3, wallColor: '#f5f5f0', floorColor: '#c4a67a' },
+  bedroom:     { width: 5, depth: 5, height: 3, wallColor: '#f2f0ec', floorColor: '#b89b72' },
+  kitchen:     { width: 4.5, depth: 4.5, height: 3, wallColor: '#f5f5f0', floorColor: '#d6cfc4' },
+  bathroom:    { width: 3.8, depth: 4.5, height: 3, wallColor: '#eef0f0', floorColor: '#c8c4be' },
 }
 
 const cfg = roomConfigs[props.room.type] ?? roomConfigs.living_room
 </script>
 
 <template>
-  <!-- Room shell: walls, floor, ceiling -->
   <RoomShell
     :position="room.position"
     :width="cfg.width"
@@ -34,13 +34,11 @@ const cfg = roomConfigs[props.room.type] ?? roomConfigs.living_room
     :floor-color="cfg.floorColor"
   />
 
-  <!-- Room-type furniture -->
   <LivingRoomFurniture v-if="room.type === 'living_room'" :position="room.position" />
   <BedroomFurniture v-else-if="room.type === 'bedroom'" :position="room.position" />
   <KitchenFurniture v-else-if="room.type === 'kitchen'" :position="room.position" />
   <BathroomFurniture v-else-if="room.type === 'bathroom'" :position="room.position" />
 
-  <!-- Devices at world-space anchors -->
   <DeviceVisual
     v-for="[deviceId, devCfg] in deviceEntries"
     :key="deviceId"

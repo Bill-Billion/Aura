@@ -12,8 +12,8 @@ const props = withDefaults(defineProps<{
   width: 5,
   depth: 5,
   height: 3,
-  wallColor: '#f0ece4',
-  floorColor: '#d4c4a8',
+  wallColor: '#f5f5f0',
+  floorColor: '#c4a67a',
 })
 
 const w = props.width
@@ -21,51 +21,75 @@ const d = props.depth
 const h = props.height
 const px = props.position[0]
 const pz = props.position[2]
-const wt = 0.06
+const wt = 0.08 // wall thickness
+const bt = 0.06 // baseboard thickness
+const bh = 0.08 // baseboard height
 </script>
 
 <template>
-  <!-- Floor -->
+  <!-- ========== FLOOR ========== -->
+  <!-- Main floor with wood-like appearance -->
   <TresMesh :position="[px, 0, pz]" receive-shadow>
     <TresBoxGeometry :args="[w, 0.05, d]" />
-    <TresMeshStandardMaterial :color="floorColor" roughness="0.8" />
+    <TresMeshStandardMaterial :color="floorColor" :roughness="0.65" :metalness="0.0" />
+  </TresMesh>
+  <!-- Floor planks effect (subtle lines) -->
+  <TresMesh v-for="i in 8" :key="'plank-' + i" :position="[px - w/2 + (w / 8) * (i - 0.5), 0.028, pz]">
+    <TresBoxGeometry :args="[0.006, 0.001, d - 0.1]" />
+    <TresMeshStandardMaterial color="#9e8560" :roughness="0.7" />
   </TresMesh>
 
-  <!-- Back wall (full height) -->
-  <TresMesh :position="[px, h / 2, pz - d / 2 + wt / 2]">
+  <!-- ========== WALLS ========== -->
+  <!-- Back wall (full height, smooth white) -->
+  <TresMesh :position="[px, h / 2, pz - d / 2 + wt / 2]" cast-shadow receive-shadow>
     <TresBoxGeometry :args="[w, h, wt]" />
-    <TresMeshStandardMaterial :color="wallColor" roughness="0.9" />
+    <TresMeshStandardMaterial :color="wallColor" :roughness="0.92" :metalness="0.0" />
   </TresMesh>
 
   <!-- Left wall (full height) -->
-  <TresMesh :position="[px - w / 2 + wt / 2, h / 2, pz]">
+  <TresMesh :position="[px - w / 2 + wt / 2, h / 2, pz]" cast-shadow receive-shadow>
     <TresBoxGeometry :args="[wt, h, d]" />
-    <TresMeshStandardMaterial :color="wallColor" roughness="0.9" />
+    <TresMeshStandardMaterial :color="wallColor" :roughness="0.92" :metalness="0.0" />
   </TresMesh>
 
-  <!-- Right wall (half height - gives open feel) -->
-  <TresMesh :position="[px + w / 2 - wt / 2, h * 0.25, pz]">
-    <TresBoxGeometry :args="[wt, h * 0.5, d]" />
-    <TresMeshStandardMaterial :color="wallColor" roughness="0.9" />
+  <!-- Right wall (40% height - open feel for camera view) -->
+  <TresMesh :position="[px + w / 2 - wt / 2, h * 0.2, pz]">
+    <TresBoxGeometry :args="[wt, h * 0.4, d]" />
+    <TresMeshStandardMaterial :color="wallColor" :roughness="0.92" :metalness="0.0" />
   </TresMesh>
 
-  <!-- No front wall, no ceiling - open dollhouse view -->
-
-  <!-- Baseboard - back -->
-  <TresMesh :position="[px, 0.06, pz - d / 2 + 0.04]">
-    <TresBoxGeometry :args="[w, 0.1, 0.03]" />
-    <TresMeshStandardMaterial color="#c8b896" roughness="0.7" />
+  <!-- ========== BASEBOARDS (white, modern) ========== -->
+  <!-- Back baseboard -->
+  <TresMesh :position="[px, bh / 2, pz - d / 2 + wt + bt / 2]">
+    <TresBoxGeometry :args="[w - wt * 2, bh, bt]" />
+    <TresMeshStandardMaterial color="#ffffff" :roughness="0.5" />
+  </TresMesh>
+  <!-- Left baseboard -->
+  <TresMesh :position="[px - w / 2 + wt + bt / 2, bh / 2, pz]">
+    <TresBoxGeometry :args="[bt, bh, d - wt * 2]" />
+    <TresMeshStandardMaterial color="#ffffff" :roughness="0.5" />
+  </TresMesh>
+  <!-- Right baseboard -->
+  <TresMesh :position="[px + w / 2 - wt - bt / 2, bh / 2, pz]">
+    <TresBoxGeometry :args="[bt, bh, d - wt * 2]" />
+    <TresMeshStandardMaterial color="#ffffff" :roughness="0.5" />
   </TresMesh>
 
-  <!-- Baseboard - left -->
-  <TresMesh :position="[px - w / 2 + 0.04, 0.06, pz]">
-    <TresBoxGeometry :args="[0.03, 0.1, d]" />
-    <TresMeshStandardMaterial color="#c8b896" roughness="0.7" />
+  <!-- ========== CROWN MOLDING (top of walls, subtle) ========== -->
+  <!-- Back crown -->
+  <TresMesh :position="[px, h - 0.02, pz - d / 2 + wt + 0.015]">
+    <TresBoxGeometry :args="[w - wt * 2, 0.04, 0.03]" />
+    <TresMeshStandardMaterial color="#ffffff" :roughness="0.4" />
+  </TresMesh>
+  <!-- Left crown -->
+  <TresMesh :position="[px - w / 2 + wt + 0.015, h - 0.02, pz]">
+    <TresBoxGeometry :args="[0.03, 0.04, d - wt * 2]" />
+    <TresMeshStandardMaterial color="#ffffff" :roughness="0.4" />
   </TresMesh>
 
-  <!-- Baseboard - right -->
-  <TresMesh :position="[px + w / 2 - 0.04, 0.06, pz]">
-    <TresBoxGeometry :args="[0.03, 0.1, d]" />
-    <TresMeshStandardMaterial color="#c8b896" roughness="0.7" />
+  <!-- ========== CEILING (partial, to cast shadow) ========== -->
+  <TresMesh :position="[px, h, pz]" receive-shadow>
+    <TresBoxGeometry :args="[w, 0.04, d]" />
+    <TresMeshStandardMaterial color="#fafafa" :roughness="0.95" />
   </TresMesh>
 </template>
