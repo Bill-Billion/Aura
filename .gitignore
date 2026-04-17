@@ -7,5 +7,21 @@ dist/
 .DS_Store
 *.egg-info/
 .env
+
+# Local AI/editor docs (not for remote)
 .claude/
 .superpowers/
+CLAUDE.md
+TODOS.md
+docs/superpowers/
+
+# IDE
+.vscode/
+.idea/
+
+# Template leftovers
+frontend/README.md
+frontend/src/components/HelloWorld.vue
+frontend/src/assets/hero.png
+frontend/src/assets/vite.svg
+frontend/src/assets/vue.svg
