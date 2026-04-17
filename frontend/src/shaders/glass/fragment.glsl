@@ -41,9 +41,10 @@ void main() {
     vec3 topLight = mix(vec3(1.0), vec3(0.5), getTopAttenuation(v_worldPos));
     diffuse = mix(diffuse, mix(topLight, vec3(0.9), envIntensity), mirror * top);
 
-    // Alpha: Fresnel-based transparency
+    // Alpha: Fresnel-based transparency with enhanced edge outline
+    float fresnel = pow(1.0 - abs(NoV), 2.5);
     float alpha = opacity;
-    alpha = mix(0.2, 0.9, 1.0 - NoV) * alpha;
+    alpha = mix(0.15, 0.95, fresnel) * alpha;
     alpha = mix(alpha, 1.0, opaque);
     alpha = mix(0.0, alpha, step(0.5, step(0.0, NoV)));
     alpha = mix(alpha, 1.0, top);
@@ -54,6 +55,9 @@ void main() {
     outputColor += irradiance * getLightAttenuation(v_worldPos);
     outputColor *= matcap;
     outputColor *= mix(0.65, 1.0, smoothstep(0.0, 2.0, v_position.y));
+
+    // White edge outline (gamemcu: visible white contour on walls)
+    outputColor += vec3(0.15) * fresnel;
 
     // Height-based alpha fade
     float a = 1.0 - smoothstep(0.0, 2.5, v_position.y);

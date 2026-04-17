@@ -25,9 +25,10 @@ void main() {
     // Floor matcap: brighter minimum than K class (0.4 vs 0.25)
     vec3 matcap = vec3(mix(0.4, 0.8, uv.y));
 
-    // Floor diffuse/irradiance: dimmer irradiance than K class
-    vec3 diffuse = mix(color * 0.5, color, envIntensity);
-    vec3 irradiance = mix(color * 0.5, vec3(0.45), envIntensity);
+    // Floor diffuse/irradiance: dimmer irradiance than K class, slightly cooler
+    vec3 coolTint = vec3(0.92, 0.94, 1.04);
+    vec3 diffuse = mix(color * 0.5, color * coolTint, envIntensity);
+    vec3 irradiance = mix(color * 0.5, vec3(0.42, 0.40, 0.48), envIntensity);
 
     vec3 outputColor = diffuse;
     outputColor += irradiance * getLightAttenuation(v_worldPos);

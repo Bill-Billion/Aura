@@ -46,7 +46,7 @@ function loadTexture(url: string): Promise<THREE.Texture> {
 
 // ======= Background sphere (gamemcu: uniform dark blue-gray #2d3040) =======
 const bgSphereMaterial = new THREE.MeshBasicMaterial({
-  color: new THREE.Color(0x1e242d),
+  color: new THREE.Color(0x252a35),
   side: THREE.BackSide,
   depthWrite: false,
   depthTest: false,  // render behind everything
@@ -58,8 +58,8 @@ const groundMaterial = new THREE.ShaderMaterial({
   vertexShader: groundVert,
   fragmentShader: groundFrag,
   uniforms: {
-    u_centerColor: { value: new THREE.Color(0x222830) },
-    u_edgeColor: { value: new THREE.Color(0x1e242d) },
+    u_centerColor: { value: new THREE.Color(0x2a3040) },
+    u_edgeColor: { value: new THREE.Color(0x151a22) },
     u_center: { value: new THREE.Vector2(0.48, 0.45) },
     u_radius: { value: 0.55 },
   },
@@ -101,26 +101,27 @@ function applyShaderMaterials(
   envMap?: THREE.Texture | null,
 ) {
   // 3 different lightGroup configs per gamemcu source
+  // Narrowed light sizes for more focused warm spots (matching gamemcu)
   const wallLightGroup = {
     lights: floorConfig.lights.map((pos, i) => ({
       position: new THREE.Vector4(pos[0], pos[1], pos[2], floorLightUnis[i]?.w ?? 1.0),
-      size: new THREE.Vector3(3, 2, 1.5),
+      size: new THREE.Vector3(1.8, 1.5, 1.2),
     })),
-    lightsInfo: new THREE.Vector4(-2, 2, 0.2, 0),
+    lightsInfo: new THREE.Vector4(-1.5, 2.0, 0.3, 0),
   }
   const objectLightGroup = {
     lights: floorConfig.lights.map((pos, i) => ({
       position: new THREE.Vector4(pos[0], pos[1], pos[2], floorLightUnis[i]?.w ?? 1.0),
-      size: new THREE.Vector3(3, 2, 1.5),
+      size: new THREE.Vector3(1.5, 1.2, 0.8),
     })),
-    lightsInfo: new THREE.Vector4(-2.5, 2.5, 0.2, 0),
+    lightsInfo: new THREE.Vector4(-1.0, 1.5, 0.4, 0),
   }
   const floorLightGroup = {
     lights: floorConfig.lights.map((pos, i) => ({
       position: new THREE.Vector4(pos[0], pos[1], pos[2], floorLightUnis[i]?.w ?? 1.0),
-      size: new THREE.Vector3(1.5, 1.8, 1),
+      size: new THREE.Vector3(1.2, 1.5, 0.8),
     })),
-    lightsInfo: new THREE.Vector4(-3, 2.5, 0.4, 0),
+    lightsInfo: new THREE.Vector4(-2.5, 2.0, 0.5, 0),
   }
 
   // Extract AO texture from GLB
@@ -195,6 +196,8 @@ watch(() => uiStore.activeFloor, (floorId) => {
 // ======= Init =======
 onMounted(async () => {
   try {
+    uiStore.setSceneLoadStatus('loading')
+
     // Load textures in parallel
     const [matcapRoughness, matcapReflection] = await Promise.all([
       loadTexture('/textures/matcap_roughness_3.webp'),
@@ -238,8 +241,11 @@ onMounted(async () => {
 
     // Setup reactive watchers: worldStore → SDF light uniforms
     setupLightWatchers()
+
+    uiStore.setSceneLoadStatus('loaded')
   } catch (e) {
     console.error('Load error:', e)
+    uiStore.setSceneLoadStatus('error')
   }
 })
 
@@ -267,13 +273,17 @@ onBeforeUnmount(() => {
     canvasEl.removeEventListener('pointerleave', camera.onPointerUp)
     canvasEl.removeEventListener('wheel', camera.onWheel)
   }
+  // Kill all active GSAP tweens on floor positions
+  if (f1.value) gsap.killTweensOf(f1.value.position)
+  if (f2.value) gsap.killTweensOf(f2.value.position)
+  if (f3.value) gsap.killTweensOf(f3.value.position)
 })
 </script>
 
 <template>
   <div class="w-full h-full absolute inset-0 scene-container">
     <TresCanvas
-      clear-color="#1e242d"
+      clear-color="#252a35"
       :antialias="true"
       :tone-mapping="1"
       :tone-mapping-exposure="1"
@@ -323,7 +333,7 @@ const RenderLoop = defineComponent({
     const { onBeforeRender } = useLoop()
 
     // Set scene.background directly (bypasses tone mapping!)
-    const bgColor = new THREE.Color(0x1e242d)
+    const bgColor = new THREE.Color(0x252a35)
     let bgSet = false
 
     onBeforeRender(({ delta }) => {

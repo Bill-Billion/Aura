@@ -23,11 +23,29 @@ const curtainNodes = new Map<string, THREE.Object3D[]>()
 // Light intensity state
 const lightCurrents = new Map<string, number>()
 
-// Device → floor mapping
+// Device → floor mapping (auto-populated from registered floors)
 const DEVICE_FLOOR_MAP: Record<string, string> = {
   light_living_01: 'F1',
   light_bedroom_01: 'F2',
   curtain_living_01: 'F1',
+}
+
+// Track which floors have been registered
+const registeredFloors = new Set<string>()
+
+/**
+ * Derive floor from device ID using naming convention.
+ * Matches patterns like: L1_light_01, light_living_01 (defaults to first registered floor)
+ */
+function inferFloorFromDevice(deviceId: string): string | null {
+  // Check explicit map first
+  if (DEVICE_FLOOR_MAP[deviceId]) return DEVICE_FLOOR_MAP[deviceId]
+  // Try L-prefix pattern: L1_xxx → F1, L2_xxx → F2
+  const match = deviceId.match(/^L(\d)_/)
+  if (match) return `F${match[1]}`
+  // Fallback: assign to first registered floor
+  const firstFloor = [...registeredFloors][0]
+  return firstFloor ?? null
 }
 
 export function registerDeviceNodes(floorId: string, scene: THREE.Group) {
@@ -50,6 +68,7 @@ export function registerDeviceNodes(floorId: string, scene: THREE.Group) {
   floorMaterials.set(floorId, mats)
   curtainNodes.set(floorId, curtains)
   lightCurrents.set(floorId, 1.0)
+  registeredFloors.add(floorId)
   console.log(`[DeviceAnim] ${floorId}: ${mats.length} shader mats, ${curtains.length} curtains`)
 }
 
@@ -84,9 +103,11 @@ export function updateDeviceAnimations(dt: number) {
   }
 
   // Override with actual device states
-  for (const [deviceId, floorId] of Object.entries(DEVICE_FLOOR_MAP)) {
-    const device = store.devices[deviceId]
-    if (!device || device.type !== 'light') continue
+  // Iterate ALL devices, not just hardcoded map
+  for (const [deviceId, device] of Object.entries(store.devices)) {
+    if (device.type !== 'light') continue
+    const floorId = inferFloorFromDevice(deviceId)
+    if (!floorId || !floorMaterials.has(floorId)) continue
     const intensity = device.state.power
       ? Math.max(0.1, (device.state.extra.brightness ?? 50) / 100)
       : 0

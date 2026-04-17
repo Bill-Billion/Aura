@@ -103,15 +103,19 @@ export const useWorldStore = defineStore('world', () => {
 
   /** Set a value at a dot-separated path on an object, reactively */
   function setNestedValue(obj: any, path: string, value: any) {
+    const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
     const parts = path.split('.')
     let current = obj
     for (let i = 0; i < parts.length - 1; i++) {
+      if (DANGEROUS_KEYS.has(parts[i])) return
       if (current[parts[i]] === undefined) {
         current[parts[i]] = {}
       }
       current = current[parts[i]]
     }
-    current[parts[parts.length - 1]] = value
+    if (!DANGEROUS_KEYS.has(parts[parts.length - 1])) {
+      current[parts[parts.length - 1]] = value
+    }
   }
 
   return {

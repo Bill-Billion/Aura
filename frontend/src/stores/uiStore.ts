@@ -1,6 +1,8 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 
+export type SceneLoadStatus = 'loading' | 'loaded' | 'error'
+
 export const useUIStore = defineStore('ui', () => {
   const activeRoom = ref<string>('living_room')
   const activeFloor = ref<string>('overview') // 'overview' | 'F1' | 'F2' | 'F3'
@@ -8,6 +10,7 @@ export const useUIStore = defineStore('ui', () => {
   const activeDevice = ref<string | null>(null)
   const sidebarOpen = ref(false)
   const sceneSelectorOpen = ref(false)
+  const sceneLoadStatus = ref<SceneLoadStatus>('loading')
 
   function setActiveRoom(roomId: string) {
     activeRoom.value = roomId
@@ -33,6 +36,10 @@ export const useUIStore = defineStore('ui', () => {
     sceneSelectorOpen.value = !sceneSelectorOpen.value
   }
 
+  function setSceneLoadStatus(status: SceneLoadStatus) {
+    sceneLoadStatus.value = status
+  }
+
   return {
     activeRoom,
     activeFloor,
@@ -40,11 +47,13 @@ export const useUIStore = defineStore('ui', () => {
     activeDevice,
     sidebarOpen,
     sceneSelectorOpen,
+    sceneLoadStatus,
     setActiveRoom,
     setActiveFloor,
     toggleFloorExpansion,
     setActiveDevice,
     toggleSidebar,
     toggleSceneSelector,
+    setSceneLoadStatus,
   }
 })

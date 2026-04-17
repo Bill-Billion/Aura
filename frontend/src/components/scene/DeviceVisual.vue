@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, watch, ref } from 'vue'
+import { computed, watch, ref, onBeforeUnmount } from 'vue'
 import gsap from 'gsap'
 import { useWorldStore } from '@/stores/worldStore'
 import { useUIStore } from '@/stores/uiStore'
@@ -14,6 +14,13 @@ const props = defineProps<{
 const worldStore = useWorldStore()
 const uiStore = useUIStore()
 const device = computed(() => worldStore.devices[props.deviceId])
+
+// --- Pulse effect on state change ---
+const pulseScale = ref(1)
+
+function triggerPulse() {
+  gsap.fromTo(pulseScale, { value: 1.05 }, { value: 1.0, duration: 0.3, ease: 'power2.out' })
+}
 
 // --- Hover state ---
 const hovered = ref(false)
@@ -64,6 +71,7 @@ watch(
       gsap.to(emissiveIntensity, { value: 0, duration: 0.5, ease: 'power2.out' })
       gsap.to(lightIntensity, { value: 0, duration: 0.5, ease: 'power2.out' })
     }
+    triggerPulse()
   },
 )
 
@@ -94,6 +102,16 @@ const curtainColor = computed(() => {
   const open = device.value?.state.extra.open_percent ?? 0
   return open > 50 ? '#4a4a5a' : '#2a2a3a'
 })
+
+// Cleanup GSAP tweens on unmount
+onBeforeUnmount(() => {
+  gsap.killTweensOf(emissiveIntensity)
+  gsap.killTweensOf(lightIntensity)
+  gsap.killTweensOf(curtainScaleX)
+  gsap.killTweensOf(curtainOpacity)
+  gsap.killTweensOf(hoverEmissive)
+  gsap.killTweensOf(pulseScale)
+})
 </script>
 
 <template>
@@ -101,6 +119,7 @@ const curtainColor = computed(() => {
     <TresMesh
       :position="anchor"
       :name="deviceId"
+      :scale="pulseScale"
       @pointer-enter="onPointerEnter"
       @pointer-leave="onPointerLeave"
       @click="onClick"
@@ -124,6 +143,7 @@ const curtainColor = computed(() => {
     <TresMesh
       :position="anchor"
       :name="deviceId"
+      :scale="pulseScale"
       @pointer-enter="onPointerEnter"
       @pointer-leave="onPointerLeave"
       @click="onClick"
@@ -145,6 +165,7 @@ const curtainColor = computed(() => {
     <TresMesh
       :position="anchor"
       :name="deviceId"
+      :scale="pulseScale"
       @pointer-enter="onPointerEnter"
       @pointer-leave="onPointerLeave"
       @click="onClick"

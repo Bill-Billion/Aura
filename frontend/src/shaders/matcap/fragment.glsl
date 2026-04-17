@@ -35,8 +35,10 @@ void main() {
     vec3 matcap = vec3(mix(0.25, 0.8, uv.y));
 
     // Diffuse and irradiance based on environment intensity
-    vec3 diffuse = mix(color * 0.15, color, envIntensity);
-    vec3 irradiance = mix(color * 0.5, vec3(1.3), envIntensity);
+    // Slightly cooler irradiance to match gamemcu's cold-blue base + warm light spots
+    vec3 coolTint = vec3(0.9, 0.92, 1.05);
+    vec3 diffuse = mix(color * 0.15, color * coolTint, envIntensity);
+    vec3 irradiance = mix(color * 0.5, vec3(1.2, 1.15, 1.3), envIntensity);
 
     // AO from texture
     float ao = 1.0;
