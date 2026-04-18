@@ -1,5 +1,4 @@
 <script setup lang="ts">
-import { computed } from 'vue'
 import StatusBar from './StatusBar.vue'
 import FloorSelector from './FloorSelector.vue'
 import HomePanelGroup from './HomePanelGroup.vue'
@@ -7,39 +6,32 @@ import SimControlBar from './SimControlBar.vue'
 import AIChatPanel from './AIChatPanel.vue'
 import SidebarToggle from './SidebarToggle.vue'
 import SceneSelector from './SceneSelector.vue'
+import ContextualDevicePanel from './ContextualDevicePanel.vue'
 import { useUIStore } from '@/stores/uiStore'
+import { showroomVisualConfig } from '@/config/showroomVisualConfig'
 
 const uiStore = useUIStore()
-
-// Hide right panel when focused on a specific floor (not overview)
-const showRightPanel = computed(() => uiStore.activeFloor === 'overview')
 </script>
 
 <template>
-  <div class="overlay-root no-select">
-    <!-- Left: Floor selector -->
+  <div class="overlay-root no-select" :style="{ '--showroom-panel-width': `${showroomVisualConfig.overlay.panelWidth}px` }">
     <FloorSelector class="zone-left" />
 
-    <!-- Right top: Device control panels (auto-hide when floor focused) -->
-    <Transition name="slide-panel-right">
-      <HomePanelGroup v-if="showRightPanel" class="zone-right-top" />
-    </Transition>
+    <aside class="zone-right">
+      <StatusBar class="zone-right__status" />
+      <ContextualDevicePanel />
+      <HomePanelGroup class="zone-right__content" />
+    </aside>
 
-    <!-- Bottom center: Status / weather -->
-    <StatusBar class="zone-bottom" />
+    <div class="zone-bottom-left">
+      <SimControlBar />
+      <SidebarToggle />
+    </div>
 
-    <!-- Bottom left: Simulation controls -->
-    <SimControlBar class="zone-bottom-left" />
-
-    <!-- Right: Sidebar toggle -->
-    <SidebarToggle class="zone-sidebar-toggle" />
-
-    <!-- Right sidebar: AI chat panel -->
     <Transition name="slide-right">
       <AIChatPanel v-if="uiStore.sidebarOpen" class="zone-sidebar" />
     </Transition>
 
-    <!-- Scene selector modal -->
     <SceneSelector v-if="uiStore.sceneSelectorOpen" />
   </div>
 </template>
@@ -60,32 +52,30 @@ const showRightPanel = computed(() => uiStore.activeFloor === 'overview')
   pointer-events: auto;
 }
 
-.zone-right-top {
+.zone-right {
   position: absolute;
   top: var(--spacing-panel);
   right: var(--spacing-panel-right);
+  bottom: calc(var(--spacing-panel) + 22px);
+  width: min(var(--showroom-panel-width), calc(100vw - 220px));
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
   pointer-events: auto;
 }
 
-.zone-bottom {
-  position: absolute;
-  bottom: var(--spacing-panel);
-  left: 50%;
-  transform: translateX(-50%);
-  pointer-events: auto;
+.zone-right__content {
+  overflow-y: auto;
+  padding-right: 2px;
 }
 
 .zone-bottom-left {
   position: absolute;
-  bottom: var(--spacing-panel);
   left: var(--spacing-panel);
-  pointer-events: auto;
-}
-
-.zone-sidebar-toggle {
-  position: absolute;
-  top: var(--spacing-panel);
-  right: var(--spacing-panel);
+  bottom: var(--spacing-panel);
+  display: flex;
+  align-items: center;
+  gap: 10px;
   pointer-events: auto;
 }
 
@@ -98,26 +88,46 @@ const showRightPanel = computed(() => uiStore.activeFloor === 'overview')
   pointer-events: auto;
 }
 
-/* Right panel slide transition */
-.slide-panel-right-enter-active,
-.slide-panel-right-leave-active {
-  transition: transform 0.4s ease, opacity 0.4s ease;
-}
-
-.slide-panel-right-enter-from,
-.slide-panel-right-leave-to {
-  transform: translateX(30px);
-  opacity: 0;
-}
-
-/* Sidebar slide transition */
 .slide-right-enter-active,
 .slide-right-leave-active {
-  transition: transform var(--transition-slow);
+  transition: transform var(--transition-slow), opacity var(--transition-slow);
 }
 
 .slide-right-enter-from,
 .slide-right-leave-to {
   transform: translateX(100%);
+  opacity: 0;
+}
+
+@media (max-width: 1200px) {
+  .zone-right {
+    width: min(var(--showroom-panel-width), calc(100vw - 180px));
+  }
+}
+
+@media (max-width: 920px) {
+  .zone-right {
+    left: 116px;
+    width: auto;
+  }
+}
+
+@media (max-width: 820px) {
+  .zone-right {
+    top: auto;
+    right: var(--spacing-panel);
+    left: var(--spacing-panel);
+    bottom: 84px;
+  }
+
+  .zone-left {
+    top: var(--spacing-panel);
+    transform: none;
+  }
+
+  .zone-bottom-left {
+    right: var(--spacing-panel);
+    justify-content: space-between;
+  }
 }
 </style>

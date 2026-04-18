@@ -12,15 +12,14 @@ const props = defineProps<{
 }>()
 
 const { sendCommand } = useWebSocket()
-
 const isPowered = computed(() => props.device.state.power)
 const targetTemp = computed(() => props.device.state.extra.target_temp ?? 24)
 const mode = computed(() => props.device.state.extra.mode ?? 'cool')
 
 const modes = [
-  { value: 'cool', label: '制冷', icon: '❄' },
-  { value: 'heat', label: '制热', icon: '🔥' },
-  { value: 'auto', label: '自动', icon: '⚡' },
+  { value: 'cool', label: '制冷' },
+  { value: 'heat', label: '制热' },
+  { value: 'auto', label: '自动' },
 ]
 
 function togglePower() {
@@ -45,37 +44,20 @@ function setMode(value: string) {
     params: { mode: value },
   })
 }
-
-const deviceLabel = computed(() => {
-  const parts = props.deviceId.split('_')
-  return parts.length > 1 ? `空调 ${parts[parts.length - 1]}` : props.deviceId
-})
-
-const modeColor = computed(() => {
-  if (!isPowered.value) return 'var(--color-text-muted)'
-  return mode.value === 'heat' ? 'var(--color-heat)' : 'var(--color-cool)'
-})
 </script>
 
 <template>
-  <div class="hvac-panel glass-panel">
-    <div class="panel-top">
-      <div class="device-info">
-        <div class="indicator" :class="{ active: isPowered }" :style="{ background: isPowered ? modeColor : undefined }" />
-        <div class="info-text">
-          <span class="device-name">{{ deviceLabel }}</span>
-          <span class="device-status">{{ isPowered ? `${targetTemp}°C` : '关闭' }}</span>
-        </div>
+  <div class="device-panel glass-panel">
+    <div class="device-panel__top">
+      <div>
+        <p class="device-panel__name">{{ deviceId }}</p>
+        <p class="device-panel__status">{{ isPowered ? `${targetTemp}°C · ${mode}` : '已关闭' }}</p>
       </div>
-      <DeviceButton
-        :active="isPowered"
-        :label="isPowered ? 'ON' : 'OFF'"
-        @click="togglePower"
-      />
+      <DeviceButton :active="isPowered" :label="isPowered ? 'ON' : 'OFF'" @click="togglePower" />
     </div>
 
-    <div class="panel-body" :class="{ disabled: !isPowered }">
-      <div class="temp-row">
+    <div class="device-panel__body" :class="{ disabled: !isPowered }">
+      <div class="device-panel__stepper">
         <NumberStepper
           :model-value="targetTemp"
           :min="16"
@@ -86,7 +68,6 @@ const modeColor = computed(() => {
           @update:model-value="setTargetTemp"
         />
       </div>
-
       <ModeSelector
         label="模式"
         :model-value="mode"
@@ -99,67 +80,45 @@ const modeColor = computed(() => {
 </template>
 
 <style scoped>
-.hvac-panel {
-  padding: 12px;
+.device-panel {
+  padding: 14px;
+}
+
+.device-panel__top {
   display: flex;
-  flex-direction: column;
+  align-items: center;
+  justify-content: space-between;
   gap: 10px;
 }
 
-.panel-top {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
+.device-panel__name,
+.device-panel__status {
+  margin: 0;
 }
 
-.device-info {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.indicator {
-  width: 3px;
-  height: 28px;
-  border-radius: 2px;
-  background: var(--color-indicator-inactive);
-  transition: background var(--transition-normal);
-}
-
-.indicator.active {
-  box-shadow: 0 0 8px currentColor;
-}
-
-.info-text {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-}
-
-.device-name {
+.device-panel__name {
   font-size: 13px;
-  font-weight: 600;
-  color: var(--color-text-primary);
 }
 
-.device-status {
-  font-size: 10px;
+.device-panel__status {
+  margin-top: 4px;
+  font-size: 11px;
   color: var(--color-text-secondary);
 }
 
-.panel-body {
+.device-panel__body {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  transition: opacity var(--transition-normal);
+  margin-top: 14px;
 }
 
-.panel-body.disabled {
-  opacity: 0.35;
+.device-panel__body.disabled {
+  opacity: 0.38;
   pointer-events: none;
 }
 
-.temp-row {
+.device-panel__stepper {
   display: flex;
   justify-content: center;
 }

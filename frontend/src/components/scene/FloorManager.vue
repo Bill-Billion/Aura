@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, provide } from 'vue'
 import FloorGroup from './FloorGroup.vue'
-import type { FloorConfig, GamemcuSceneConfig } from '@/types/model-types'
+import type { GamemcuSceneConfig } from '@/types/model-types'
 
 const sceneConfig = ref<GamemcuSceneConfig | null>(null)
 const floorRefs = ref<Record<string, InstanceType<typeof FloorGroup>>>({})

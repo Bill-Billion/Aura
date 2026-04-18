@@ -23,7 +23,6 @@ const emit = defineEmits<{
         :disabled="disabled"
         @click="emit('update:modelValue', mode.value)"
       >
-        <span v-if="mode.icon" class="mode-icon">{{ mode.icon }}</span>
         <span class="mode-text">{{ mode.label }}</span>
       </button>
     </div>
@@ -34,7 +33,7 @@ const emit = defineEmits<{
 .mode-selector {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
 }
 
 .mode-selector.disabled {
@@ -43,47 +42,35 @@ const emit = defineEmits<{
 }
 
 .mode-label {
-  font-size: 10px;
+  font-size: 11px;
   color: var(--color-text-secondary);
 }
 
 .mode-options {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 6px;
 }
 
 .mode-btn {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  padding: 5px 12px;
+  min-height: 34px;
   border: 1px solid var(--color-border);
-  border-radius: 16px;
-  background: transparent;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.03);
   color: var(--color-text-secondary);
-  font-size: 11px;
+  font-size: 12px;
   cursor: pointer;
-  transition: all var(--transition-normal);
-  white-space: nowrap;
+  transition: all var(--transition-fast);
 }
 
 .mode-btn:hover:not(:disabled):not(.active) {
-  border-color: var(--color-border-strong);
   color: var(--color-text-primary);
+  border-color: rgba(255, 231, 74, 0.34);
 }
 
 .mode-btn.active {
-  background: var(--color-primary);
-  border-color: var(--color-primary);
-  color: #000;
-  font-weight: 600;
-}
-
-.mode-icon {
-  font-size: 13px;
-}
-
-.mode-text {
-  line-height: 1;
+  border-color: rgba(255, 231, 74, 0.48);
+  background: rgba(255, 231, 74, 0.08);
+  color: var(--color-primary);
 }
 </style>

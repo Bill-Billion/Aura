@@ -1,4 +1,3 @@
-import { ref } from 'vue'
 import * as THREE from 'three'
 
 export interface FloorLightConfig {
@@ -44,7 +43,7 @@ export function useLightUniforms() {
 
   /** Call every frame to lerp light intensities */
   function update(dt: number) {
-    for (const [floorId, states] of floorLights) {
+    for (const [, states] of floorLights) {
       for (const light of states) {
         const current = light.uniform.w
         const next = THREE.MathUtils.lerp(current, light.target, Math.min(5 * dt, 1))

@@ -6,11 +6,11 @@ Aura is a simulation and visualization platform for observing how AI agents cont
 
 ## Features
 
-- **3D Smart Home Visualization** — Multi-floor apartment rendering with TresJS/Three.js, custom GLSL shaders (SDF area lights, matcap materials, Fresnel glass)
+- **3D Showroom Visualization** — Multi-floor apartment rendering with TresJS/Three.js, custom GLSL shaders, world-floor reflection layers, and a tighter gamemcu-style shell
 - **AI Agent Simulation** — Rule-based agents (Lighting, HVAC) with an extensible architecture for LLM-powered autonomous agents
-- **Real-time Observability** — WebSocket-powered live updates showing agent reasoning chains and device state changes
-- **Event-Driven Engine** — Async EventBus + StateManager with delta tracking and snapshot support
-- **Interactive Dashboard** — Device control panels, agent action log, simulation controls, floor/scene selection
+- **Structured Event Flow** — `SimEvent` now carries `event_id`, `correlation_id`, `causal_parent`, and priority for user/action/feedback tracing
+- **Real-time Observability Foundation** — WebSocket now exposes legacy state sync and `SIM_EVENT` side by side, ready for the next-stage observability panel
+- **Interactive Dashboard** — Slim left floor rail, lighter right showroom cards, contextual device controller, compact simulation controls, and auxiliary event log
 
 ## Tech Stack
 
@@ -28,17 +28,17 @@ aura/
 ├── backend/
 │   ├── api/          # FastAPI routes + WebSocket gateway
 │   ├── agents/       # AI agents (Lighting, HVAC) + AgentRuntime
-│   ├── engine/       # SimulationEngine, EventBus, StateManager
+│   ├── engine/       # SimulationEngine, EventBus, SimEvent, StateManager
 │   ├── models/       # Pydantic schemas (WorldState, WSMessage)
 │   ├── simulators/   # Environment physics + User behavior
 │   └── core/         # Logging
 ├── frontend/
 │   ├── src/
 │   │   ├── components/
-│   │   │   ├── scene/       # 3D rendering (SceneRenderer, FloorGroup, shaders)
-│   │   │   └── dashboard/   # UI overlay (ControlPanel, AgentActionLog, etc.)
+│   │   │   ├── scene/       # 3D rendering (SceneRenderer, shaders, CSS2D labels)
+│   │   │   └── dashboard/   # Showroom shell, contextual controller, scene presets
 │   │   ├── composables/     # useWebSocket, useSphericalCamera, useShaderMaterials
-│   │   ├── stores/          # Pinia stores (world, agent, simulation, ui)
+│   │   ├── stores/          # Pinia stores (world, agent, simulation, ui, events)
 │   │   ├── shaders/         # GLSL vertex/fragment shaders
 │   │   └── types/           # TypeScript type definitions
 │   └── public/
@@ -80,6 +80,17 @@ Open http://localhost:5173
 cd backend
 pytest ../tests/ -v
 ```
+
+前端构建验证：
+
+```bash
+cd frontend
+npm run build
+```
+
+## Event Schema
+
+结构化事件字段和关联规则写在 `/docs/architecture/sim-event-schema.md`。下一阶段的 ObservabilityPanel 会直接消费这条事件流，而不是继续依赖旧的 delta 文本日志。
 
 ## Roadmap
 

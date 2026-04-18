@@ -1,36 +1,94 @@
 <script setup lang="ts">
-import { ref, onMounted, onBeforeUnmount, shallowRef, watch } from 'vue'
+import { onBeforeUnmount, onMounted, shallowRef, watch, ref } from 'vue'
 import { TresCanvas } from '@tresjs/core'
 import * as THREE from 'three'
-
-// Disable color management to match gamemcu's Three.js r175 behavior
-// Without this, Color(hex) auto-converts sRGB→linear, breaking our color values
-THREE.ColorManagement.enabled = false
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js'
-import { RGBELoader } from 'three/addons/loaders/RGBELoader.js'
+import { HDRLoader } from 'three/addons/loaders/HDRLoader.js'
+import { CSS2DObject, CSS2DRenderer } from 'three/addons/renderers/CSS2DRenderer.js'
 import gsap from 'gsap'
 import { useUIStore } from '@/stores/uiStore'
+import { useWorldStore } from '@/stores/worldStore'
 import { useSphericalCamera } from '@/composables/useSphericalCamera'
-import { useShaderMaterials } from '@/composables/useShaderMaterials'
+import { useShaderMaterials, type LightGroupConfig } from '@/composables/useShaderMaterials'
 import { useLightUniforms } from '@/composables/useLightUniforms'
-import { registerDeviceNodes, setupLightWatchers, updateDeviceAnimations, initDeviceAnimStore } from '@/composables/useDeviceAnimations'
+import {
+  initDeviceAnimStore,
+  registerDeviceNodes,
+  setupLightWatchers,
+} from '@/composables/useDeviceAnimations'
+import { showroomVisualConfig, type ShowroomMaterialRole } from '@/config/showroomVisualConfig'
+import { getFloorForDevice } from '@/utils/deviceFloorMap'
+import { showroomRuntime } from './showroomRuntime'
+import { SceneRenderLoop } from './SceneRenderLoop'
 import groundVert from '@/shaders/ground/vertex.glsl?raw'
 import groundFrag from '@/shaders/ground/fragment.glsl?raw'
 
+type FloorId = 'F1' | 'F2' | 'F3'
+
 const uiStore = useUIStore()
+const worldStore = useWorldStore()
 const camera = useSphericalCamera()
 const lightUniforms = useLightUniforms()
+initDeviceAnimStore(worldStore)
 
-// Init device animation with worldStore reference
-import { useWorldStore } from '@/stores/worldStore'
-initDeviceAnimStore(useWorldStore())
-
-const f1 = shallowRef<THREE.Group | null>(null)
-const f2 = shallowRef<THREE.Group | null>(null)
-const f3 = shallowRef<THREE.Group | null>(null)
-
+const sceneHostEl = ref<HTMLElement | null>(null)
 const glbLoader = new GLTFLoader()
 const textureLoader = new THREE.TextureLoader()
+const raycaster = new THREE.Raycaster()
+const pointer = new THREE.Vector2()
+
+const floorRefs: Record<FloorId, ReturnType<typeof shallowRef<THREE.Group | null>>> = {
+  F1: shallowRef<THREE.Group | null>(null),
+  F2: shallowRef<THREE.Group | null>(null),
+  F3: shallowRef<THREE.Group | null>(null),
+}
+
+const reflectionRefs: Record<FloorId, ReturnType<typeof shallowRef<THREE.Group | null>>> = {
+  F1: shallowRef<THREE.Group | null>(null),
+  F2: shallowRef<THREE.Group | null>(null),
+  F3: shallowRef<THREE.Group | null>(null),
+}
+
+const labelElements = new Map<FloorId, HTMLDivElement>()
+const selectableMeshes = new Map<THREE.Object3D, string>()
+const floorForSelectable = new Map<THREE.Object3D, FloorId>()
+
+const groundMaterial = new THREE.ShaderMaterial({
+  vertexShader: groundVert,
+  fragmentShader: groundFrag,
+  uniforms: {
+    u_centerColor: { value: new THREE.Color(0x12161d) },
+    u_edgeColor: { value: new THREE.Color(0x06080c) },
+    u_shadowColor: { value: new THREE.Color(0x07090d) },
+    u_reflectionColor: { value: new THREE.Color(0x8897a6) },
+    u_center: { value: new THREE.Vector2(0.48, 0.47) },
+    u_radius: { value: 0.6 },
+    u_time: { value: 0 },
+  },
+  transparent: true,
+  depthWrite: false,
+  toneMapped: false,
+})
+
+const floorOrder: FloorId[] = ['F1', 'F2', 'F3']
+
+const cameraPresets = {
+  overview: showroomVisualConfig.camera.overview,
+  F1: showroomVisualConfig.camera.floors.F1,
+  F2: showroomVisualConfig.camera.floors.F2,
+  F3: showroomVisualConfig.camera.floors.F3,
+}
+
+let floorsExpanded = false
+let canvasEl: HTMLCanvasElement | null = null
+let pointerDown = { x: 0, y: 0 }
+let labelRenderer: CSS2DRenderer | null = null
+
+const FLOOR_DISPLAY_NAMES: Record<FloorId, string> = {
+  F1: 'F1 Living Deck',
+  F2: 'F2 Private Deck',
+  F3: 'F3 Service Deck',
+}
 
 function loadGLB(url: string): Promise<THREE.Group> {
   return new Promise((resolve, reject) => {
@@ -44,161 +102,299 @@ function loadTexture(url: string): Promise<THREE.Texture> {
   })
 }
 
-// ======= Background sphere (gamemcu: uniform dark blue-gray #2d3040) =======
-const bgSphereMaterial = new THREE.MeshBasicMaterial({
-  color: new THREE.Color(0x252a35),
-  side: THREE.BackSide,
-  depthWrite: false,
-  depthTest: false,  // render behind everything
-  fog: false,
-})
-
-// ======= Ground plane material =======
-const groundMaterial = new THREE.ShaderMaterial({
-  vertexShader: groundVert,
-  fragmentShader: groundFrag,
-  uniforms: {
-    u_centerColor: { value: new THREE.Color(0x2a3040) },
-    u_edgeColor: { value: new THREE.Color(0x151a22) },
-    u_center: { value: new THREE.Vector2(0.48, 0.45) },
-    u_radius: { value: 0.55 },
-  },
-  toneMapped: false, // prevent ACES from crushing dark values
-})
-
-// ======= Floor configs =======
-const FLOOR_CONFIGS = [
-  {
-    id: 'F1', path: '/models/F1.glb', collapsedY: 1, expandedY: 0,
-    numLights: 3,
-    lights: [[-2, 0, -1.5], [-2, 0, 1], [-1, 0, 4]] as [number,number,number][],
-  },
-  {
-    id: 'F2', path: '/models/F2.glb', collapsedY: 7, expandedY: 18,
-    numLights: 2,
-    lights: [[-4, 0, -1.5], [3, 0, -2.5]] as [number,number,number][],
-  },
-  {
-    id: 'F3', path: '/models/F3.glb', collapsedY: 13, expandedY: 35,
-    numLights: 2,
-    lights: [[-1, 0, 3], [3, 0, -2.5]] as [number,number,number][],
-  },
-]
-
-const CAMERA_PRESETS = {
-  overview: { springLength: 120, lookAt: [-1.5, 7.5, 0.5] as [number,number,number], theta: 2.38 + Math.PI, phi: 1.25, fov: 12 },
-  F1: { springLength: 50, lookAt: [0, 2.5, 0] as [number,number,number], theta: 2.35 + Math.PI, phi: 0.84, fov: 12, smoothing: 4, rotateSmoothing: 4 },
-  F2: { springLength: 50, lookAt: [0, 19.5, 0] as [number,number,number], theta: 2.35 + Math.PI, phi: 0.84, fov: 12, smoothing: 4, rotateSmoothing: 4 },
-  F3: { springLength: 50, lookAt: [0, 36.5, 0] as [number,number,number], theta: 2.35 + Math.PI, phi: 0.84, fov: 12, smoothing: 4, rotateSmoothing: 4 },
-}
-
-// ======= Apply 3 shader classes based on mesh.name =======
-function applyShaderMaterials(
-  scene: THREE.Group,
-  floorConfig: typeof FLOOR_CONFIGS[0],
-  shaderMats: ReturnType<typeof useShaderMaterials>,
-  floorLightUnis: THREE.Vector4[],
-  envMap?: THREE.Texture | null,
-) {
-  // 3 different lightGroup configs per gamemcu source
-  // Narrowed light sizes for more focused warm spots (matching gamemcu)
-  const wallLightGroup = {
-    lights: floorConfig.lights.map((pos, i) => ({
-      position: new THREE.Vector4(pos[0], pos[1], pos[2], floorLightUnis[i]?.w ?? 1.0),
-      size: new THREE.Vector3(1.8, 1.5, 1.2),
-    })),
-    lightsInfo: new THREE.Vector4(-1.5, 2.0, 0.3, 0),
-  }
-  const objectLightGroup = {
-    lights: floorConfig.lights.map((pos, i) => ({
-      position: new THREE.Vector4(pos[0], pos[1], pos[2], floorLightUnis[i]?.w ?? 1.0),
-      size: new THREE.Vector3(1.5, 1.2, 0.8),
-    })),
-    lightsInfo: new THREE.Vector4(-1.0, 1.5, 0.4, 0),
-  }
-  const floorLightGroup = {
-    lights: floorConfig.lights.map((pos, i) => ({
-      position: new THREE.Vector4(pos[0], pos[1], pos[2], floorLightUnis[i]?.w ?? 1.0),
-      size: new THREE.Vector3(1.2, 1.5, 0.8),
-    })),
-    lightsInfo: new THREE.Vector4(-2.5, 2.0, 0.5, 0),
-  }
-
-  // Extract AO texture from GLB
-  const aoMap = extractAOMap(scene)
-
-  scene.traverse((obj) => {
-    if (!(obj instanceof THREE.Mesh)) return
-    const mat = obj.material as THREE.MeshStandardMaterial
-    const matName = mat?.name?.toLowerCase() ?? ''
-    const nodeName = obj.name.toLowerCase()
-
-    if (nodeName.includes('visualcone') || nodeName.includes('effect')) {
-      obj.visible = false
-      return
-    }
-
-    if (nodeName === 'wall') {
-      // I3 class: walls — Fresnel transparency + SDF
-      obj.material = shaderMats.createI3ClassMaterial(wallLightGroup)
-    } else if (nodeName === 'floor') {
-      // z1 class: indoor floor — higher matcap min, semi-transparent
-      obj.material = shaderMats.createZ1ClassMaterial(floorLightGroup)
-    } else if (nodeName === 'car') {
-      // Car: keep original GLB material
-      // (gamemcu uses onBeforeCompile for sweep effect, skip for now)
-    } else {
-      // K class: all other objects (furniture, fixtures, appliances)
-      obj.material = shaderMats.createKClassMaterial(objectLightGroup, {
-        aoMap: aoMap ?? undefined,
-      })
-    }
-  })
-}
-
-// Extract first texture from GLB as AO map
 function extractAOMap(scene: THREE.Group): THREE.Texture | null {
   let aoMap: THREE.Texture | null = null
   scene.traverse((obj) => {
-    if (aoMap) return
-    if (!(obj instanceof THREE.Mesh)) return
-    const mat = obj.material as THREE.MeshStandardMaterial
-    if (mat?.aoMap) {
-      aoMap = mat.aoMap
+    if (aoMap || !(obj instanceof THREE.Mesh)) return
+    const material = Array.isArray(obj.material) ? obj.material[0] : obj.material
+    const standardMaterial = material as THREE.MeshStandardMaterial
+    if (standardMaterial?.aoMap) {
+      aoMap = standardMaterial.aoMap
     }
   })
   return aoMap
 }
 
-// ======= Floor expansion =======
-let floorsExpanded = false
+function classifyRole(nodeName: string, materialName: string): ShowroomMaterialRole {
+  const lowerName = nodeName.toLowerCase()
+  const lowerMat = materialName.toLowerCase()
 
-watch(() => uiStore.activeFloor, (floorId) => {
-  const preset = CAMERA_PRESETS[floorId as keyof typeof CAMERA_PRESETS] ?? CAMERA_PRESETS.overview
+  if (lowerName === 'wall' || lowerMat.includes('glass') || lowerMat.includes('wall')) return 'wallGlass'
+  if (lowerName === 'floor' || lowerMat.includes('woodfloor') || lowerMat === 'floor') return 'floorDeck'
+  if (lowerName === 'car' || lowerName.includes('sweeper')) return 'vehicleFx'
+  if (lowerName.startsWith('cam')) return 'signage'
+  if (/^(ac|air|fan|fridge|wash|charge|hotwater|tv|radiator)/.test(lowerName) || lowerMat.includes('black')) return 'applianceMetal'
+  return 'furniture'
+}
 
-  if (floorId === 'overview') {
-    floorsExpanded = false
-    if (f1.value) { f1.value.visible = true; gsap.to(f1.value.position, { y: 1, duration: 1.0, ease: 'cubic.out' }) }
-    if (f2.value) { f2.value.visible = true; gsap.to(f2.value.position, { y: 7, duration: 1.0, ease: 'cubic.out' }) }
-    if (f3.value) { f3.value.visible = true; gsap.to(f3.value.position, { y: 13, duration: 1.0, ease: 'cubic.out' }) }
-    camera.animateTo(preset, 1.0)
-  } else {
-    if (!floorsExpanded) {
-      floorsExpanded = true
-      if (f1.value) { f1.value.visible = true; gsap.to(f1.value.position, { y: 0, duration: 0.8, ease: 'cubic.out' }) }
-      if (f2.value) { f2.value.visible = true; gsap.to(f2.value.position, { y: 18, duration: 0.8, ease: 'cubic.out' }) }
-      if (f3.value) { f3.value.visible = true; gsap.to(f3.value.position, { y: 35, duration: 0.8, ease: 'cubic.out' }) }
-    }
-    camera.animateTo(preset, 0.8)
+function resolveSceneDeviceId(floorId: FloorId, nodeName: string): string | null {
+  const lowerName = nodeName.toLowerCase()
+  if (floorId === 'F1' && lowerName.startsWith('ac')) return 'ac_living_01'
+  if (floorId === 'F1' && lowerName.startsWith('curtain')) return 'curtain_living_01'
+  return null
+}
+
+function createLightGroups(floorId: FloorId, uniforms: THREE.Vector4[]) {
+  const floor = showroomVisualConfig.floors[floorId]
+  const bias = floor.lightBias
+  const makeLights = (size: [number, number, number]) => {
+    return floor.lights.map((position, index) => ({
+      position: new THREE.Vector4(position[0], position[1], position[2], uniforms[index]?.w ?? bias),
+      size: new THREE.Vector3(size[0], size[1], size[2]),
+    }))
   }
-})
 
-// ======= Init =======
+  return {
+    wall: {
+      lights: makeLights([1.45, 1.12, 0.88]),
+      lightsInfo: new THREE.Vector4(-1.55, 1.35, 0.26, 0),
+    } satisfies LightGroupConfig,
+    floor: {
+      lights: makeLights([1.1, 0.8, 0.72]),
+      lightsInfo: new THREE.Vector4(-1.3, 1.1, 0.2, 0),
+    } satisfies LightGroupConfig,
+    object: {
+      lights: makeLights([1.22, 0.95, 0.82]),
+      lightsInfo: new THREE.Vector4(-1.4, 1.18, 0.24, 0),
+    } satisfies LightGroupConfig,
+  }
+}
+
+/**
+ * GLB 命名并不等于业务设备。这里先按“墙 / 楼板 / 家具 / 深色设备 / 车辆 / 信息牌”分层，
+ * 只替换真正影响气质的材质，其余保留原材质并做定向增强。
+ */
+function applyShowroomMaterials(
+  scene: THREE.Group,
+  floorId: FloorId,
+  shaderMats: ReturnType<typeof useShaderMaterials>,
+  floorLightUnis: THREE.Vector4[],
+) {
+  const floorConfig = showroomVisualConfig.floors[floorId]
+  const lightGroups = createLightGroups(floorId, floorLightUnis)
+  const aoMap = extractAOMap(scene)
+
+  scene.traverse((obj) => {
+    if (!(obj instanceof THREE.Mesh)) return
+
+    const sourceMaterial = Array.isArray(obj.material) ? obj.material[0] : obj.material
+    const materialName = sourceMaterial?.name ?? ''
+    const nodeName = obj.name
+    const lowerNodeName = nodeName.toLowerCase()
+
+    if (lowerNodeName.includes('visualcone') || lowerNodeName.startsWith('effect')) {
+      obj.visible = false
+      return
+    }
+
+    const role = classifyRole(nodeName, materialName)
+    obj.userData.materialRole = role
+
+    if (role === 'wallGlass') {
+      obj.material = shaderMats.createWallGlassMaterial(lightGroups.wall, {
+        color: new THREE.Color(showroomVisualConfig.materialPalette.wallGlass),
+        opacity: 1,
+        envIntensity: floorConfig.envBias,
+      })
+    } else if (role === 'floorDeck') {
+      obj.material = shaderMats.createFloorDeckMaterial(lightGroups.floor, {
+        color: new THREE.Color(showroomVisualConfig.materialPalette.floorDeck),
+        envIntensity: floorConfig.envBias,
+      })
+      obj.renderOrder = 2
+    } else if (role === 'furniture') {
+      obj.material = shaderMats.createFurnitureMaterial(lightGroups.object, {
+        aoMap: aoMap ?? undefined,
+        envIntensity: floorConfig.envBias,
+      })
+    } else if (role === 'applianceMetal') {
+      obj.material = shaderMats.createApplianceMaterial(sourceMaterial, {
+        envIntensity: 1.24,
+      })
+    } else if (role === 'vehicleFx') {
+      obj.material = shaderMats.createVehicleMaterial(sourceMaterial)
+    } else if (role === 'signage') {
+      obj.material = shaderMats.createSignageMaterial(sourceMaterial)
+    }
+
+    const deviceId = resolveSceneDeviceId(floorId, nodeName)
+    if (deviceId) {
+      selectableMeshes.set(obj, deviceId)
+      floorForSelectable.set(obj, floorId)
+    }
+  })
+}
+
+function createReflectionGroup(scene: THREE.Group, shaderMats: ReturnType<typeof useShaderMaterials>) {
+  const reflection = scene.clone(true)
+  reflection.scale.set(1.015, -0.22, 1.015)
+
+  reflection.traverse((obj) => {
+    if (!(obj instanceof THREE.Mesh)) return
+    const role = (obj.userData.materialRole ?? 'reflection') as ShowroomMaterialRole
+    obj.material = shaderMats.createReflectionMaterial(role)
+    obj.renderOrder = 0
+  })
+
+  return reflection
+}
+
+function getReflectionY(sourceY: number) {
+  return showroomVisualConfig.ground.planeY - Math.min(sourceY * 0.05, 0.74)
+}
+
+function moveFloorPair(floorId: FloorId, targetY: number, duration: number) {
+  const floor = floorRefs[floorId].value
+  const reflection = reflectionRefs[floorId].value
+  if (floor) {
+    gsap.to(floor.position, { y: targetY, duration, ease: 'cubic.out' })
+  }
+  if (reflection) {
+    gsap.to(reflection.position, { y: getReflectionY(targetY), duration, ease: 'cubic.out' })
+  }
+}
+
+function buildFloorDevices(floorId: FloorId) {
+  return Object.entries(worldStore.devices).filter(([, device]) => {
+    return getFloorForDevice(device.id, device.location.room) === floorId
+  })
+}
+
+function renderFloorLabel(floorId: FloorId) {
+  const element = labelElements.get(floorId)
+  if (!element) return
+
+  const devices = buildFloorDevices(floorId)
+  const activeFloor = uiStore.activeFloor
+  const visibleInOverview = false
+  const visibleInFocus = activeFloor === floorId
+  element.style.display = activeFloor === 'overview'
+    ? (visibleInOverview ? 'block' : 'none')
+    : (visibleInFocus ? 'block' : 'none')
+
+  const chipsHtml = devices.length > 0
+    ? devices.map(([deviceId, device]) => {
+        const activeClass = uiStore.activeDevice === deviceId ? 'active' : ''
+        const liveClass = device.state.power ? 'live' : ''
+        return `<button class="scene-floor-label__chip ${activeClass} ${liveClass}" data-device-id="${deviceId}" data-floor-id="${floorId}">${device.type}</button>`
+      }).join('')
+    : '<span class="scene-floor-label__sub">当前没有接入设备</span>'
+
+  element.innerHTML = `
+    <p class="scene-floor-label__title">${FLOOR_DISPLAY_NAMES[floorId]}</p>
+    <p class="scene-floor-label__sub">${devices.length} 个在线入口，可直接打开右侧控制器。</p>
+    <div class="scene-floor-label__actions">${chipsHtml}</div>
+  `
+
+  element.querySelectorAll<HTMLButtonElement>('[data-device-id]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const deviceId = button.dataset.deviceId
+      const floor = button.dataset.floorId as FloorId | undefined
+      if (!deviceId || !floor) return
+      uiStore.setActiveFloor(floor)
+      uiStore.setActiveDevice(deviceId)
+    })
+  })
+}
+
+function attachFloorLabel(floorId: FloorId, scene: THREE.Group) {
+  const element = document.createElement('div')
+  element.className = 'scene-floor-label'
+  labelElements.set(floorId, element)
+  renderFloorLabel(floorId)
+
+  const labelObject = new CSS2DObject(element)
+  const anchor = showroomVisualConfig.floors[floorId].labelAnchor
+  labelObject.position.set(anchor[0], anchor[1], anchor[2])
+  scene.add(labelObject)
+}
+
+function refreshFloorLabels() {
+  floorOrder.forEach((floorId) => renderFloorLabel(floorId))
+}
+
+function createLabelRenderer() {
+  if (!sceneHostEl.value) return
+
+  labelRenderer = new CSS2DRenderer()
+  labelRenderer.setSize(sceneHostEl.value.clientWidth, sceneHostEl.value.clientHeight)
+  labelRenderer.domElement.className = 'scene-label-layer'
+  labelRenderer.domElement.style.pointerEvents = 'none'
+  sceneHostEl.value.appendChild(labelRenderer.domElement)
+  showroomRuntime.labelRenderer.value = labelRenderer
+}
+
+function resizeLabelRenderer() {
+  if (!sceneHostEl.value || !labelRenderer) return
+  labelRenderer.setSize(sceneHostEl.value.clientWidth, sceneHostEl.value.clientHeight)
+}
+
+function pickSceneDevice(event: PointerEvent) {
+  const activeCamera = showroomRuntime.camera.value
+  if (!activeCamera || !canvasEl || selectableMeshes.size === 0) return
+
+  const rect = canvasEl.getBoundingClientRect()
+  pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1
+  pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1
+
+  raycaster.setFromCamera(pointer, activeCamera)
+  const intersects = raycaster.intersectObjects([...selectableMeshes.keys()], true)
+  const picked = intersects.find((entry) => selectableMeshes.has(entry.object))
+  if (!picked) return
+
+  const deviceId = selectableMeshes.get(picked.object)
+  const floorId = floorForSelectable.get(picked.object)
+  if (!deviceId || !floorId) return
+
+  uiStore.setActiveFloor(floorId)
+  uiStore.setActiveDevice(deviceId)
+}
+
+watch(
+  () => uiStore.activeFloor,
+  (floorId) => {
+    const preset = cameraPresets[floorId as keyof typeof cameraPresets] ?? cameraPresets.overview
+
+    if (floorId === 'overview') {
+      floorsExpanded = false
+      moveFloorPair('F1', showroomVisualConfig.floors.F1.collapsedY, 1.0)
+      moveFloorPair('F2', showroomVisualConfig.floors.F2.collapsedY, 1.0)
+      moveFloorPair('F3', showroomVisualConfig.floors.F3.collapsedY, 1.0)
+      camera.animateTo(preset, 1.0)
+    } else {
+      if (!floorsExpanded) {
+        floorsExpanded = true
+      }
+      moveFloorPair('F1', showroomVisualConfig.floors.F1.expandedY, 0.86)
+      moveFloorPair('F2', showroomVisualConfig.floors.F2.expandedY, 0.86)
+      moveFloorPair('F3', showroomVisualConfig.floors.F3.expandedY, 0.86)
+      camera.animateTo(preset, 0.82)
+    }
+
+    refreshFloorLabels()
+  },
+  { immediate: true },
+)
+
+watch(
+  () => JSON.stringify(worldStore.devices),
+  () => {
+    refreshFloorLabels()
+  },
+)
+
+watch(
+  () => uiStore.activeDevice,
+  () => {
+    refreshFloorLabels()
+  },
+)
+
 onMounted(async () => {
   try {
     uiStore.setSceneLoadStatus('loading')
+    createLabelRenderer()
 
-    // Load textures in parallel
     const [matcapRoughness, matcapReflection] = await Promise.all([
       loadTexture('/textures/matcap_roughness_3.webp'),
       loadTexture('/textures/matcap_reflection.webp'),
@@ -206,150 +402,167 @@ onMounted(async () => {
 
     const shaderMats = useShaderMaterials({ matcapRoughness, matcapReflection })
 
-    // Load HDR environment map
-    const rgbeLoader = new RGBELoader()
     const hdrTexture = await new Promise<THREE.Texture>((resolve, reject) => {
-      rgbeLoader.load('/textures/roomhdr_blue.hdr', resolve, undefined, reject)
+      new HDRLoader().load('/textures/roomhdr_blue.hdr', resolve, undefined, reject)
     })
     hdrTexture.mapping = THREE.EquirectangularReflectionMapping
+    showroomRuntime.environment.value = hdrTexture
 
-    // Init light uniforms for each floor
-    for (const fc of FLOOR_CONFIGS) {
-      lightUniforms.initFloor({
-        floorId: fc.id,
-        numLights: fc.numLights,
-        positions: fc.lights,
-        floorY: fc.collapsedY,
+    for (const floorId of floorOrder) {
+      const floorConfig = showroomVisualConfig.floors[floorId]
+      const scene = await loadGLB(`/models/${floorId}.glb`)
+      scene.position.set(0, floorConfig.collapsedY, 0)
+
+      const floorLightUnis = lightUniforms.initFloor({
+        floorId,
+        numLights: floorConfig.lights.length,
+        positions: floorConfig.lights,
+        floorY: floorConfig.collapsedY,
       })
+
+      applyShowroomMaterials(scene, floorId, shaderMats, floorLightUnis)
+      registerDeviceNodes(floorId, scene)
+
+      const reflection = createReflectionGroup(scene, shaderMats)
+      reflection.position.set(0, getReflectionY(floorConfig.collapsedY), 0)
+
+      attachFloorLabel(floorId, scene)
+
+      floorRefs[floorId].value = scene
+      reflectionRefs[floorId].value = reflection
     }
 
-    // Load and process GLBs
-    const floorRefs = [f1, f2, f3]
-    for (let i = 0; i < FLOOR_CONFIGS.length; i++) {
-      const fc = FLOOR_CONFIGS[i]
-      const scene = await loadGLB(fc.path)
-      scene.position.set(0, fc.collapsedY, 0)
-
-      const floorLightUnis = lightUniforms.getFloorUniforms(fc.id)
-      applyShaderMaterials(scene, fc, shaderMats, floorLightUnis, hdrTexture)
-
-      // Register device nodes for animation
-      registerDeviceNodes(fc.id, scene)
-
-      floorRefs[i].value = scene
+    showroomRuntime.onFrame.value = (dt, elapsed) => {
+      shaderMats.updateShowroomEffects(dt, elapsed)
+      groundMaterial.uniforms.u_time.value = elapsed
     }
 
-    // Setup reactive watchers: worldStore → SDF light uniforms
     setupLightWatchers()
-
+    resizeLabelRenderer()
     uiStore.setSceneLoadStatus('loaded')
-  } catch (e) {
-    console.error('Load error:', e)
+  } catch (error) {
+    console.error('Scene load error:', error)
     uiStore.setSceneLoadStatus('error')
   }
-})
 
-// ======= Pointer events =======
-let canvasEl: HTMLCanvasElement | null = null
-
-onMounted(() => {
   setTimeout(() => {
-    canvasEl = document.querySelector('canvas')
-    if (canvasEl) {
-      canvasEl.addEventListener('pointerdown', camera.onPointerDown)
-      canvasEl.addEventListener('pointermove', camera.onPointerMove)
-      canvasEl.addEventListener('pointerup', camera.onPointerUp)
-      canvasEl.addEventListener('pointerleave', camera.onPointerUp)
-      canvasEl.addEventListener('wheel', camera.onWheel, { passive: true })
+    canvasEl = sceneHostEl.value?.querySelector('canvas') ?? null
+    if (!canvasEl) return
+
+    const handlePointerDown = (event: PointerEvent) => {
+      pointerDown = { x: event.clientX, y: event.clientY }
+      camera.onPointerDown(event)
     }
-  }, 100)
+
+    const handlePointerMove = (event: PointerEvent) => {
+      camera.onPointerMove(event)
+    }
+
+    const handlePointerUp = (event: PointerEvent) => {
+      const moved = Math.hypot(event.clientX - pointerDown.x, event.clientY - pointerDown.y)
+      camera.onPointerUp()
+      if (moved < 6) {
+        pickSceneDevice(event)
+      }
+    }
+
+    canvasEl.addEventListener('pointerdown', handlePointerDown)
+    canvasEl.addEventListener('pointermove', handlePointerMove)
+    canvasEl.addEventListener('pointerup', handlePointerUp)
+    canvasEl.addEventListener('pointerleave', camera.onPointerUp)
+    canvasEl.addEventListener('wheel', camera.onWheel, { passive: true })
+
+    ;(canvasEl as HTMLCanvasElement & {
+      __showroomHandlers?: {
+        down: (event: PointerEvent) => void
+        move: (event: PointerEvent) => void
+        up: (event: PointerEvent) => void
+      }
+    }).__showroomHandlers = {
+      down: handlePointerDown,
+      move: handlePointerMove,
+      up: handlePointerUp,
+    }
+  }, 120)
+
+  window.addEventListener('resize', resizeLabelRenderer)
 })
 
 onBeforeUnmount(() => {
   if (canvasEl) {
-    canvasEl.removeEventListener('pointerdown', camera.onPointerDown)
-    canvasEl.removeEventListener('pointermove', camera.onPointerMove)
-    canvasEl.removeEventListener('pointerup', camera.onPointerUp)
+    const handlers = (canvasEl as HTMLCanvasElement & {
+      __showroomHandlers?: {
+        down: (event: PointerEvent) => void
+        move: (event: PointerEvent) => void
+        up: (event: PointerEvent) => void
+      }
+    }).__showroomHandlers
+
+    if (handlers) {
+      canvasEl.removeEventListener('pointerdown', handlers.down)
+      canvasEl.removeEventListener('pointermove', handlers.move)
+      canvasEl.removeEventListener('pointerup', handlers.up)
+    }
     canvasEl.removeEventListener('pointerleave', camera.onPointerUp)
     canvasEl.removeEventListener('wheel', camera.onWheel)
   }
-  // Kill all active GSAP tweens on floor positions
-  if (f1.value) gsap.killTweensOf(f1.value.position)
-  if (f2.value) gsap.killTweensOf(f2.value.position)
-  if (f3.value) gsap.killTweensOf(f3.value.position)
+
+  floorOrder.forEach((floorId) => {
+    if (floorRefs[floorId].value) gsap.killTweensOf(floorRefs[floorId].value.position)
+    if (reflectionRefs[floorId].value) gsap.killTweensOf(reflectionRefs[floorId].value.position)
+  })
+
+  window.removeEventListener('resize', resizeLabelRenderer)
+  showroomRuntime.environment.value = null
+  showroomRuntime.onFrame.value = null
+  showroomRuntime.camera.value = null
+  showroomRuntime.scene.value = null
+  showroomRuntime.labelRenderer.value = null
+  if (labelRenderer?.domElement.parentNode) {
+    labelRenderer.domElement.parentNode.removeChild(labelRenderer.domElement)
+  }
 })
 </script>
 
 <template>
-  <div class="w-full h-full absolute inset-0 scene-container">
+  <div ref="sceneHostEl" class="scene-container">
     <TresCanvas
-      clear-color="#252a35"
+      clear-color="#090c12"
       :antialias="true"
       :tone-mapping="1"
-      :tone-mapping-exposure="1"
+      :tone-mapping-exposure="0.94"
     >
       <TresPerspectiveCamera
-        :position="[-50, 60, 80]"
+        :position="[-48, 60, 80]"
         :fov="12"
-        :near="1"
-        :far="300"
+        :near="0.5"
+        :far="320"
       />
 
-      <!-- No directional lights — matcap shader provides all shading -->
-      <TresAmbientLight :intensity="0.05" color="#e0dcd4" />
+      <TresAmbientLight :intensity="0.028" color="#dce4ee" />
 
-      <!-- Camera + Light update loop -->
-      <RenderLoop />
+      <SceneRenderLoop />
 
-      <!-- Floor models -->
-      <primitive v-if="f1" :object="f1" />
-      <primitive v-if="f2" :object="f2" />
-      <primitive v-if="f3" :object="f3" />
+      <primitive v-if="reflectionRefs.F1.value" :object="reflectionRefs.F1.value" />
+      <primitive v-if="reflectionRefs.F2.value" :object="reflectionRefs.F2.value" />
+      <primitive v-if="reflectionRefs.F3.value" :object="reflectionRefs.F3.value" />
 
-      <!-- Ground with radial gradient -->
-      <TresMesh :position="[0, -0.05, 0]" :rotation-x="-Math.PI / 2">
-        <TresPlaneGeometry :args="[200, 200]" />
+      <TresMesh :position="[0, showroomVisualConfig.ground.planeY, 0]" :rotation-x="-Math.PI / 2">
+        <TresPlaneGeometry :args="[showroomVisualConfig.ground.size, showroomVisualConfig.ground.size]" />
         <primitive :object="groundMaterial" attach="material" />
       </TresMesh>
+
+      <primitive v-if="floorRefs.F1.value" :object="floorRefs.F1.value" />
+      <primitive v-if="floorRefs.F2.value" :object="floorRefs.F2.value" />
+      <primitive v-if="floorRefs.F3.value" :object="floorRefs.F3.value" />
     </TresCanvas>
   </div>
 </template>
 
-<script lang="ts">
-// Renderless component inside TresCanvas for per-frame updates
-import { defineComponent, toRaw } from 'vue'
-import * as THREE from 'three'
-import { useLoop, useTres } from '@tresjs/core'
-import { useSphericalCamera } from '@/composables/useSphericalCamera'
-import { useLightUniforms } from '@/composables/useLightUniforms'
-import { updateDeviceAnimations } from '@/composables/useDeviceAnimations'
 
-const RenderLoop = defineComponent({
-  name: 'RenderLoop',
-  setup() {
-    const cam = useSphericalCamera()
-    const lights = useLightUniforms()
-    const { camera, scene } = useTres()
-    const { onBeforeRender } = useLoop()
-
-    // Set scene.background directly (bypasses tone mapping!)
-    const bgColor = new THREE.Color(0x252a35)
-    let bgSet = false
-
-    onBeforeRender(({ delta }) => {
-      if (!bgSet && scene.value) {
-        ;(scene.value as any).background = bgColor
-        bgSet = true
-      }
-      const c = toRaw(camera.value)
-      if (c) cam.update(c as any, delta)
-      lights.update(delta)
-      updateDeviceAnimations(delta)
-    })
-
-    return () => null
-  },
-})
-
-export { RenderLoop }
-</script>
+<style scoped>
+.scene-container {
+  position: absolute;
+  inset: 0;
+}
+</style>

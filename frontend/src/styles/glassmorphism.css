@@ -1,7 +1,9 @@
-.glass-panel {
+.glass-panel,
+.showroom-card {
   background: var(--panel-bg);
   backdrop-filter: var(--panel-blur);
   -webkit-backdrop-filter: var(--panel-blur);
   border: var(--panel-border);
   border-radius: var(--panel-radius);
+  box-shadow: var(--panel-shadow);
 }

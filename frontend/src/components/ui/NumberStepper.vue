@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onBeforeUnmount } from 'vue'
+import { onBeforeUnmount } from 'vue'
 
 const props = withDefaults(defineProps<{
   modelValue: number
@@ -35,47 +35,50 @@ function decrement() {
 function startHold(fn: () => void) {
   stopHold()
   holdTimeout = setTimeout(() => {
-    holdTimer = setInterval(fn, 100)
-  }, 300)
+    holdTimer = setInterval(fn, 110)
+  }, 320)
 }
 
 function stopHold() {
-  if (holdTimeout) { clearTimeout(holdTimeout); holdTimeout = null }
-  if (holdTimer) { clearInterval(holdTimer); holdTimer = null }
+  if (holdTimeout) {
+    clearTimeout(holdTimeout)
+    holdTimeout = null
+  }
+  if (holdTimer) {
+    clearInterval(holdTimer)
+    holdTimer = null
+  }
 }
 
 onBeforeUnmount(stopHold)
-
-const atMax = ref(false)
-const atMin = ref(false)
 </script>
 
 <template>
   <div class="number-stepper" :class="{ disabled }">
     <span v-if="label" class="stepper-label">{{ label }}</span>
     <button
-      class="stepper-btn up"
+      class="stepper-btn"
       :disabled="disabled || modelValue >= max"
       @click="increment"
       @pointerdown="startHold(increment)"
       @pointerup="stopHold"
       @pointerleave="stopHold"
     >
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="18 15 12 9 6 15" /></svg>
+      +
     </button>
     <div class="stepper-value">
       <span class="value-text">{{ modelValue }}</span>
       <span v-if="unit" class="value-unit">{{ unit }}</span>
     </div>
     <button
-      class="stepper-btn down"
+      class="stepper-btn"
       :disabled="disabled || modelValue <= min"
       @click="decrement"
       @pointerdown="startHold(decrement)"
       @pointerup="stopHold"
       @pointerleave="stopHold"
     >
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9" /></svg>
+      -
     </button>
   </div>
 </template>
@@ -85,11 +88,12 @@ const atMin = ref(false)
   display: flex;
   flex-direction: column;
   align-items: center;
-  width: 80px;
-  background: rgba(97, 97, 97, 0.6);
-  border-radius: 8px;
-  padding: 6px 4px;
-  gap: 2px;
+  width: 96px;
+  padding: 8px 6px;
+  border: 1px solid var(--color-border);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.03);
+  gap: 4px;
 }
 
 .number-stepper.disabled {
@@ -97,21 +101,18 @@ const atMin = ref(false)
   pointer-events: none;
 }
 
-.stepper-label {
-  font-size: 10px;
+.stepper-label,
+.value-unit {
+  font-size: 11px;
   color: var(--color-text-secondary);
-  margin-bottom: 2px;
 }
 
 .stepper-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 32px;
-  height: 24px;
-  border: none;
-  border-radius: 4px;
-  background: transparent;
+  width: 34px;
+  height: 26px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.03);
   color: var(--color-text-secondary);
   cursor: pointer;
   transition: all var(--transition-fast);
@@ -119,34 +120,28 @@ const atMin = ref(false)
 
 .stepper-btn:hover:not(:disabled) {
   color: var(--color-primary);
-  background: rgba(255, 255, 255, 0.06);
+  border-color: rgba(255, 231, 74, 0.34);
 }
 
 .stepper-btn:active:not(:disabled) {
-  transform: scale(0.9);
+  transform: scale(0.94);
 }
 
 .stepper-btn:disabled {
-  opacity: 0.25;
+  opacity: 0.3;
   cursor: not-allowed;
 }
 
 .stepper-value {
   display: flex;
   align-items: baseline;
-  gap: 2px;
-  padding: 4px 0;
+  gap: 4px;
 }
 
 .value-text {
-  font-size: 22px;
-  font-weight: 700;
-  color: var(--color-primary);
+  font-size: 24px;
   line-height: 1;
-}
-
-.value-unit {
-  font-size: 12px;
-  color: var(--color-text-secondary);
+  letter-spacing: -0.05em;
+  color: var(--color-primary);
 }
 </style>

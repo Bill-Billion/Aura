@@ -2,8 +2,10 @@ import { ref, readonly } from 'vue'
 import { useWorldStore } from '@/stores/worldStore'
 import { useAgentStore } from '@/stores/agentStore'
 import { useSimulationStore } from '@/stores/simulationStore'
+import { useEventStore } from '@/stores/eventStore'
 import type { WSMessage } from '@/types/websocket'
 import type { WorldStateSnapshot, DeltaChange } from '@/types/world-state'
+import type { SimEvent } from '@/types/sim-event'
 
 type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'error'
 
@@ -23,6 +25,7 @@ export function useWebSocket() {
   const worldStore = useWorldStore()
   const agentStore = useAgentStore()
   const simulationStore = useSimulationStore()
+  const eventStore = useEventStore()
 
   // ---- Connect ----
 
@@ -137,8 +140,12 @@ export function useWebSocket() {
       }
 
       case 'EVENT_NOTIFICATION': {
-        // Could trigger a toast / notification in the UI
         console.info('[WebSocket] Event:', msg.payload)
+        break
+      }
+
+      case 'SIM_EVENT': {
+        eventStore.appendEvent(msg.payload as SimEvent)
         break
       }
 

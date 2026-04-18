@@ -1,5 +1,4 @@
 import { ref, shallowReactive } from 'vue'
-import * as THREE from 'three'
 import { GLTFLoader, DRACOLoader, MeshoptDecoder } from 'three-stdlib'
 import type { GLTF } from 'three-stdlib'
 import type { FloorConfig } from '@/types/model-types'

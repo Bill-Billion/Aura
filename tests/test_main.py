@@ -16,6 +16,24 @@ def _connect(client):
     return client.websocket_connect("/ws/simulation")
 
 
+def _receive_until_types(
+    ws,
+    expected: set[str],
+    max_messages: int = 8,
+    min_sim_events: int = 1,
+) -> list[dict]:
+    messages: list[dict] = []
+    seen: set[str] = set()
+    for _ in range(max_messages):
+        data = ws.receive_json()
+        messages.append(data)
+        seen.add(data["type"])
+        sim_event_count = sum(1 for message in messages if message["type"] == "SIM_EVENT")
+        if expected.issubset(seen) and sim_event_count >= min_sim_events:
+            break
+    return messages
+
+
 def test_ws_receives_full_state_on_connect(client):
     with _connect(client) as ws:
         data = ws.receive_json()
@@ -73,14 +91,14 @@ def test_ws_cmd_device_control_turn_on(client):
             "type": "CMD_DEVICE_CONTROL",
             "payload": {"device_id": "light_living_01", "action": "turn_off"},
         })
-        ws.receive_json()  # STATE_DELTA (turn off)
+        _receive_until_types(ws, {"STATE_DELTA", "SIM_EVENT"}, min_sim_events=2)
         ws.send_json({
             "type": "CMD_DEVICE_CONTROL",
             "payload": {"device_id": "light_living_01", "action": "turn_on"},
         })
-        data = ws.receive_json()
-        assert data["type"] == "STATE_DELTA"
-        assert len(data["payload"]["deltas"]) > 0
+        messages = _receive_until_types(ws, {"STATE_DELTA"})
+        delta_message = next(message for message in messages if message["type"] == "STATE_DELTA")
+        assert len(delta_message["payload"]["deltas"]) > 0
 
 
 def test_ws_cmd_device_control_turn_off(client):
@@ -144,6 +162,28 @@ def test_ws_cmd_device_control_no_delta(client):
         # turning off an already-off device produces no delta, so no broadcast
         # the connection stays open, close it to end the test
         ws.close()
+
+
+def test_ws_cmd_device_control_emits_structured_events(client):
+    with _connect(client) as ws:
+        ws.receive_json()  # initial STATE_FULL
+        ws.send_json({
+            "type": "CMD_DEVICE_CONTROL",
+            "payload": {"device_id": "light_living_01", "action": "turn_off"},
+        })
+
+        messages = _receive_until_types(
+            ws,
+            {"STATE_DELTA", "SIM_EVENT"},
+            min_sim_events=2,
+        )
+        event_messages = [message for message in messages if message["type"] == "SIM_EVENT"]
+
+        assert any(message["type"] == "STATE_DELTA" for message in messages)
+        assert len(event_messages) >= 2
+        assert event_messages[0]["payload"]["event_id"]
+        assert event_messages[0]["payload"]["correlation_id"]
+        assert event_messages[1]["payload"]["causal_parent"] == event_messages[0]["payload"]["event_id"]
 
 
 def test_ws_unknown_message_type(client):

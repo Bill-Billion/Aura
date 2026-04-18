@@ -1,6 +1,7 @@
 import { reactive } from 'vue'
 import * as THREE from 'three'
 import type { CameraPreset } from '@/types/model-types'
+import { showroomVisualConfig } from '@/config/showroomVisualConfig'
 import gsap from 'gsap'
 
 export interface SphericalCameraState {
@@ -9,57 +10,47 @@ export interface SphericalCameraState {
   targetSpringLength: number
   targetLookAt: THREE.Vector3
   targetFov: number
-
   currentTheta: number
   currentPhi: number
   currentSpringLength: number
   currentLookAt: THREE.Vector3
   currentFov: number
-
   smoothing: number
   rotateSmoothing: number
-
-  // Input state
   isDragging: boolean
   lastPointerX: number
   lastPointerY: number
-
-  // Limits
   phiMin: number
   phiMax: number
   distanceMin: number
   distanceMax: number
 }
 
+const overviewPreset = showroomVisualConfig.camera.overview
+
 const state = reactive<SphericalCameraState>({
-  // gamemcu overview defaults — theta rotated 180° (+ PI) to match gamemcu front view
-  targetTheta: 2.38 + Math.PI,
-  targetPhi: 1.25,
-  targetSpringLength: 120,
-  targetLookAt: new THREE.Vector3(-1.5, 7.5, 0.5),
-  targetFov: 12,
-
-  currentTheta: 2.38 + Math.PI,
-  currentPhi: 1.25,
-  currentSpringLength: 120,
-  currentLookAt: new THREE.Vector3(-1.5, 7.5, 0.5),
-  currentFov: 12,
-
-  smoothing: 4,
-  rotateSmoothing: 4,
-
+  targetTheta: overviewPreset.theta,
+  targetPhi: overviewPreset.phi,
+  targetSpringLength: overviewPreset.springLength,
+  targetLookAt: new THREE.Vector3(...overviewPreset.lookAt),
+  targetFov: overviewPreset.fov ?? 12,
+  currentTheta: overviewPreset.theta,
+  currentPhi: overviewPreset.phi,
+  currentSpringLength: overviewPreset.springLength,
+  currentLookAt: new THREE.Vector3(...overviewPreset.lookAt),
+  currentFov: overviewPreset.fov ?? 12,
+  smoothing: overviewPreset.smoothing ?? 4,
+  rotateSmoothing: overviewPreset.rotateSmoothing ?? 4,
   isDragging: false,
   lastPointerX: 0,
   lastPointerY: 0,
-
-  phiMin: 0.2,
-  phiMax: 1.4,
-  distanceMin: 20,
-  distanceMax: 180,
+  phiMin: 0.84,
+  phiMax: 1.26,
+  distanceMin: 32,
+  distanceMax: 150,
 })
 
 export function useSphericalCamera() {
-
   function setTarget(preset: CameraPreset) {
     state.targetTheta = preset.theta
     state.targetPhi = preset.phi
@@ -93,7 +84,6 @@ export function useSphericalCamera() {
   }
 
   function update(camera: THREE.PerspectiveCamera, dt: number) {
-    // Spring damping interpolation
     const posFactor = 1 - Math.exp(-state.smoothing * dt)
     const rotFactor = 1 - Math.exp(-state.rotateSmoothing * dt)
 
@@ -103,7 +93,6 @@ export function useSphericalCamera() {
     state.currentLookAt.lerp(state.targetLookAt, posFactor)
     state.currentFov += (state.targetFov - state.currentFov) * posFactor
 
-    // Spherical to cartesian
     const r = state.currentSpringLength
     const phi = state.currentPhi
     const theta = state.currentTheta
@@ -118,32 +107,26 @@ export function useSphericalCamera() {
     camera.updateProjectionMatrix()
   }
 
-  // --- Pointer handlers ---
-
-  function onPointerDown(e: PointerEvent) {
+  function onPointerDown(event: PointerEvent) {
     state.isDragging = true
-    state.lastPointerX = e.clientX
-    state.lastPointerY = e.clientY
+    state.lastPointerX = event.clientX
+    state.lastPointerY = event.clientY
   }
 
-  function onPointerMove(e: PointerEvent) {
+  function onPointerMove(event: PointerEvent) {
     if (!state.isDragging) return
-    const dx = e.clientX - state.lastPointerX
-    const dy = e.clientY - state.lastPointerY
-    state.lastPointerX = e.clientX
-    state.lastPointerY = e.clientY
-
-    // Rotate — horizontal only (gamemcu locks vertical axis)
-    state.targetTheta -= dx * 0.005
-    // phi is locked — no vertical rotation allowed
+    const dx = event.clientX - state.lastPointerX
+    state.lastPointerX = event.clientX
+    state.lastPointerY = event.clientY
+    state.targetTheta -= dx * 0.0052
   }
 
   function onPointerUp() {
     state.isDragging = false
   }
 
-  function onWheel(e: WheelEvent) {
-    const delta = e.deltaY * 0.1
+  function onWheel(event: WheelEvent) {
+    const delta = event.deltaY * 0.08
     state.targetSpringLength = Math.max(
       state.distanceMin,
       Math.min(state.distanceMax, state.targetSpringLength + delta),

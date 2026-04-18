@@ -4,19 +4,22 @@ import { useUIStore } from '@/stores/uiStore'
 const uiStore = useUIStore()
 
 const floors = [
-  { id: 'overview', label: '总览', icon: '🏠' },
-  { id: 'F1', label: '1F', icon: '1' },
-  { id: 'F2', label: '2F', icon: '2' },
-  { id: 'F3', label: '3F', icon: '3' },
+  { id: 'F3', label: 'F3', detail: '' },
+  { id: 'F2', label: 'F2', detail: '' },
+  { id: 'F1', label: 'F1', detail: '' },
+  { id: 'overview', label: 'All', detail: '' },
 ]
 
 function selectFloor(floorId: string) {
   uiStore.setActiveFloor(floorId)
+  if (floorId === 'overview') {
+    uiStore.setActiveDevice(null)
+  }
 }
 </script>
 
 <template>
-  <div class="floor-selector">
+  <nav class="floor-selector">
     <button
       v-for="floor in floors"
       :key="floor.id"
@@ -24,95 +27,81 @@ function selectFloor(floorId: string) {
       :class="{ active: uiStore.activeFloor === floor.id }"
       @click="selectFloor(floor.id)"
     >
-      <div class="floor-indicator" />
-      <div class="floor-content">
-        <span class="floor-icon">{{ floor.icon }}</span>
-        <span class="floor-label">{{ floor.label }}</span>
-      </div>
+      <span class="floor-btn__index">{{ floor.label }}</span>
+      <span v-if="floor.detail" class="floor-btn__detail">{{ floor.detail }}</span>
     </button>
-  </div>
+  </nav>
 </template>
 
 <style scoped>
 .floor-selector {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  justify-content: center;
+  gap: 2px;
+  width: 60px;
 }
 
 .floor-btn {
+  position: relative;
+  width: 60px;
+  height: 94px;
   display: flex;
   align-items: center;
-  width: 60px;
-  height: 60px;
-  border: none;
+  justify-content: center;
+  border: 0;
   background: transparent;
+  color: rgba(244, 246, 248, 0.72);
   cursor: pointer;
-  position: relative;
-  transition: all var(--transition-normal);
+  transition: color var(--transition-fast), transform var(--transition-fast);
 }
 
 .floor-btn:hover {
-  transform: scale(1.1);
+  color: rgba(244, 246, 248, 0.92);
 }
 
-.floor-indicator {
+.floor-btn.active {
+  color: var(--color-primary);
+}
+
+.floor-btn.active::before {
+  content: '';
   position: absolute;
-  left: 0;
-  top: 50%;
-  transform: translateY(-50%);
+  left: -6px;
   width: 2px;
-  height: 0;
+  height: 36px;
   background: var(--color-primary);
-  border-radius: 1px;
-  transition: height var(--transition-normal);
+  box-shadow: 0 0 10px rgba(255, 231, 74, 0.24);
 }
 
-.floor-btn.active .floor-indicator {
-  height: 30px;
-}
-
-.floor-content {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  width: 100%;
-  height: 100%;
-  gap: 2px;
-  background: var(--panel-bg);
-  backdrop-filter: var(--panel-blur);
-  -webkit-backdrop-filter: var(--panel-blur);
-  border: var(--panel-border);
-  border-radius: var(--panel-radius);
-  margin-left: 6px;
-  transition: all var(--transition-normal);
-}
-
-.floor-btn.active .floor-content {
-  background: rgba(255, 255, 255, 0.1);
-  border-color: rgba(255, 231, 74, 0.3);
-}
-
-.floor-icon {
-  font-size: 16px;
-  font-weight: 700;
-  color: var(--color-text-secondary);
+.floor-btn__index {
+  font-size: 18px;
   line-height: 1;
+  font-weight: 500;
+  letter-spacing: -0.04em;
 }
 
-.floor-btn.active .floor-icon {
-  color: var(--color-primary);
+.floor-btn__detail {
+  display: none;
 }
 
-.floor-label {
-  font-size: 9px;
-  color: var(--color-text-secondary);
-  transition: color var(--transition-normal);
-}
+@media (max-width: 820px) {
+  .floor-selector {
+    flex-direction: row-reverse;
+    width: auto;
+    gap: 8px;
+  }
 
-.floor-btn.active .floor-label {
-  color: var(--color-primary);
-  font-weight: 600;
+  .floor-btn {
+    width: 52px;
+    height: 52px;
+  }
+
+  .floor-btn.active::before {
+    left: 13px;
+    bottom: -2px;
+    width: 26px;
+    height: 2px;
+  }
 }
 </style>

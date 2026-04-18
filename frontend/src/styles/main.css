@@ -4,13 +4,30 @@
 @import "./animations.css";
 
 @layer base {
+  * {
+    box-sizing: border-box;
+  }
+
+  html,
   body {
     margin: 0;
+    min-height: 100%;
     background: var(--color-bg);
     color: var(--color-text-primary);
-    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'PingFang SC', system-ui, sans-serif;
+    font-family: "SF Pro Display", "SF Pro Text", -apple-system, BlinkMacSystemFont, "PingFang SC", "Segoe UI", sans-serif;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    overscroll-behavior: none;
+  }
+
+  button,
+  input,
+  textarea,
+  select {
+    font: inherit;
   }
 
   #app {
@@ -19,9 +36,9 @@
     overflow: hidden;
   }
 
-  /* Scrollbar */
   ::-webkit-scrollbar {
     width: 4px;
+    height: 4px;
   }
 
   ::-webkit-scrollbar-track {
@@ -29,22 +46,17 @@
   }
 
   ::-webkit-scrollbar-thumb {
-    background: rgba(255, 255, 255, 0.1);
-    border-radius: 2px;
+    background: rgba(255, 255, 255, 0.16);
+    border-radius: 999px;
   }
 
-  ::-webkit-scrollbar-thumb:hover {
-    background: rgba(255, 255, 255, 0.2);
-  }
-
-  /* Slider track */
   input[type="range"] {
     -webkit-appearance: none;
     appearance: none;
     width: 100%;
     height: 3px;
-    background: rgba(255, 255, 255, 0.1);
-    border-radius: 2px;
+    background: rgba(255, 255, 255, 0.12);
+    border-radius: 999px;
     outline: none;
   }
 
@@ -54,12 +66,81 @@
     height: 12px;
     border-radius: 50%;
     background: var(--color-primary);
+    box-shadow: 0 0 0 4px rgba(255, 231, 74, 0.12);
     cursor: pointer;
   }
 }
 
-/* Utility classes (outside layers for highest specificity) */
 .no-select {
   -webkit-user-select: none;
   user-select: none;
+}
+
+.showroom-card {
+  padding: 12px;
+}
+
+.scene-label-layer {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 4;
+}
+
+.scene-label-layer > div {
+  pointer-events: none;
+}
+
+.scene-floor-label {
+  min-width: 156px;
+  padding: 10px;
+  border-radius: 2px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(8, 10, 14, 0.78);
+  box-shadow: 0 14px 28px rgba(0, 0, 0, 0.18);
+  backdrop-filter: blur(10px);
+  color: var(--color-text-primary);
+  pointer-events: auto;
+}
+
+.scene-floor-label__title {
+  margin: 0 0 4px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.scene-floor-label__sub {
+  margin: 0 0 10px;
+  font-size: 11px;
+  color: var(--color-text-secondary);
+}
+
+.scene-floor-label__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.scene-floor-label__chip {
+  min-height: 26px;
+  padding: 0 8px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--color-text-secondary);
+  font-size: 10px;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.scene-floor-label__chip:hover,
+.scene-floor-label__chip.active {
+  border-color: rgba(255, 231, 74, 0.42);
+  background: rgba(255, 231, 74, 0.1);
+  color: var(--color-primary);
+}
+
+.scene-floor-label__chip.live {
+  color: var(--color-text-primary);
 }

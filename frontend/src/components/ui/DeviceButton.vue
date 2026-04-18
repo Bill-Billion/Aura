@@ -12,12 +12,7 @@ defineEmits<{
 </script>
 
 <template>
-  <button
-    class="device-btn"
-    :class="{ active, disabled }"
-    :disabled="disabled"
-    @click="$emit('click')"
-  >
+  <button class="device-btn" :class="{ active, disabled }" :disabled="disabled" @click="$emit('click')">
     <span v-if="icon" class="btn-icon">{{ icon }}</span>
     <span class="btn-label">{{ label }}</span>
   </button>
@@ -29,22 +24,19 @@ defineEmits<{
   align-items: center;
   justify-content: center;
   gap: 4px;
-  padding: 6px 14px;
-  min-height: 32px;
-  border: none;
-  border-radius: 6px;
-  background: rgba(97, 97, 97, 0.6);
+  min-height: 34px;
+  padding: 0 14px;
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.03);
   color: var(--color-text-secondary);
-  font-size: 12px;
-  font-weight: 500;
   cursor: pointer;
-  transition: all var(--transition-normal);
+  transition: all var(--transition-fast);
   white-space: nowrap;
-  user-select: none;
 }
 
 .device-btn:hover:not(:disabled):not(.active) {
-  background: rgba(97, 97, 97, 0.8);
+  border-color: rgba(255, 231, 74, 0.34);
   color: var(--color-text-primary);
 }
 
@@ -53,9 +45,9 @@ defineEmits<{
 }
 
 .device-btn.active {
-  background: var(--color-primary);
-  color: #000;
-  font-weight: 600;
+  border-color: rgba(255, 231, 74, 0.48);
+  background: rgba(255, 231, 74, 0.08);
+  color: var(--color-primary);
 }
 
 .device-btn.disabled {
@@ -63,7 +55,7 @@ defineEmits<{
   cursor: not-allowed;
 }
 
-.btn-icon {
-  font-size: 14px;
+.btn-label {
+  font-size: 12px;
 }
 </style>

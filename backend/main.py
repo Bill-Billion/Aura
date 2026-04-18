@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
@@ -20,7 +21,7 @@ from backend.engine.state import (
     UserState,
     WorldState,
 )
-from backend.engine.event_bus import EventBus
+from backend.engine.event_bus import EventBus, SimEvent
 from backend.engine.simulation import SimulationEngine
 from backend.engine.state_manager import StateManager
 from backend.models.schemas import WSMessage
@@ -34,6 +35,12 @@ manager = ConnectionManager()
 event_bus = EventBus()
 state_manager: StateManager | None = None
 simulation_engine: SimulationEngine | None = None
+
+
+async def _broadcast_sim_event(event: SimEvent) -> SimEvent:
+    await event_bus.publish(event)
+    await manager.broadcast(WSMessage(type="SIM_EVENT", payload=event.model_dump()))
+    return event
 
 
 # ---------------------------------------------------------------------------
@@ -220,12 +227,49 @@ async def ws_simulation(ws: WebSocket) -> None:
                         "user", device_id, prop, value
                     )
 
+                root_event = event_bus.coerce_event(
+                    SimEvent(
+                        event_type="user.command",
+                        source="user_ui",
+                        timestamp=float(state_manager.world.simulation_tick),
+                        wall_time=time.time(),
+                        priority=2,
+                        data={
+                            "message_type": msg_type,
+                            "device_id": device_id,
+                            "action": action or prop,
+                            "params": params if params else {"value": value},
+                        },
+                    )
+                )
+                await event_bus.publish(root_event)
+
                 if deltas:
                     delta_payload = {
                         "deltas": [d.model_dump() for d in deltas],
                     }
                     await manager.broadcast(
                         WSMessage(type="STATE_DELTA", payload=delta_payload)
+                    )
+                    await manager.broadcast(
+                        WSMessage(type="SIM_EVENT", payload=root_event.model_dump())
+                    )
+                    for delta in deltas:
+                        await _broadcast_sim_event(
+                            SimEvent(
+                                event_type="feedback.state_delta",
+                                source="state_manager",
+                                timestamp=float(state_manager.world.simulation_tick),
+                                wall_time=time.time(),
+                                correlation_id=root_event.correlation_id,
+                                causal_parent=root_event.event_id,
+                                priority=1,
+                                data=delta.model_dump(),
+                            )
+                        )
+                else:
+                    await manager.broadcast(
+                        WSMessage(type="SIM_EVENT", payload=root_event.model_dump())
                     )
 
             elif msg_type == "CMD_SIM_START":

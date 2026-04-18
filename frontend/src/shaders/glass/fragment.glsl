@@ -1,6 +1,3 @@
-// I3 class fragment shader — walls and glass
-// Fresnel transparency + height fade + matcap + SDF lights
-
 precision highp float;
 
 SDF_LIGHTS_PLACEHOLDER
@@ -16,58 +13,37 @@ uniform vec3 color;
 uniform float opacity;
 uniform float opaque;
 uniform float envIntensity;
+uniform float u_lightIntensity;
 
 void main() {
     vec3 v = normalize(v_view);
     vec3 n = normalize(v_normal);
 
-    float NoV = dot(n, v);
-    float NoY = dot(n, v_up);
-    float top = step(0.98, NoY) * step(0.5, v_position.y);
-    float mirror = step(0.0, v_up.y);
+    float NoV = max(dot(n, v), 0.0);
+    float fresnel = pow(1.0 - NoV, 2.8);
+    float verticalFade = smoothstep(-0.2, 2.6, v_position.y);
+    float topMask = smoothstep(0.92, 1.0, dot(n, v_up));
 
-    // Matcap UV
     vec3 x = normalize(vec3(v.z, 0.0, -v.x));
     vec3 y = cross(v, x);
     vec2 uv = vec2(dot(x, n), dot(y, n)) * 0.495 + 0.5;
 
-    // Wall matcap: slightly lower minimum than K class
-    vec3 matcap = vec3(mix(0.2, 0.8, uv.y));
+    vec3 matcap = vec3(mix(0.16, 0.58, uv.y));
+    vec3 diffuse = mix(color * 0.32, color * 0.74, envIntensity);
+    vec3 lightBloom = vec3(0.76, 0.84, 0.96) * getLightAttenuation(v_worldPos) * u_lightIntensity;
+    vec3 haze = mix(vec3(0.11, 0.13, 0.16), color, 0.26 + fresnel * 0.24);
 
-    vec3 diffuse = color;
-    vec3 irradiance = mix(color * 0.5, vec3(1.0), envIntensity);
-
-    // Top light calculation
-    vec3 topLight = mix(vec3(1.0), vec3(0.5), getTopAttenuation(v_worldPos));
-    diffuse = mix(diffuse, mix(topLight, vec3(0.9), envIntensity), mirror * top);
-
-    // Alpha: Fresnel-based transparency with enhanced edge outline
-    float fresnel = pow(1.0 - abs(NoV), 2.5);
-    float alpha = opacity;
-    alpha = mix(0.15, 0.95, fresnel) * alpha;
-    alpha = mix(alpha, 1.0, opaque);
-    alpha = mix(0.0, alpha, step(0.5, step(0.0, NoV)));
-    alpha = mix(alpha, 1.0, top);
-    alpha *= smoothstep(5.0, 15.0, v_view.z);
-
-    // Combine
     vec3 outputColor = diffuse;
-    outputColor += irradiance * getLightAttenuation(v_worldPos);
+    outputColor += lightBloom * 0.32;
     outputColor *= matcap;
-    outputColor *= mix(0.65, 1.0, smoothstep(0.0, 2.0, v_position.y));
+    outputColor = mix(outputColor, haze, 0.34 + fresnel * 0.18);
+    outputColor += topMask * 0.03;
 
-    // White edge outline (gamemcu: visible white contour on walls)
-    outputColor += vec3(0.15) * fresnel;
+    float alpha = mix(0.05, 0.28, fresnel) * opacity;
+    alpha *= mix(0.78, 1.0, verticalFade);
+    alpha = mix(alpha, 1.0, opaque);
 
-    // Height-based alpha fade
-    float a = 1.0 - smoothstep(0.0, 2.5, v_position.y);
-
-    // Front/back face mixing
-    gl_FragColor = mix(
-        vec4(outputColor * 0.65, alpha * a),
-        vec4(outputColor, alpha),
-        mirror
-    );
+    gl_FragColor = vec4(outputColor, alpha);
 
     #include <tonemapping_fragment>
     #include <colorspace_fragment>

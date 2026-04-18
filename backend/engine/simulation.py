@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 
 from backend.agents.hvac import HVACAgent
 from backend.agents.lighting import LightingAgent
 from backend.agents.runtime import AgentRuntime
 from backend.api.ws import ConnectionManager
 from backend.core.logging import log
-from backend.engine.event_bus import EventBus
+from backend.engine.event_bus import EventBus, SimEvent, WorldEvent
 from backend.engine.state import AgentRuntimeState
 from backend.engine.state_manager import StateManager
 from backend.models.schemas import WSMessage
@@ -115,8 +116,15 @@ class SimulationEngine:
 
         # 3. User behaviour simulation → publish events
         user_events = self.user_sim.step(world)
+        published_user_events: list[SimEvent] = []
         for event in user_events:
-            await self.event_bus.publish(event)
+            sim_event = SimEvent.from_world_event(
+                event,
+                timestamp=float(world.simulation_tick),
+                wall_time=time.time(),
+                priority=2,
+            )
+            published_user_events.append(await self._publish_sim_event(sim_event))
 
         # 4. Environment physics step
         self.env_sim.step(world, dt=self.SIMULATED_DT)
@@ -124,7 +132,14 @@ class SimulationEngine:
         # 5. Agent decisions → apply actions
         actions = await self.agent_runtime.step(world)
         all_deltas: list[dict] = []
+        root_event = published_user_events[-1] if published_user_events else None
         for action in actions:
+            action_event = self._build_action_event(
+                world_tick=world.simulation_tick,
+                action=action,
+                root_event=root_event,
+            )
+            published_action = await self._publish_sim_event(action_event)
             try:
                 deltas = self.state_manager.apply_action(
                     agent_id=action["agent_id"],
@@ -134,6 +149,18 @@ class SimulationEngine:
                     reason=action.get("reason", ""),
                 )
                 all_deltas.extend(d.model_dump() for d in deltas)
+                for delta in deltas:
+                    feedback_event = SimEvent(
+                        event_type="feedback.state_delta",
+                        source="state_manager",
+                        timestamp=float(world.simulation_tick),
+                        wall_time=time.time(),
+                        correlation_id=published_action.correlation_id,
+                        causal_parent=published_action.event_id,
+                        priority=1,
+                        data=delta.model_dump(),
+                    )
+                    await self._publish_sim_event(feedback_event)
             except KeyError:
                 log.warning(
                     "agent_action_failed",
@@ -178,6 +205,39 @@ class SimulationEngine:
         new_h = int(total_minutes // 60)
         new_m = int(total_minutes % 60)
         world.environment.time_of_day = f"{new_h:02d}:{new_m:02d}"
+
+    def _build_action_event(
+        self,
+        world_tick: int,
+        action: dict,
+        root_event: SimEvent | None,
+    ) -> SimEvent:
+        correlation_id = root_event.correlation_id if root_event else None
+        causal_parent = root_event.event_id if root_event else None
+        return SimEvent(
+            event_type="action.device_control",
+            source=action["agent_id"],
+            timestamp=float(world_tick),
+            wall_time=time.time(),
+            correlation_id=correlation_id or uuid.uuid4().hex,
+            causal_parent=causal_parent,
+            priority=2,
+            data={
+                "agent_name": action.get("agent_name", ""),
+                "device_id": action["device_id"],
+                "property": action["property"],
+                "value": action["value"],
+                "reason": action.get("reason", ""),
+            },
+        )
+
+    async def _publish_sim_event(self, event: WorldEvent | SimEvent) -> SimEvent:
+        sim_event = self.event_bus.coerce_event(event)
+        await self.event_bus.publish(sim_event)
+        await self.conn.broadcast(
+            WSMessage(type="SIM_EVENT", payload=sim_event.model_dump())
+        )
+        return sim_event
 
     def _sync_agent_states(
         self,

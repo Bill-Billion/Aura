@@ -23,8 +23,7 @@ const emit = defineEmits<{
         :disabled="disabled"
         @click="emit('update:modelValue', opt.value)"
       >
-        <span class="level-text">{{ opt.label }}</span>
-        <div class="level-line" />
+        {{ opt.label }}
       </button>
     </div>
   </div>
@@ -34,7 +33,7 @@ const emit = defineEmits<{
 .level-selector {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
 }
 
 .level-selector.disabled {
@@ -43,56 +42,34 @@ const emit = defineEmits<{
 }
 
 .level-label {
-  font-size: 10px;
+  font-size: 11px;
   color: var(--color-text-secondary);
 }
 
 .level-options {
-  display: flex;
-  gap: 0;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
 }
 
 .level-btn {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 4px;
-  padding: 6px 8px;
-  border: none;
-  background: transparent;
+  min-height: 34px;
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--color-text-secondary);
   cursor: pointer;
   transition: all var(--transition-fast);
 }
 
-.level-text {
-  font-size: 11px;
-  color: var(--color-text-secondary);
-  transition: color var(--transition-fast);
-}
-
-.level-btn.active .level-text {
-  color: var(--color-primary);
-  font-weight: 600;
-}
-
-.level-line {
-  width: 100%;
-  height: 2px;
-  background: var(--color-text-muted);
-  border-radius: 1px;
-  transition: background var(--transition-fast);
-}
-
-.level-btn.active .level-line {
-  background: var(--color-primary);
-}
-
-.level-btn:hover:not(:disabled):not(.active) .level-text {
+.level-btn:hover:not(:disabled):not(.active) {
   color: var(--color-text-primary);
+  border-color: rgba(255, 231, 74, 0.34);
 }
 
-.level-btn:hover:not(:disabled):not(.active) .level-line {
-  background: var(--color-text-secondary);
+.level-btn.active {
+  border-color: rgba(255, 231, 74, 0.48);
+  background: rgba(255, 231, 74, 0.08);
+  color: var(--color-primary);
 }
 </style>

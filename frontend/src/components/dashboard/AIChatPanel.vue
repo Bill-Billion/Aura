@@ -25,23 +25,26 @@ watch(
 
 const agentColors: Record<string, string> = {
   lighting_agent: '#ffe74a',
-  hvac_agent: '#4FC3F7',
-  user_sim: '#4ade80',
+  hvac_agent: '#66c6ff',
+  user_sim: '#8ddf9d',
 }
 
 function getAgentColor(name: string): string {
-  return agentColors[name] ?? '#8b5cf6'
+  return agentColors[name] ?? '#b5bec8'
 }
 
 function formatTime(ts: number): string {
-  const d = new Date(ts)
-  return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+  return new Date(ts).toLocaleTimeString('zh-CN', {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  })
 }
 
 const quickActions = [
-  { label: '全部开灯', action: () => batchControl('light', 'turn_on') },
-  { label: '全部关灯', action: () => batchControl('light', 'turn_off') },
-  { label: '全部关闭', action: () => batchControl('all', 'turn_off') },
+  { label: '全屋开灯', action: () => batchControl('light', 'turn_on') },
+  { label: '全屋关灯', action: () => batchControl('light', 'turn_off') },
+  { label: '设备归零', action: () => batchControl('all', 'turn_off') },
 ]
 
 function batchControl(type: string, action: string) {
@@ -51,57 +54,48 @@ function batchControl(type: string, action: string) {
     }
   }
 }
-
-function close() {
-  uiStore.sidebarOpen = false
-}
 </script>
 
 <template>
-  <div class="chat-panel">
-    <div class="chat-header">
-      <span class="header-title">AI 助手</span>
-      <button class="close-btn" @click="close">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
-      </button>
-    </div>
+  <section class="chat-panel">
+    <header class="chat-header">
+      <div>
+        <p class="chat-header__eyebrow">Auxiliary Feed</p>
+        <h2 class="chat-header__title">Agent Log</h2>
+      </div>
+      <button class="close-btn" @click="uiStore.sidebarOpen = false">关闭</button>
+    </header>
 
     <div ref="scrollContainer" class="chat-messages">
       <template v-if="logEntries.length > 0">
-        <div
+        <article
           v-for="(entry, idx) in logEntries"
           :key="idx"
           class="message-bubble"
-          :style="{ borderLeftColor: getAgentColor(entry.agent_name) }"
+          :style="{ '--agent-color': getAgentColor(entry.agent_name) }"
         >
           <div class="msg-header">
-            <span class="msg-agent" :style="{ color: getAgentColor(entry.agent_name) }">
-              {{ entry.agent_name }}
-            </span>
+            <span class="msg-agent">{{ entry.agent_name }}</span>
             <span class="msg-time">{{ formatTime(entry.timestamp) }}</span>
           </div>
           <div class="msg-action">{{ entry.action }}</div>
           <div v-if="entry.reason" class="msg-reason">{{ entry.reason }}</div>
-        </div>
+        </article>
       </template>
-      <div v-else class="empty-state">
-        等待 Agent 决策...
-      </div>
+      <div v-else class="empty-state">当前没有新的 Agent 动作日志。</div>
     </div>
 
-    <div class="chat-footer">
-      <div class="quick-actions">
-        <button
-          v-for="qa in quickActions"
-          :key="qa.label"
-          class="quick-btn"
-          @click="qa.action"
-        >
-          {{ qa.label }}
-        </button>
-      </div>
-    </div>
-  </div>
+    <footer class="chat-footer">
+      <button
+        v-for="qa in quickActions"
+        :key="qa.label"
+        class="quick-btn"
+        @click="qa.action"
+      >
+        {{ qa.label }}
+      </button>
+    </footer>
+  </section>
 </template>
 
 <style scoped>
@@ -109,127 +103,109 @@ function close() {
   display: flex;
   flex-direction: column;
   height: 100%;
-  background: var(--panel-bg-solid);
-  border-left: 1px solid var(--color-border-strong);
+  background: rgba(9, 12, 16, 0.96);
+  border-left: 1px solid rgba(255, 255, 255, 0.06);
+  backdrop-filter: blur(22px);
 }
 
 .chat-header {
   display: flex;
   justify-content: space-between;
-  align-items: center;
-  padding: 16px 16px 12px;
-  border-bottom: 1px solid var(--color-border);
-  flex-shrink: 0;
+  align-items: flex-start;
+  gap: 16px;
+  padding: 20px 18px 16px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
 }
 
-.header-title {
-  font-size: 14px;
-  font-weight: 700;
-  color: var(--color-text-primary);
+.chat-header__eyebrow {
+  margin: 0 0 6px;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--color-text-muted);
 }
 
-.close-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 28px;
-  height: 28px;
-  border: none;
-  border-radius: 6px;
-  background: transparent;
+.chat-header__title {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 600;
+}
+
+.close-btn,
+.quick-btn {
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.03);
   color: var(--color-text-secondary);
   cursor: pointer;
   transition: all var(--transition-fast);
 }
 
-.close-btn:hover {
-  background: rgba(255, 255, 255, 0.08);
+.close-btn {
+  min-width: 58px;
+  height: 30px;
+}
+
+.close-btn:hover,
+.quick-btn:hover {
   color: var(--color-text-primary);
+  border-color: rgba(255, 231, 74, 0.36);
 }
 
 .chat-messages {
   flex: 1;
   overflow-y: auto;
-  padding: 12px 16px;
+  padding: 14px 18px;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 10px;
 }
 
 .message-bubble {
-  padding: 8px 10px;
-  border-left: 3px solid;
-  border-radius: 0 6px 6px 0;
+  padding: 12px 14px;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  border-radius: 16px;
   background: rgba(255, 255, 255, 0.03);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.015);
 }
 
 .msg-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-bottom: 4px;
+  gap: 8px;
+  margin-bottom: 8px;
 }
 
 .msg-agent {
+  color: var(--agent-color);
   font-size: 11px;
-  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
 }
 
-.msg-time {
-  font-size: 10px;
-  color: var(--color-text-muted);
+.msg-time,
+.msg-reason,
+.empty-state {
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  line-height: 1.5;
 }
 
 .msg-action {
-  font-size: 12px;
-  color: var(--color-text-primary);
-  line-height: 1.4;
-}
-
-.msg-reason {
-  font-size: 11px;
-  color: var(--color-text-secondary);
-  font-style: italic;
-  margin-top: 3px;
-  line-height: 1.3;
-}
-
-.empty-state {
-  text-align: center;
-  color: var(--color-text-muted);
-  font-size: 12px;
-  padding: 40px 0;
+  font-size: 13px;
+  line-height: 1.5;
 }
 
 .chat-footer {
-  border-top: 1px solid var(--color-border);
-  padding: 12px 16px;
-  flex-shrink: 0;
-}
-
-.quick-actions {
-  display: flex;
-  gap: 6px;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  padding: 16px 18px 20px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
 }
 
 .quick-btn {
-  flex: 1;
-  min-width: 0;
-  padding: 6px 8px;
-  border: 1px solid var(--color-border);
-  border-radius: 6px;
-  background: transparent;
-  color: var(--color-text-secondary);
-  font-size: 11px;
-  cursor: pointer;
-  transition: all var(--transition-fast);
-  white-space: nowrap;
-}
-
-.quick-btn:hover {
-  border-color: var(--color-primary);
-  color: var(--color-primary);
-  background: rgba(255, 231, 74, 0.06);
+  min-height: 36px;
 }
 </style>

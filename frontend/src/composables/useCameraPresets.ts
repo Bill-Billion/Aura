@@ -1,5 +1,4 @@
 import type { CameraPreset, GamemcuSceneConfig } from '@/types/model-types'
-import * as THREE from 'three'
 
 export function useCameraPresets(config: GamemcuSceneConfig) {
 
@@ -22,7 +21,7 @@ export function useCameraPresets(config: GamemcuSceneConfig) {
     }
   }
 
-  function devicePreset(deviceId: string): CameraPreset {
+  function devicePreset(_deviceId: string): CameraPreset {
     // Default close-up preset
     return {
       springLength: 14,

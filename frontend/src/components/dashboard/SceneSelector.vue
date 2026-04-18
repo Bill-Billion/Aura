@@ -8,46 +8,64 @@ const worldStore = useWorldStore()
 const { sendCommand } = useWebSocket()
 
 const scenes = [
-  { id: 'morning', label: '清晨模式', icon: '🌅', desc: '开灯 75%、暖光、开窗帘' },
-  { id: 'day', label: '白天模式', icon: '☀️', desc: '关灯、开窗帘' },
-  { id: 'evening', label: '傍晚模式', icon: '🌇', desc: '开灯 60%、暖光' },
-  { id: 'night', label: '夜间模式', icon: '🌙', desc: '关灯、关窗帘、降温' },
+  { id: 'reading', label: '阅读模式', desc: '局部暖光和半开窗帘' },
+  { id: 'entertainment', label: '娱乐模式', desc: '保持低亮度，强化客厅氛围' },
+  { id: 'away', label: '离家模式', desc: '收束灯光和窗帘，压低存在感' },
+  { id: 'sleep', label: '睡眠模式', desc: '关闭主要灯光，空调归夜间值' },
 ]
 
 function applyScene(sceneId: string) {
   const devices = Object.entries(worldStore.devices)
 
   switch (sceneId) {
-    case 'morning':
+    case 'reading':
       for (const [id, dev] of devices) {
         if (dev.type === 'light') {
           sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'turn_on' })
-          sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'set_state', params: { brightness: 75, color_temp: 3000 } })
+          sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'set_state', params: { brightness: 68, color_temp: 3400 } })
         }
         if (dev.type === 'curtain') {
-          sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'set_state', params: { open_percent: 80 } })
+          sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'set_state', params: { open_percent: 52 } })
         }
       }
       break
-    case 'day':
-      for (const [id, dev] of devices) {
-        if (dev.type === 'light') sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'turn_off' })
-        if (dev.type === 'curtain') sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'set_state', params: { open_percent: 100 } })
-      }
-      break
-    case 'evening':
+    case 'entertainment':
       for (const [id, dev] of devices) {
         if (dev.type === 'light') {
           sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'turn_on' })
-          sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'set_state', params: { brightness: 60, color_temp: 2700 } })
+          sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'set_state', params: { brightness: 42, color_temp: 2850 } })
+        }
+        if (dev.type === 'curtain') {
+          sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'set_state', params: { open_percent: 28 } })
+        }
+        if (dev.type === 'hvac') {
+          sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'turn_on' })
+          sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'set_state', params: { target_temp: 24, mode: 'cool' } })
         }
       }
       break
-    case 'night':
+    case 'away':
       for (const [id, dev] of devices) {
-        if (dev.type === 'light') sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'turn_off' })
-        if (dev.type === 'curtain') sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'set_state', params: { open_percent: 0 } })
-        if (dev.type === 'hvac') sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'set_state', params: { target_temp: 22 } })
+        if (dev.type === 'light' || dev.type === 'hvac') {
+          sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'turn_off' })
+        }
+        if (dev.type === 'curtain') {
+          sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'set_state', params: { open_percent: 0 } })
+        }
+      }
+      break
+    case 'sleep':
+      for (const [id, dev] of devices) {
+        if (dev.type === 'light') {
+          sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'turn_off' })
+        }
+        if (dev.type === 'curtain') {
+          sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'set_state', params: { open_percent: 0 } })
+        }
+        if (dev.type === 'hvac') {
+          sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'turn_on' })
+          sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'set_state', params: { target_temp: 22, mode: 'cool' } })
+        }
       }
       break
   }
@@ -58,9 +76,13 @@ function applyScene(sceneId: string) {
 
 <template>
   <div class="scene-backdrop" @click.self="uiStore.sceneSelectorOpen = false">
-    <div class="scene-selector glass-panel">
+    <div class="scene-selector showroom-card">
       <div class="selector-header">
-        <span class="selector-title">场景预设</span>
+        <div>
+          <p class="selector-eyebrow">Scene Presets</p>
+          <h2 class="selector-title">场景预设</h2>
+        </div>
+        <button class="selector-close" @click="uiStore.sceneSelectorOpen = false">关闭</button>
       </div>
       <div class="scene-list">
         <button
@@ -69,7 +91,6 @@ function applyScene(sceneId: string) {
           class="scene-item"
           @click="applyScene(scene.id)"
         >
-          <span class="scene-icon">{{ scene.icon }}</span>
           <div class="scene-info">
             <span class="scene-label">{{ scene.label }}</span>
             <span class="scene-desc">{{ scene.desc }}</span>
@@ -87,76 +108,85 @@ function applyScene(sceneId: string) {
   display: flex;
   align-items: center;
   justify-content: center;
+  background: rgba(5, 7, 10, 0.48);
+  backdrop-filter: blur(12px);
   z-index: var(--z-modal);
   pointer-events: auto;
 }
 
 .scene-selector {
-  width: 300px;
-  padding: 16px;
+  width: min(360px, calc(100vw - 32px));
 }
 
 .selector-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
   margin-bottom: 12px;
 }
 
+.selector-eyebrow {
+  margin: 0 0 6px;
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+}
+
 .selector-title {
-  font-size: 14px;
-  font-weight: 700;
-  color: var(--color-text-primary);
+  margin: 0;
+  font-size: 22px;
+  font-weight: 600;
+}
+
+.selector-close {
+  min-width: 58px;
+  height: 30px;
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--color-text-secondary);
+  cursor: pointer;
 }
 
 .scene-list {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 6px;
 }
 
 .scene-item {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 12px;
-  border: none;
-  border-radius: 8px;
-  background: transparent;
+  min-height: 72px;
+  padding: 0 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--color-text-primary);
   cursor: pointer;
-  transition: all var(--transition-fast);
   text-align: left;
+  transition: all var(--transition-fast);
 }
 
 .scene-item:hover {
-  background: rgba(255, 255, 255, 0.06);
-}
-
-.scene-item:active {
-  background: var(--color-primary);
-}
-
-.scene-item:active .scene-label,
-.scene-item:active .scene-desc {
-  color: #000;
-}
-
-.scene-icon {
-  font-size: 24px;
-  flex-shrink: 0;
+  border-color: rgba(255, 231, 74, 0.4);
 }
 
 .scene-info {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 4px;
 }
 
 .scene-label {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--color-text-primary);
+  font-size: 16px;
 }
 
 .scene-desc {
-  font-size: 10px;
+  font-size: 12px;
   color: var(--color-text-secondary);
+  line-height: 1.5;
 }
 </style>

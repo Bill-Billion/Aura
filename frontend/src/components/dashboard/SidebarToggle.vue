@@ -8,40 +8,42 @@ const uiStore = useUIStore()
   <button
     class="sidebar-toggle"
     :class="{ active: uiStore.sidebarOpen }"
+    title="事件日志"
     @click="uiStore.toggleSidebar()"
-    title="AI 助手"
   >
-    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-      <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-    </svg>
+    <span class="sidebar-toggle__label">日志</span>
   </button>
 </template>
 
 <style scoped>
 .sidebar-toggle {
-  display: flex;
+  display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 36px;
+  min-width: 68px;
   height: 36px;
-  border: var(--panel-border);
-  border-radius: var(--panel-radius);
-  background: var(--panel-bg);
-  backdrop-filter: var(--panel-blur);
-  -webkit-backdrop-filter: var(--panel-blur);
-  color: var(--color-text-secondary);
+  padding: 0 12px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.02);
+  color: var(--color-text-muted);
   cursor: pointer;
-  transition: all var(--transition-normal);
+  transition: all var(--transition-fast);
 }
 
 .sidebar-toggle:hover {
+  border-color: rgba(255, 255, 255, 0.14);
   color: var(--color-text-primary);
-  border-color: var(--color-border-strong);
 }
 
 .sidebar-toggle.active {
+  border-color: rgba(255, 231, 74, 0.42);
   color: var(--color-primary);
-  border-color: rgba(255, 231, 74, 0.3);
-  background: rgba(255, 231, 74, 0.08);
+}
+
+.sidebar-toggle__label {
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
 }
 </style>
