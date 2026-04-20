@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import copy
+import re
+
 from pydantic import BaseModel, Field
 from typing import Any
 
@@ -18,6 +21,8 @@ class DeltaChange(BaseModel):
 
 class StateManager:
     """Owns the canonical WorldState and exposes mutation + query helpers."""
+
+    _PATH_TOKEN_RE = re.compile(r"([^\.\[\]]+)|\[([^\]]+)\]")
 
     def __init__(self, world: WorldState | None = None):
         self.world = world if world is not None else WorldState()
@@ -45,39 +50,68 @@ class StateManager:
         if device is None:
             raise KeyError(f"Device '{device_id}' not found in world state")
 
-        deltas: list[DeltaChange] = []
-
-        old_value = self._get_nested(device.state, property_path)
-        if old_value == new_value:
-            return deltas  # no change needed
-
-        self._set_nested(device.state, property_path, new_value)
-
-        deltas.append(
-            DeltaChange(
-                path=f"devices[{device_id}].state.{property_path}",
-                old_value=old_value,
-                new_value=new_value,
-                caused_by=agent_id,
-                reason=reason,
-            )
+        deltas = self.apply_path_update(
+            caused_by=agent_id,
+            path=f"devices[{device_id}].state.{property_path}",
+            new_value=new_value,
+            reason=reason,
         )
+        if not deltas:
+            return []
 
         # Always record who last changed the device
         if property_path != "last_changed_by":
             prev_agent = device.state.last_changed_by
-            device.state.last_changed_by = agent_id
             if prev_agent != agent_id:
-                deltas.append(
-                    DeltaChange(
-                        path=f"devices[{device_id}].state.last_changed_by",
-                        old_value=prev_agent,
-                        new_value=agent_id,
+                deltas.extend(
+                    self.apply_path_update(
                         caused_by=agent_id,
+                        path=f"devices[{device_id}].state.last_changed_by",
+                        new_value=agent_id,
                         reason="auto-update on action",
                     )
                 )
 
+        return deltas
+
+    def apply_path_update(
+        self,
+        caused_by: str,
+        path: str,
+        new_value: Any,
+        reason: str = "",
+    ) -> list[DeltaChange]:
+        old_value = self._get_nested(self.world, path)
+        if old_value == new_value:
+            return []
+
+        self._set_nested(self.world, path, new_value)
+        return [
+            DeltaChange(
+                path=path,
+                old_value=copy.deepcopy(old_value),
+                new_value=copy.deepcopy(new_value),
+                caused_by=caused_by,
+                reason=reason,
+            )
+        ]
+
+    def apply_updates(
+        self,
+        caused_by: str,
+        updates: list[tuple[str, Any]],
+        reason: str = "",
+    ) -> list[DeltaChange]:
+        deltas: list[DeltaChange] = []
+        for path, value in updates:
+            deltas.extend(
+                self.apply_path_update(
+                    caused_by=caused_by,
+                    path=path,
+                    new_value=value,
+                    reason=reason,
+                )
+            )
         return deltas
 
     # ------------------------------------------------------------------
@@ -93,9 +127,13 @@ class StateManager:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _get_nested(obj: BaseModel | dict, path: str) -> Any:
+    def _tokenize_path(path: str) -> list[str]:
+        return [match.group(1) or match.group(2) for match in StateManager._PATH_TOKEN_RE.finditer(path)]
+
+    @classmethod
+    def _get_nested(cls, obj: BaseModel | dict, path: str) -> Any:
         """Resolve a dot-notation *path* against a Pydantic model or dict."""
-        parts = path.split(".")
+        parts = cls._tokenize_path(path)
         current: Any = obj
         for part in parts:
             if isinstance(current, dict):
@@ -104,10 +142,10 @@ class StateManager:
                 current = getattr(current, part)
         return current
 
-    @staticmethod
-    def _set_nested(obj: BaseModel | dict, path: str, value: Any) -> None:
+    @classmethod
+    def _set_nested(cls, obj: BaseModel | dict, path: str, value: Any) -> None:
         """Set a value at *path* (dot-notation) on a Pydantic model or dict."""
-        parts = path.split(".")
+        parts = cls._tokenize_path(path)
         current: Any = obj
         for part in parts[:-1]:
             if isinstance(current, dict):

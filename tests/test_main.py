@@ -36,6 +36,36 @@ def _receive_until_types(
     return messages
 
 
+def _receive_until_event_types(
+    ws,
+    expected_event_types: set[str],
+    max_messages: int = 24,
+) -> list[dict]:
+    messages: list[dict] = []
+    seen: set[str] = set()
+    for _ in range(max_messages):
+        data = ws.receive_json()
+        messages.append(data)
+        if data["type"] == "SIM_EVENT":
+            seen.add(data["payload"]["event_type"])
+        if expected_event_types.issubset(seen):
+            break
+    return messages
+
+
+def _receive_until_message_type(
+    ws,
+    expected_type: str,
+    max_messages: int = 24,
+) -> dict:
+    last = {}
+    for _ in range(max_messages):
+        last = ws.receive_json()
+        if last["type"] == expected_type:
+            return last
+    return last
+
+
 def test_ws_receives_full_state_on_connect(client):
     with _connect(client) as ws:
         data = ws.receive_json()
@@ -86,22 +116,34 @@ def test_ws_cmd_sim_start(client):
     with _connect(client) as ws:
         ws.receive_json()  # initial STATE_FULL
         ws.send_json({"type": "CMD_SIM_START"})
-        data = ws.receive_json()
+        data = _receive_until_message_type(ws, "SIMULATION_STATUS")
         assert data["type"] == "SIMULATION_STATUS"
         assert data["payload"]["is_running"] is True
+
+
+def test_ws_cmd_sim_start_streams_timer_and_environment_events(client):
+    with _connect(client) as ws:
+        ws.receive_json()  # initial STATE_FULL
+        ws.send_json({"type": "CMD_SIM_START"})
+        _receive_until_message_type(ws, "SIMULATION_STATUS")
+
+        messages = _receive_until_event_types(
+            ws,
+            {"system.timer_tick", "environment.state_refresh"},
+        )
+
+        sim_events = [message["payload"]["event_type"] for message in messages if message["type"] == "SIM_EVENT"]
+        assert "system.timer_tick" in sim_events
+        assert "environment.state_refresh" in sim_events
 
 
 def test_ws_cmd_sim_pause(client):
     with _connect(client) as ws:
         ws.receive_json()  # initial STATE_FULL
         ws.send_json({"type": "CMD_SIM_START"})
-        ws.receive_json()  # SIMULATION_STATUS
+        _receive_until_message_type(ws, "SIMULATION_STATUS")
         ws.send_json({"type": "CMD_SIM_PAUSE"})
-        # simulation_engine.pause() may broadcast multiple messages before SIMULATION_STATUS
-        # (STATE_DELTA, AGENT_STATUS, etc.)
-        data = ws.receive_json()
-        while data["type"] != "SIMULATION_STATUS":
-            data = ws.receive_json()
+        data = _receive_until_message_type(ws, "SIMULATION_STATUS")
         assert data["type"] == "SIMULATION_STATUS"
         assert data["payload"]["is_running"] is False
 
@@ -110,7 +152,7 @@ def test_ws_cmd_sim_reset(client):
     with _connect(client) as ws:
         ws.receive_json()  # initial STATE_FULL
         ws.send_json({"type": "CMD_SIM_RESET"})
-        data = ws.receive_json()
+        data = _receive_until_message_type(ws, "STATE_FULL")
         assert data["type"] == "STATE_FULL"
         assert "rooms" in data["payload"]
 
@@ -268,3 +310,6 @@ def test_ws_cmd_device_control_rejects_sensor_write(client):
         data = ws.receive_json()
         assert data["type"] == "ERROR"
         assert data["payload"]["code"] == "DEVICE_NOT_CONTROLLABLE"
+        assert data["payload"]["message"]
+        assert isinstance(data["payload"]["details"], dict)
+        assert data["payload"]["details"]["device_id"] == "sensor_living_temp_01"

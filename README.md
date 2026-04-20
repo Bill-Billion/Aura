@@ -1,71 +1,40 @@
-# Aura
+# SmartHomeSim
 
-Smart Home AI Agent Behavior Observability Platform — 智能家居 Agent 行为可观测性平台
+SmartHomeSim 是一个面向智能家居 Agent 的 3D 仿真与观测平台。当前版本已经完成 Phase 1 的事件驱动迁移，后端会同时外发兼容旧界面的状态消息和给后续可观测性面板使用的结构化事件流。
 
-Aura is a simulation and visualization platform for observing how AI agents control IoT devices in smart home environments. It provides a 3D real-time view of agent decision-making, device states, and environmental changes.
+## 当前能力
 
-## Features
+- 多楼层 3D 展厅渲染，支持灯光、空调、窗帘、风扇、摄像头和环境传感器
+- 规则型 Lighting / HVAC Agent 与用户行为模拟
+- `STATE_FULL + STATE_DELTA + AGENT_STATUS + SIM_EVENT` 并行输出
+- 事件链字段 `event_id / correlation_id / causal_parent / priority`
+- 统一设备注册表与场景绑定
+- 一键本地起栈脚本和 Docker Compose 联调入口
 
-- **3D Showroom Visualization** — Multi-floor apartment rendering with TresJS/Three.js, custom GLSL shaders, world-floor reflection layers, and a tighter gamemcu-style shell
-- **AI Agent Simulation** — Rule-based agents (Lighting, HVAC) with an extensible architecture for LLM-powered autonomous agents
-- **Structured Event Flow** — `SimEvent` now carries `event_id`, `correlation_id`, `causal_parent`, and priority for user/action/feedback tracing
-- **Registered Device Catalog** — Default scene now ships with lights, HVAC, curtains, fans, cameras, and environment sensors, all with explicit metadata and capability flags
-- **Real-time Observability Foundation** — WebSocket now exposes legacy state sync and `SIM_EVENT` side by side, ready for the next-stage observability panel
-- **Interactive Dashboard** — Slim left floor rail, lighter right showroom cards, grouped device summary, contextual device controller, compact simulation controls, and auxiliary event log
+## 技术栈
 
-## Tech Stack
+| 层 | 技术 |
+| --- | --- |
+| Frontend | Vue 3.5、TypeScript、TresJS、Three.js、Pinia、TailwindCSS、GSAP |
+| Backend | FastAPI、Pydantic v2、WebSocket、structlog |
+| Runtime | Python 3.10+、Node.js 18+ |
+| Testing | pytest、node:test、Vue TSC、Vite build |
 
-| Layer | Technologies |
-|-------|-------------|
-| Frontend | Vue 3.5 + TypeScript, TresJS 5.8 (Three.js), Pinia 3.0, TailwindCSS 4, GSAP 3.14 |
-| 3D | Custom GLSL shaders, DRACO + Meshopt compressed GLB models |
-| Backend | FastAPI, Pydantic v2, WebSocket, structlog |
-| Testing | pytest + pytest-asyncio (74 backend tests) |
+## 5 分钟快速开始
 
-## Architecture
+### 方式一：直接在本机运行
 
-```
-aura/
-├── backend/
-│   ├── api/          # FastAPI routes + WebSocket gateway
-│   ├── agents/       # AI agents (Lighting, HVAC) + AgentRuntime
-│   ├── engine/       # SimulationEngine, EventBus, SimEvent, StateManager
-│   ├── models/       # Pydantic schemas (WorldState, WSMessage)
-│   ├── simulators/   # Environment physics + User behavior
-│   └── core/         # Logging
-├── frontend/
-│   ├── src/
-│   │   ├── components/
-│   │   │   ├── scene/       # 3D rendering (SceneRenderer, shaders, CSS2D labels)
-│   │   │   └── dashboard/   # Showroom shell, contextual controller, scene presets
-│   │   ├── composables/     # useWebSocket, useSphericalCamera, useShaderMaterials
-│   │   ├── stores/          # Pinia stores (world, agent, simulation, ui, events)
-│   │   ├── shaders/         # GLSL vertex/fragment shaders
-│   │   └── types/           # TypeScript type definitions
-│   └── public/
-│       ├── models/          # GLB 3D models (F1, F2, F3)
-│       ├── scenes/          # Scene configuration JSON
-│       └── textures/        # Matcap textures, HDR environment maps
-└── tests/                   # Backend test suite
-```
-
-## Getting Started
-
-### Prerequisites
-
-- Python 3.10+
-- Node.js 18+
-
-### Backend
+先启动后端：
 
 ```bash
 cd backend
-python -m venv .venv && source .venv/bin/activate
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 uvicorn main:app --reload --port 8000
 ```
 
-### Frontend
+再启动前端：
 
 ```bash
 cd frontend
@@ -73,50 +42,133 @@ npm install
 npm run dev
 ```
 
-Open http://localhost:5173
+浏览器打开 [http://localhost:5173](http://localhost:5173)。
 
-### Recommended: fresh local stack
+### 方式二：用统一起栈脚本
 
-调试时优先使用仓库根目录的统一起栈脚本，它会清理已记录的旧 PID、检查 `8000/5173` 端口占用，并在启动后额外校验一次通过前端代理的 WebSocket 保活。
+如果本机已经有旧实例，优先用仓库脚本。它会检查端口占用、记录 PID/日志，并补一条代理 WebSocket 保活校验。
 
 ```bash
 ./scripts/dev-stack.sh start
-./scripts/dev-stack.sh status
 ./scripts/dev-stack.sh verify
 ./scripts/dev-stack.sh stop
 ```
 
-### Running Tests
+### 方式三：用 Docker Compose
 
 ```bash
-cd backend
-pytest ../tests/ -v
+docker compose up --build
 ```
 
-前端构建验证：
+Compose 环境下前端代理会自动指向 `http://backend:8000`，不再把 `/ws` 和 `/api` 打回容器里的自己。
+
+## WebSocket 公共契约
+
+### 客户端命令
+
+当前开放的命令类型：
+
+- `CMD_SIM_START`
+- `CMD_SIM_PAUSE`
+- `CMD_SIM_RESET`
+- `CMD_SIM_SPEED`
+- `CMD_DEVICE_CONTROL`
+
+### 服务端消息
+
+当前公开的消息类型：
+
+- `STATE_FULL`
+- `STATE_DELTA`
+- `AGENT_STATUS`
+- `SIM_EVENT`
+- `SIMULATION_STATUS`
+- `ERROR`
+
+### 结构化事件
+
+Phase 1 对外开放的 `SIM_EVENT.event_type`：
+
+- `system.timer_tick`
+- `system.simulation_started`
+- `system.simulation_paused`
+- `system.simulation_reset`
+- `environment.state_refresh`
+- `user.command`
+- `user.activity_change`
+- `action.device_control`
+- `feedback.state_delta`
+
+### 错误格式
+
+```json
+{
+  "code": "DEVICE_NOT_CONTROLLABLE",
+  "message": "客厅温度传感器不支持修改: value",
+  "details": {
+    "device_id": "sensor_living_temp_01",
+    "action": "set_state"
+  }
+}
+```
+
+更完整的协议说明见 `docs/architecture/ws-protocol.md`。
+
+## 当前开放枚举
+
+### 设备类型
+
+`light`、`hvac`、`curtain`、`sensor`、`fan`、`camera`
+
+### 设备能力
+
+`power`、`brightness`、`color_temp`、`target_temp`、`mode`、`speed`、`open_percent`、`shake`、`timeout`、`view`、`read`
+
+## 目录结构
+
+```text
+SmartHomeSim/
+├── backend/
+│   ├── agents/        # 规则型 Agent
+│   ├── api/           # FastAPI 路由与 WebSocket 网关
+│   ├── config/        # 默认设备与场景配置
+│   ├── engine/        # EventBus、SimulationEngine、SimulatorTimer、StateManager
+│   ├── models/        # 协议 schema 与 SimulationClient protocol
+│   └── simulators/    # 用户行为与环境仿真
+├── docs/architecture/
+│   ├── sim-event-schema.md
+│   └── ws-protocol.md
+├── frontend/
+│   └── src/
+│       ├── components/
+│       ├── composables/
+│       ├── stores/
+│       └── types/
+└── tests/
+```
+
+## 开发验证
+
+后端测试：
+
+```bash
+pytest tests -q
+```
+
+前端测试：
 
 ```bash
 cd frontend
+node --experimental-strip-types --test tests/*.test.ts
 npm run build
 ```
 
-## Event Schema
+Compose 配置检查：
 
-结构化事件字段和关联规则写在 `/docs/architecture/sim-event-schema.md`。下一阶段的 ObservabilityPanel 会直接消费这条事件流，而不是继续依赖旧的 delta 文本日志。
+```bash
+docker compose config
+```
 
-## Device Registration
+## 下一阶段
 
-默认设备注册与接入主线写在 `/docs/architecture/gamemcu-device-registration-plan.md`。当前系统已经把设备能力显式写进 `STATE_FULL`，前端可以直接按 `ui_group` 和 `capabilities` 渲染交互，不需要再维护一套分散的硬编码映射。
-
-## Roadmap
-
-- [ ] Event-driven simulation engine (replace tick loop)
-- [ ] LLM-powered autonomous agents with intent recognition
-- [ ] Multi-agent collaboration and task decomposition
-- [ ] User habit memory system
-- [ ] Improved physics simulation (inter-room heat transfer)
-- [ ] Frontend test suite
-
-## License
-
-MIT
+Phase 1 已收口完成。下一步会沿着 `GSTACK_FINAL_PLAN.md` 进入事件流消费侧，把右侧可观测性面板从旧日志模式切到事件时间线和 reasoning detail，而不是提前跳到 LLM Agent。

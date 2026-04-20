@@ -8,6 +8,8 @@ dist/
 *.egg-info/
 .env
 *.log
+.vite/
+output/
 .playwright-cli/
 
 # Local AI/editor docs (not for remote)

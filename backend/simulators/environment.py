@@ -57,18 +57,8 @@ def _parse_time_hour(time_of_day: str) -> float:
 class EnvironmentSimulator:
     """Step-based environment physics engine."""
 
-    def step(self, state: WorldState, dt: float) -> None:
-        """Advance environment by *dt* simulation-time units.
-
-        Modifies ``state.rooms`` in place.
-
-        Parameters
-        ----------
-        state : WorldState
-            The canonical world state (mutated in place).
-        dt : float
-            Simulation time step (in arbitrary time units).
-        """
+    def step(self, state: WorldState, dt: float) -> dict[str, float]:
+        """Advance environment by *dt* simulation-time units and return updates."""
         hour = _parse_time_hour(state.environment.time_of_day)
         outdoor_temp = state.environment.outdoor_temp
 
@@ -101,22 +91,24 @@ class EnvironmentSimulator:
                 brightness_by_room[room] = brightness_by_room.get(room, 0) + brightness
 
         natural_lux = _natural_light_lux(hour)
+        updates: dict[str, float] = {}
 
         for room_id, room in state.rooms.items():
             # --- Temperature ---
             # Outdoor diffusion
-            diffusion = TEMP_OUTDOOR_DIFFUSION_RATE * dt * (outdoor_temp - room.temperature)
-            room.temperature += diffusion
+            next_temperature = room.temperature
+            diffusion = TEMP_OUTDOOR_DIFFUSION_RATE * dt * (outdoor_temp - next_temperature)
+            next_temperature += diffusion
 
             # HVAC effect
             hvac = hvac_by_room.get(room_id)
             if hvac is not None:
                 target = hvac["target_temp"]
                 mode = hvac["mode"]
-                if mode == "cool" and room.temperature > target:
-                    room.temperature -= HVAC_COOL_RATE * dt * (room.temperature - target)
-                elif mode == "heat" and room.temperature < target:
-                    room.temperature += HVAC_HEAT_RATE * dt * (target - room.temperature)
+                if mode == "cool" and next_temperature > target:
+                    next_temperature -= HVAC_COOL_RATE * dt * (next_temperature - target)
+                elif mode == "heat" and next_temperature < target:
+                    next_temperature += HVAC_HEAT_RATE * dt * (target - next_temperature)
 
             # --- Light level ---
             # Artificial light
@@ -126,4 +118,7 @@ class EnvironmentSimulator:
             curtain_pct = curtain_by_room.get(room_id, 100.0)
             natural_contribution = natural_lux * (curtain_pct / 100.0)
 
-            room.light_level = artificial_lux + natural_contribution
+            updates[f"rooms[{room_id}].temperature"] = next_temperature
+            updates[f"rooms[{room_id}].light_level"] = artificial_lux + natural_contribution
+
+        return updates

@@ -4,6 +4,7 @@ import type {
   DeviceState,
   RoomState,
   EnvironmentState,
+  UserState,
   WorldStateSnapshot,
   DeltaChange,
 } from '@/types/world-state'
@@ -24,6 +25,7 @@ export const useWorldStore = defineStore('world', () => {
 
   const devices = reactive<Record<string, DeviceState>>({})
   const rooms = reactive<Record<string, RoomState>>({})
+  const users = reactive<Record<string, UserState>>({})
 
   // --- Actions ---
 
@@ -51,6 +53,14 @@ export const useWorldStore = defineStore('world', () => {
     for (const [id, room] of Object.entries(snap.rooms)) {
       rooms[id] = { ...room }
     }
+
+    // Clear and refill users
+    for (const key of Object.keys(users)) {
+      delete users[key]
+    }
+    for (const [id, user] of Object.entries(snap.users)) {
+      users[id] = { ...user }
+    }
   }
 
   /** Parse and apply a list of delta changes */
@@ -72,10 +82,10 @@ export const useWorldStore = defineStore('world', () => {
     const directKeys = ['simulation_tick', 'simulation_speed', 'is_running', 'scene_id']
     if (directKeys.includes(path)) {
       switch (path) {
-        case 'simulation_tick': simulationTick.value = value; break
-        case 'simulation_speed': simulationSpeed.value = value; break
-        case 'is_running': isRunning.value = value; break
-        case 'scene_id': sceneId.value = value; break
+        case 'simulation_tick': simulationTick.value = Number(value); break
+        case 'simulation_speed': simulationSpeed.value = Number(value); break
+        case 'is_running': isRunning.value = Boolean(value); break
+        case 'scene_id': sceneId.value = String(value); break
       }
       return
     }
@@ -84,7 +94,13 @@ export const useWorldStore = defineStore('world', () => {
     const rootMatch = path.match(/^(\w+)\[([^\]]+)\]\.(.+)$/)
     if (rootMatch) {
       const [, root, key, subPath] = rootMatch
-      const container = root === 'devices' ? devices : root === 'rooms' ? rooms : null
+      const container = root === 'devices'
+        ? devices
+        : root === 'rooms'
+          ? rooms
+          : root === 'users'
+            ? users
+            : null
       if (container && container[key]) {
         setNestedValue(container[key], subPath, value)
       }
@@ -102,7 +118,7 @@ export const useWorldStore = defineStore('world', () => {
   }
 
   /** Set a value at a dot-separated path on an object, reactively */
-  function setNestedValue(obj: any, path: string, value: any) {
+  function setNestedValue(obj: any, path: string, value: unknown) {
     const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
     const parts = path.split('.')
     let current = obj
@@ -126,6 +142,7 @@ export const useWorldStore = defineStore('world', () => {
     environment,
     devices,
     rooms,
+    users,
     applyFullState,
     applyDelta,
   }

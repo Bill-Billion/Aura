@@ -3,7 +3,12 @@ import { useWorldStore } from '@/stores/worldStore'
 import { useAgentStore } from '@/stores/agentStore'
 import { useSimulationStore } from '@/stores/simulationStore'
 import { useEventStore } from '@/stores/eventStore'
-import type { WSMessage } from '@/types/websocket'
+import type {
+  AgentStatusPayload,
+  ErrorPayload,
+  SimulationStatusPayload,
+  WSMessage,
+} from '@/types/websocket'
 import type { WorldStateSnapshot, DeltaChange } from '@/types/world-state'
 import type { SimEvent } from '@/types/sim-event'
 
@@ -112,7 +117,7 @@ export function useWebSocket() {
       }
 
       case 'STATE_DELTA': {
-        const deltas = (msg.payload?.deltas ?? []) as DeltaChange[]
+        const deltas = ((msg.payload as { deltas?: DeltaChange[] } | undefined)?.deltas ?? []) as DeltaChange[]
         worldStore.applyDelta(deltas)
 
         // Extract agent actions from delta metadata for the log
@@ -130,7 +135,7 @@ export function useWebSocket() {
       }
 
       case 'AGENT_STATUS': {
-        const agents = msg.payload?.agents as Record<string, any> | undefined
+        const agents = (msg.payload as AgentStatusPayload | undefined)?.agents
         if (agents) {
           for (const [id, data] of Object.entries(agents)) {
             agentStore.updateStatus(id, data)
@@ -150,7 +155,7 @@ export function useWebSocket() {
       }
 
       case 'SIMULATION_STATUS': {
-        const p = msg.payload
+        const p = msg.payload as SimulationStatusPayload
         if (typeof p?.is_running === 'boolean') {
           simulationStore.setRunning(p.is_running)
           worldStore.isRunning = p.is_running
@@ -163,7 +168,12 @@ export function useWebSocket() {
       }
 
       case 'ERROR': {
-        console.warn('[WebSocket] Command rejected:', msg.payload)
+        const error = msg.payload as ErrorPayload
+        console.warn('[WebSocket] Command rejected:', {
+          code: error.code,
+          message: error.message,
+          details: error.details ?? null,
+        })
         break
       }
 

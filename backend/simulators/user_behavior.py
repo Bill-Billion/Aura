@@ -51,7 +51,7 @@ class UserBehaviorSimulator:
         self._last_hour: int | None = None
 
     def step(self, state: WorldState) -> list[WorldEvent]:
-        """Check if the simulated hour changed and move users accordingly.
+        """Check if the simulated hour changed and emit user activity events.
 
         Returns a (possibly empty) list of ``WorldEvent`` objects.
         """
@@ -69,29 +69,6 @@ class UserBehaviorSimulator:
             old_room = user.location.room if user.location else ""
             if old_room == target_room and user.activity == activity:
                 continue  # no change needed
-
-            # Remove user from old room
-            if old_room and old_room in state.rooms:
-                room = state.rooms[old_room]
-                if user_id in room.persons:
-                    room.persons.remove(user_id)
-                if not room.persons:
-                    room.occupancy = False
-
-            # Move user to new room
-            if user.location:
-                user.location.room = target_room
-            else:
-                from backend.engine.state import Location3D
-                user.location = Location3D(room=target_room)
-            user.activity = activity
-
-            # Update new room occupancy
-            if target_room in state.rooms:
-                room = state.rooms[target_room]
-                if user_id not in room.persons:
-                    room.persons.append(user_id)
-                room.occupancy = True
 
             events.append(
                 WorldEvent(

@@ -31,7 +31,7 @@ def _make_world(time_of_day: str = "06:00") -> WorldState:
 
 class TestUserBehavior:
     def test_user_moves_on_schedule(self):
-        """Simulate a full day and check user transitions."""
+        """纯事件模式下，step 返回行为变化事件，但不直接修改世界状态。"""
         sim = UserBehaviorSimulator()
         world = _make_world("06:00")
 
@@ -52,18 +52,18 @@ class TestUserBehavior:
             events = sim.step(world)
 
             user = world.users["user_01"]
-            assert user.location.room == expected_room, (
-                f"At {hour}:00 expected room={expected_room}, got {user.location.room}"
-            )
-            assert user.activity == expected_activity, (
-                f"At {hour}:00 expected activity={expected_activity}, got {user.activity}"
-            )
-            assert len(events) > 0, f"Expected event at {hour}:00"
-            assert events[0].event_type == "user.activity_change"
+            assert user.location.room == "bedroom"
+            assert user.activity == "sleeping"
+            if expected_room == "bedroom" and expected_activity == "sleeping":
+                assert len(events) == 0
+            else:
+                assert len(events) > 0, f"Expected event at {hour}:00"
+                assert events[0].event_type == "user.activity_change"
+                assert events[0].data["to_room"] == expected_room
+                assert events[0].data["activity"] == expected_activity
 
-            # Verify room occupancy
-            assert world.rooms[expected_room].occupancy is True
-            assert "user_01" in world.rooms[expected_room].persons
+            # Verify world state has not been mutated yet
+            assert world.rooms["bedroom"].occupancy is False
 
     def test_no_event_when_hour_unchanged(self):
         """No events should fire when the hour stays the same."""

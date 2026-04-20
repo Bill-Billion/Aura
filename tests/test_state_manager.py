@@ -1,11 +1,18 @@
 import pytest
-from backend.engine.state import WorldState, DeviceState, DeviceStateValues, Location3D
+from backend.engine.state import WorldState, DeviceState, DeviceStateValues, Location3D, RoomState, UserState
 from backend.engine.state_manager import StateManager, DeltaChange
 from backend.models.schemas import WSMessage, SimCommand
 
 
 def _make_world() -> WorldState:
     ws = WorldState()
+    ws.rooms["living_room"] = RoomState(id="living_room", temperature=22.0)
+    ws.users["user_01"] = UserState(
+        id="user_01",
+        name="User",
+        location=Location3D(room="living_room"),
+        activity="idle",
+    )
     ws.devices["light-001"] = DeviceState(
         id="light-001",
         type="light",
@@ -76,6 +83,45 @@ def test_apply_action_unknown_device_raises():
     mgr = StateManager(_make_world())
     with pytest.raises(KeyError, match="nonexistent"):
         mgr.apply_action("agent-1", "nonexistent", "power", True)
+
+
+def test_apply_path_update_supports_root_and_room_paths():
+    mgr = StateManager(_make_world())
+
+    deltas = mgr.apply_path_update(
+        caused_by="simulator_timer",
+        path="rooms[living_room].temperature",
+        new_value=24.5,
+        reason="environment refresh",
+    )
+    deltas += mgr.apply_path_update(
+        caused_by="simulator_timer",
+        path="simulation_tick",
+        new_value=3,
+        reason="timer tick",
+    )
+
+    assert mgr.world.rooms["living_room"].temperature == 24.5
+    assert mgr.world.simulation_tick == 3
+    assert deltas[0].path == "rooms[living_room].temperature"
+    assert deltas[1].path == "simulation_tick"
+
+
+def test_apply_updates_batches_multiple_paths():
+    mgr = StateManager(_make_world())
+
+    deltas = mgr.apply_updates(
+        caused_by="user_behavior_sim",
+        updates=[
+            ("users[user_01].activity", "breakfast"),
+            ("environment.time_of_day", "08:00"),
+        ],
+        reason="apply user event",
+    )
+
+    assert len(deltas) == 2
+    assert mgr.world.users["user_01"].activity == "breakfast"
+    assert mgr.world.environment.time_of_day == "08:00"
 
 
 # -------------------------------------------------------------------

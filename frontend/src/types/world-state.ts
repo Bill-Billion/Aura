@@ -21,7 +21,7 @@ export interface DeviceState {
   floor_id: string
   ui_group: DeviceUIGroup
   capabilities: DeviceCapability[]
-  scene_bindings: Record<string, any>
+  scene_bindings: Record<string, unknown>
   state: { power: boolean; last_changed_by: string; extra: Record<string, any> }
 }
 
@@ -40,6 +40,14 @@ export interface AgentState {
   current_strategy: string; confidence: number; last_action: string
 }
 
+export interface UserState {
+  id: string
+  name: string
+  location: Location3D | null
+  activity: string
+  comfort_score: number
+}
+
 export interface WorldStateSnapshot {
   simulation_tick: number; simulation_speed: number
   is_running: boolean; scene_id: string
@@ -47,6 +55,7 @@ export interface WorldStateSnapshot {
   devices: Record<string, DeviceState>
   rooms: Record<string, RoomState>
   agents: Record<string, AgentState>
+  users: Record<string, UserState>
 }
 
 export interface DeltaChange {

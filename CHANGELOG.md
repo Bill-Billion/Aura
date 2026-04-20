@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.3.5] - 2026-04-20
+
+### Added
+
+- **Phase 1 protocol docs**: 新增 `/docs/architecture/ws-protocol.md`，把 WebSocket 命令、服务端消息、`SIM_EVENT` 类型和 `ERROR` 格式收敛成一份公共契约
+- **SimulationClient contract**: 新增 `backend/models/simulation_client.py`，定义 `connect / disconnect / send_command / iter_events / get_snapshot` 最小协议
+- **Compose dev stack**: 新增 `docker-compose.yml`、`backend/Dockerfile` 和 `frontend/Dockerfile`，提供一键起前后端的联调环境
+
+### Changed
+
+- **Event-driven runtime**: `SimulationEngine` 改成 `SimulatorTimer + EventBus` 驱动，移除集中 `_tick` 主循环，`system.timer_tick` 和 `environment.state_refresh` 会实时外发
+- **WebSocket error schema**: `ERROR` 消息统一改为 `{ code, message, details }`，设备控制失败会带明确上下文
+- **Reset lifecycle**: `CMD_SIM_RESET` 改成复用现有引擎实例并替换 `StateManager`，不再重建整套 `SimulationEngine`
+- **Frontend contract types**: 前端补齐 `SIM_EVENT`、`ERROR`、`SIMULATION_STATUS` 和 `users` 快照类型，`Vite` 代理目标改成环境变量可配置
+- **README quickstart**: README 更新成本机直跑、统一脚本、Docker Compose 三种入口，并把公开 device/event/message 枚举写进文档
+
+### Testing
+
+- 后端 `pytest tests/test_simulator_timer.py tests/test_state_manager.py tests/test_user_behavior_sim.py tests/test_environment_sim.py tests/test_simulation.py tests/test_main.py -q` 通过
+- 额外覆盖了 `system.timer_tick`、`environment.state_refresh` 和结构化 `ERROR.details` 的 WebSocket 回归
+
 ## [0.1.3.4] - 2026-04-20
 
 ### Changed

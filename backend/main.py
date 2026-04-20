@@ -25,7 +25,7 @@ from backend.engine.state import (
 from backend.engine.event_bus import EventBus, SimEvent
 from backend.engine.simulation import SimulationEngine
 from backend.engine.state_manager import StateManager
-from backend.models.schemas import WSMessage
+from backend.models.schemas import ErrorMessage, WSMessage
 
 
 # ---------------------------------------------------------------------------
@@ -44,12 +44,17 @@ async def _broadcast_sim_event(event: SimEvent) -> SimEvent:
     return event
 
 
-async def _send_ws_error(ws: WebSocket, code: str, message: str, **payload: str) -> None:
+async def _send_ws_error(
+    ws: WebSocket,
+    code: str,
+    message: str,
+    details: dict[str, object] | None = None,
+) -> None:
     await manager.send(
         ws,
         WSMessage(
             type="ERROR",
-            payload={"code": code, "message": message, **payload},
+            payload=ErrorMessage(code=code, message=message, details=details).model_dump(),
         ),
     )
 
@@ -118,7 +123,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     yield
     # Gracefully stop the simulation if running
     if simulation_engine is not None:
-        await simulation_engine.stop()
+        await simulation_engine.close()
     log.info("app_shutdown")
 
 
@@ -179,7 +184,7 @@ async def ws_simulation(ws: WebSocket) -> None:
                         ws,
                         "UNKNOWN_DEVICE",
                         f"设备 {device_id} 不存在",
-                        device_id=device_id,
+                        details={"device_id": device_id},
                     )
                     continue
 
@@ -194,8 +199,7 @@ async def ws_simulation(ws: WebSocket) -> None:
                             ws,
                             error_code,
                             error_message,
-                            device_id=device_id,
-                            action=action,
+                            details={"device_id": device_id, "action": action},
                         )
                         continue
 
@@ -226,8 +230,7 @@ async def ws_simulation(ws: WebSocket) -> None:
                             ws,
                             error_code,
                             error_message,
-                            device_id=device_id,
-                            action=prop,
+                            details={"device_id": device_id, "action": prop},
                         )
                         continue
 
@@ -240,7 +243,7 @@ async def ws_simulation(ws: WebSocket) -> None:
                         ws,
                         "INVALID_DEVICE_COMMAND",
                         "设备控制命令缺少 action 或 property",
-                        device_id=device_id,
+                        details={"device_id": device_id},
                     )
                     continue
 
@@ -290,29 +293,29 @@ async def ws_simulation(ws: WebSocket) -> None:
                     )
 
             elif msg_type == "CMD_SIM_START":
+                await manager.broadcast(
+                    WSMessage(
+                        type="SIMULATION_STATUS",
+                        payload={"is_running": True},
+                    )
+                )
                 if simulation_engine is not None:
                     await simulation_engine.start()
-                await manager.broadcast(
-                    WSMessage(type="SIMULATION_STATUS", payload={"is_running": True})
-                )
 
             elif msg_type == "CMD_SIM_PAUSE":
+                await manager.broadcast(
+                    WSMessage(
+                        type="SIMULATION_STATUS",
+                        payload={"is_running": False},
+                    )
+                )
                 if simulation_engine is not None:
                     await simulation_engine.pause()
-                await manager.broadcast(
-                    WSMessage(type="SIMULATION_STATUS", payload={"is_running": False})
-                )
 
             elif msg_type == "CMD_SIM_RESET":
-                if simulation_engine is not None:
-                    await simulation_engine.reset()
                 state_manager = _init_default_state()
-                # Re-create the engine with the fresh state manager
-                simulation_engine = SimulationEngine(
-                    event_bus=event_bus,
-                    state_manager=state_manager,
-                    connection_manager=manager,
-                )
+                if simulation_engine is not None:
+                    await simulation_engine.reset(new_state_manager=state_manager)
                 full = state_manager.get_full_snapshot()
                 await manager.broadcast(
                     WSMessage(type="STATE_FULL", payload=full)

@@ -70,17 +70,16 @@ def _make_world(
 
 class TestTemperature:
     def test_temperature_towards_target(self):
-        """AC cooling should move room temperature toward the target."""
+        """纯计算模式下，step 返回目标更新，不直接修改世界状态。"""
         world = _make_world(room_temp=30.0, ac_mode="cool", ac_target=24.0)
         sim = EnvironmentSimulator()
 
-        for _ in range(200):
-            sim.step(world, dt=1.0)
+        updates = sim.step(world, dt=1.0)
 
-        # Temperature should have decreased significantly toward 24
-        assert world.rooms["living_room"].temperature < 28.0
-        # And should still be above target (asymptotic approach)
-        assert world.rooms["living_room"].temperature > 24.0
+        assert "rooms[living_room].temperature" in updates
+        assert world.rooms["living_room"].temperature == 30.0
+        assert updates["rooms[living_room].temperature"] < 30.0
+        assert updates["rooms[living_room].temperature"] > 24.0
 
     def test_outdoor_heat_diffusion(self):
         """With AC off, room temp should drift toward outdoor temp."""
@@ -91,13 +90,10 @@ class TestTemperature:
         )
         sim = EnvironmentSimulator()
 
-        for _ in range(100):
-            sim.step(world, dt=1.0)
+        updates = sim.step(world, dt=1.0)
 
-        # Should have warmed toward outdoor temp
-        assert world.rooms["living_room"].temperature > 20.0
-        # But not reached it yet (slow diffusion)
-        assert world.rooms["living_room"].temperature < 35.0
+        assert updates["rooms[living_room].temperature"] > 20.0
+        assert updates["rooms[living_room].temperature"] < 35.0
 
 
 class TestLightLevel:
@@ -111,13 +107,13 @@ class TestLightLevel:
             time_of_day="12:00",
         )
         sim = EnvironmentSimulator()
-        sim.step(world, dt=1.0)
+        updates = sim.step(world, dt=1.0)
 
-        room = world.rooms["living_room"]
         # Artificial: 50 * 8 = 400 lux
         # Natural at noon (peak): 500 * 0.5 = 250 lux
         expected = 50.0 * 8.0 + 500.0 * 0.5
-        assert abs(room.light_level - expected) < 1.0
+        assert abs(updates["rooms[living_room].light_level"] - expected) < 1.0
+        assert world.rooms["living_room"].light_level == 300.0
 
     def test_no_light_at_night(self):
         """At night, no natural light contribution."""
@@ -128,6 +124,7 @@ class TestLightLevel:
             time_of_day="22:00",
         )
         sim = EnvironmentSimulator()
-        sim.step(world, dt=1.0)
+        updates = sim.step(world, dt=1.0)
 
-        assert world.rooms["living_room"].light_level == 0.0
+        assert updates["rooms[living_room].light_level"] == 0.0
+        assert world.rooms["living_room"].light_level == 300.0

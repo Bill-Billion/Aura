@@ -65,6 +65,7 @@ def _make_world() -> WorldState:
             id="hvac_agent", name="HVAC Agent", status="idle"
         ),
     }
+    world.users = {}
     return world
 
 
@@ -154,46 +155,41 @@ class TestSimulationEngine:
         engine = _make_engine()
         assert engine.env_sim is not None
         assert engine.user_sim is not None
+        assert engine.timer is not None
         assert engine.speed == 1.0
 
     @pytest.mark.anyio
-    async def test_main_loop_one_tick(self):
-        """Run one tick and verify tick incremented and broadcast called."""
+    async def test_start_runs_timer_and_updates_world(self):
+        """事件驱动模式下，start 会启动定时器并推进世界状态。"""
         engine = _make_engine()
         world = engine.state_manager.world
 
-        # Mock broadcast to avoid needing real WebSocket connections
         engine.conn.broadcast = AsyncMock()  # type: ignore[method-assign]
 
         initial_tick = world.simulation_tick
-        await engine._tick()
+        await engine.start()
+        await asyncio.sleep(0.12)
+        await engine.stop()
 
-        # Tick should have incremented
-        assert world.simulation_tick == initial_tick + 1
-
-        # Time should have advanced
+        assert world.simulation_tick >= initial_tick + 1
         assert world.environment.time_of_day != "12:00"
-
-        # Broadcast should have been called at least once (AGENT_STATUS)
         assert engine.conn.broadcast.call_count >= 1
 
     @pytest.mark.anyio
     async def test_start_stop(self):
         """Verify start/stop lifecycle."""
         engine = _make_engine()
-        # Mock broadcast
         engine.conn.broadcast = AsyncMock()  # type: ignore[method-assign]
 
         await engine.start()
         assert engine.is_running is True
-        assert engine._task is not None
+        assert engine.timer.is_running is True
 
-        # Let it run briefly
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.05)
 
         await engine.stop()
         assert engine.is_running is False
-        assert engine._task is None
+        assert engine.timer.is_running is False
 
     @pytest.mark.anyio
     async def test_reset(self):
@@ -203,54 +199,54 @@ class TestSimulationEngine:
 
         engine.state_manager.world.simulation_tick = 42
         engine.state_manager.world.environment.time_of_day = "18:30"
+        engine.timer.current_tick = 42
 
         await engine.reset()
 
         assert engine.state_manager.world.simulation_tick == 0
         assert engine.state_manager.world.environment.time_of_day == "12:00"
+        assert engine.timer.current_tick == 0
         assert engine.is_running is False
 
     @pytest.mark.anyio
-    async def test_advance_time_wraps_at_midnight(self):
+    async def test_next_time_of_day_wraps_at_midnight(self):
         engine = _make_engine()
-        engine.state_manager.world.environment.time_of_day = "23:59"
-        engine._advance_time(engine.state_manager.world)
-        # After 1 minute advance (SIMULATED_DT=60s → 1 minute)
-        assert engine.state_manager.world.environment.time_of_day == "00:00"
+        assert engine._next_time_of_day("23:59") == "00:00"
 
     @pytest.mark.anyio
     async def test_speed_control(self):
         engine = _make_engine()
         engine.speed = 5.0
         assert engine.speed == 5.0
+        assert engine.timer.speed == 5.0
 
     @pytest.mark.anyio
-    async def test_tick_produces_delta_broadcast(self):
-        """When agents produce actions, STATE_DELTA should be broadcast."""
+    async def test_timer_tick_produces_delta_and_status_broadcasts(self):
+        """每次 timer tick 后都要有事件流、状态增量和 agent 状态广播。"""
         engine = _make_engine()
         engine.conn.broadcast = AsyncMock()  # type: ignore[method-assign]
 
-        # Light brightness is 0, room occupied, time 12:00 → agent will act
-        await engine._tick()
+        await engine.start()
+        await asyncio.sleep(0.12)
+        await engine.stop()
 
-        # Check that at least one broadcast was for STATE_DELTA
         broadcast_types = [
             call.args[0].type for call in engine.conn.broadcast.call_args_list
         ]
-        # If deltas were produced, STATE_DELTA should be present
-        # (depends on whether agent found a change > threshold)
+        assert "SIM_EVENT" in broadcast_types
+        assert "STATE_DELTA" in broadcast_types
         assert "AGENT_STATUS" in broadcast_types
 
     @pytest.mark.anyio
     async def test_start_idempotent(self):
-        """Calling start() twice should not create two tasks."""
+        """Calling start() twice should not create two timer tasks."""
         engine = _make_engine()
         engine.conn.broadcast = AsyncMock()  # type: ignore[method-assign]
 
         await engine.start()
-        task1 = engine._task
+        task1 = engine.timer._task
         await engine.start()
-        task2 = engine._task
+        task2 = engine.timer._task
         assert task1 is task2
 
         await engine.stop()
