@@ -1,5 +1,7 @@
 """Tests for main.py WebSocket handler and lifespan."""
 
+import time
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -39,6 +41,45 @@ def test_ws_receives_full_state_on_connect(client):
         data = ws.receive_json()
         assert data["type"] == "STATE_FULL"
         assert "rooms" in data["payload"]
+
+
+def test_ws_stays_open_without_client_messages_for_five_seconds(client):
+    with _connect(client) as ws:
+        data = ws.receive_json()
+        assert data["type"] == "STATE_FULL"
+
+        time.sleep(5)
+
+        ws.send_json({"type": "UNKNOWN_TYPE", "payload": {}})
+        ws.close()
+
+
+def test_ws_full_state_exposes_registered_device_metadata(client):
+    with _connect(client) as ws:
+        data = ws.receive_json()
+        assert data["type"] == "STATE_FULL"
+
+        devices = data["payload"]["devices"]
+        assert "fan_living_01" in devices
+        assert "camera_entry_01" in devices
+        assert "sensor_living_temp_01" in devices
+
+        fan = devices["fan_living_01"]
+        camera = devices["camera_entry_01"]
+        sensor = devices["sensor_living_temp_01"]
+
+        assert fan["type"] == "fan"
+        assert fan["display_name"] == "客厅风扇"
+        assert fan["floor_id"] == "F1"
+        assert "speed" in fan["capabilities"]
+
+        assert camera["type"] == "camera"
+        assert camera["ui_group"] == "security"
+        assert "view" in camera["capabilities"]
+
+        assert sensor["type"] == "sensor"
+        assert sensor["ui_group"] == "environment"
+        assert "read" in sensor["capabilities"]
 
 
 def test_ws_cmd_sim_start(client):
@@ -130,6 +171,25 @@ def test_ws_cmd_device_control_set_state(client):
         assert data["type"] == "STATE_DELTA"
 
 
+def test_ws_cmd_device_control_updates_fan_state(client):
+    with _connect(client) as ws:
+        ws.receive_json()  # initial STATE_FULL
+        ws.send_json({
+            "type": "CMD_DEVICE_CONTROL",
+            "payload": {
+                "device_id": "fan_living_01",
+                "action": "set_state",
+                "params": {"speed": "high", "shake": True},
+            },
+        })
+
+        data = ws.receive_json()
+        assert data["type"] == "STATE_DELTA"
+        paths = {delta["path"] for delta in data["payload"]["deltas"]}
+        assert "devices[fan_living_01].state.extra.speed" in paths
+        assert "devices[fan_living_01].state.extra.shake" in paths
+
+
 def test_ws_cmd_device_control_legacy_property(client):
     # light_living_01 defaults to power=True, so set to False to produce a delta
     with _connect(client) as ws:
@@ -191,3 +251,20 @@ def test_ws_unknown_message_type(client):
         ws.receive_json()  # initial STATE_FULL
         ws.send_json({"type": "UNKNOWN_TYPE", "payload": {}})
         ws.close()
+
+
+def test_ws_cmd_device_control_rejects_sensor_write(client):
+    with _connect(client) as ws:
+        ws.receive_json()  # initial STATE_FULL
+        ws.send_json({
+            "type": "CMD_DEVICE_CONTROL",
+            "payload": {
+                "device_id": "sensor_living_temp_01",
+                "action": "set_state",
+                "params": {"value": 18},
+            },
+        })
+
+        data = ws.receive_json()
+        assert data["type"] == "ERROR"
+        assert data["payload"]["code"] == "DEVICE_NOT_CONTROLLABLE"

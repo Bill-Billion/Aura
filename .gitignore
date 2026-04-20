@@ -7,6 +7,8 @@ dist/
 .DS_Store
 *.egg-info/
 .env
+*.log
+.playwright-cli/
 
 # Local AI/editor docs (not for remote)
 .claude/

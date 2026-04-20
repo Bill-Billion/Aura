@@ -4,6 +4,7 @@ import { useWebSocket } from '@/composables/useWebSocket'
 import DeviceButton from '@/components/ui/DeviceButton.vue'
 import NumberStepper from '@/components/ui/NumberStepper.vue'
 import ModeSelector from '@/components/ui/ModeSelector.vue'
+import LevelSelector from '@/components/ui/LevelSelector.vue'
 import type { DeviceState } from '@/types/world-state'
 
 const props = defineProps<{
@@ -15,11 +16,20 @@ const { sendCommand } = useWebSocket()
 const isPowered = computed(() => props.device.state.power)
 const targetTemp = computed(() => props.device.state.extra.target_temp ?? 24)
 const mode = computed(() => props.device.state.extra.mode ?? 'cool')
+const speed = computed(() => props.device.state.extra.speed ?? 'medium')
 
 const modes = [
+  { value: 'auto', label: '自动' },
   { value: 'cool', label: '制冷' },
   { value: 'heat', label: '制热' },
-  { value: 'auto', label: '自动' },
+  { value: 'fan', label: '送风' },
+  { value: 'dry', label: '除湿' },
+]
+
+const speedOptions = [
+  { value: 'low', label: '低速' },
+  { value: 'medium', label: '中速' },
+  { value: 'high', label: '高速' },
 ]
 
 function togglePower() {
@@ -44,14 +54,22 @@ function setMode(value: string) {
     params: { mode: value },
   })
 }
+
+function setSpeed(value: number | string) {
+  sendCommand('CMD_DEVICE_CONTROL', {
+    device_id: props.deviceId,
+    action: 'set_state',
+    params: { speed: value },
+  })
+}
 </script>
 
 <template>
   <div class="device-panel glass-panel">
     <div class="device-panel__top">
       <div>
-        <p class="device-panel__name">{{ deviceId }}</p>
-        <p class="device-panel__status">{{ isPowered ? `${targetTemp}°C · ${mode}` : '已关闭' }}</p>
+        <p class="device-panel__name">{{ device.display_name || deviceId }}</p>
+        <p class="device-panel__status">{{ isPowered ? `${targetTemp}°C · ${mode} · ${speed}` : '已关闭' }}</p>
       </div>
       <DeviceButton :active="isPowered" :label="isPowered ? 'ON' : 'OFF'" @click="togglePower" />
     </div>
@@ -74,6 +92,13 @@ function setMode(value: string) {
         :modes="modes"
         :disabled="!isPowered"
         @update:model-value="setMode"
+      />
+      <LevelSelector
+        label="风速"
+        :model-value="speed"
+        :options="speedOptions"
+        :disabled="!isPowered"
+        @update:model-value="setSpeed"
       />
     </div>
   </div>

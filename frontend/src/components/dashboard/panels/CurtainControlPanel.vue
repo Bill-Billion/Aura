@@ -29,7 +29,7 @@ function onSliderInput(event: Event) {
   <div class="device-panel glass-panel">
     <div class="device-panel__top">
       <div>
-        <p class="device-panel__name">{{ deviceId }}</p>
+        <p class="device-panel__name">{{ device.display_name || deviceId }}</p>
         <p class="device-panel__status">{{ openPercent }}% 开启</p>
       </div>
     </div>

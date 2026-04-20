@@ -3,7 +3,13 @@ import { computed, ref } from 'vue'
 import { useUIStore } from '@/stores/uiStore'
 import { useWorldStore } from '@/stores/worldStore'
 import { useWebSocket } from '@/composables/useWebSocket'
-import { getFloorForDevice } from '@/utils/deviceFloorMap'
+import {
+  getDeviceGroupLabel,
+  getDeviceLabel,
+  getFloorForDevice,
+  hasDeviceCapability,
+  isDeviceOnline,
+} from '@/utils/deviceFloorMap'
 
 const uiStore = useUIStore()
 const worldStore = useWorldStore()
@@ -16,13 +22,6 @@ const floorMeta: Record<string, { title: string; summary: string }> = {
   F3: { title: 'F3 服务层', summary: '服务空间只保留轮廓和层次。' },
 }
 
-const deviceNameMap: Record<string, string> = {
-  light_living_01: '客厅灯光',
-  light_bedroom_01: '卧室灯光',
-  ac_living_01: '客厅空调',
-  curtain_living_01: '客厅窗帘',
-}
-
 const sceneModes = [
   { id: 'reading', label: '阅读模式', desc: '局部暖光和半开窗帘' },
   { id: 'entertainment', label: '娱乐模式', desc: '保持低亮度，强化客厅氛围' },
@@ -31,36 +30,47 @@ const sceneModes = [
 ] as const
 
 const activeSceneId = ref<(typeof sceneModes)[number]['id']>('entertainment')
+const groupOrder = ['lighting', 'device', 'security', 'environment'] as const
 
 const liveMetrics = computed(() => {
   const devices = Object.values(worldStore.devices)
   const lightsOn = devices.filter((device) => device.type === 'light' && device.state.power).length
-  const hvacOn = devices.filter((device) => device.type === 'hvac' && device.state.power).length
-  const curtainsOpen = devices.filter((device) => device.type === 'curtain' && (device.state.extra.open_percent ?? 0) > 0).length
+  const climateOn = devices.filter((device) => (device.type === 'hvac' || device.type === 'fan') && device.state.power).length
+  const camerasOnline = devices.filter((device) => device.type === 'camera' && isDeviceOnline(device)).length
+  const sensors = devices.filter((device) => device.type === 'sensor').length
 
   return [
     { label: '在线设备', value: `${devices.length}` },
     { label: '灯光', value: `${lightsOn}` },
-    { label: '空调', value: `${hvacOn}` },
-    { label: '窗帘', value: `${curtainsOpen}` },
+    { label: '气流设备', value: `${climateOn}` },
+    { label: '安防 / 环境', value: `${camerasOnline + sensors}` },
   ]
 })
 
 const floorSections = computed(() => {
-  const buckets: Record<string, Array<{ id: string; label: string; type: string; online: boolean }>> = {
+  const buckets: Record<string, Array<{
+    id: string
+    label: string
+    type: string
+    group: string
+    groupLabel: string
+    online: boolean
+  }>> = {
     F1: [],
     F2: [],
     F3: [],
   }
 
   for (const [deviceId, device] of Object.entries(worldStore.devices)) {
-    const floorId = getFloorForDevice(deviceId, device.location.room)
+    const floorId = getFloorForDevice(deviceId, device.location.room, device.floor_id)
     if (!floorId || !buckets[floorId]) continue
     buckets[floorId].push({
       id: deviceId,
-      label: deviceNameMap[deviceId] ?? deviceId,
+      label: getDeviceLabel(device, deviceId),
       type: device.type,
-      online: Boolean(device.state.power),
+      group: device.ui_group,
+      groupLabel: getDeviceGroupLabel(device.ui_group),
+      online: isDeviceOnline(device),
     })
   }
 
@@ -69,6 +79,13 @@ const floorSections = computed(() => {
     title: floorMeta[floorId].title,
     summary: floorMeta[floorId].summary,
     devices,
+    groups: groupOrder
+      .map((groupId) => ({
+        id: groupId,
+        label: getDeviceGroupLabel(groupId),
+        devices: devices.filter((device) => device.group === groupId),
+      }))
+      .filter((group) => group.devices.length > 0),
   }))
 })
 
@@ -96,6 +113,9 @@ function applyScene(sceneId: (typeof sceneModes)[number]['id']) {
         if (dev.type === 'curtain') {
           sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'set_state', params: { open_percent: 52 } })
         }
+        if (dev.type === 'fan' && hasDeviceCapability(dev, 'power')) {
+          sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'turn_off' })
+        }
       }
       break
     case 'entertainment':
@@ -111,11 +131,15 @@ function applyScene(sceneId: (typeof sceneModes)[number]['id']) {
           sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'turn_on' })
           sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'set_state', params: { target_temp: 24, mode: 'cool' } })
         }
+        if (dev.type === 'fan') {
+          sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'turn_on' })
+          sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'set_state', params: { speed: 'medium', shake: true } })
+        }
       }
       break
     case 'away':
       for (const [id, dev] of devices) {
-        if (dev.type === 'light' || dev.type === 'hvac') {
+        if (dev.type === 'light' || dev.type === 'hvac' || dev.type === 'fan') {
           sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'turn_off' })
         }
         if (dev.type === 'curtain') {
@@ -134,6 +158,9 @@ function applyScene(sceneId: (typeof sceneModes)[number]['id']) {
         if (dev.type === 'hvac') {
           sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'turn_on' })
           sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'set_state', params: { target_temp: 22, mode: 'cool' } })
+        }
+        if (dev.type === 'fan') {
+          sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'turn_off' })
         }
       }
       break
@@ -195,20 +222,29 @@ function focusDevice(deviceId: string, floorId: string) {
       </header>
       <p class="showroom-card__text">{{ uiStore.activeFloor === 'overview' ? currentScene.desc : primarySection.summary }}</p>
 
-      <div v-if="primarySection.devices.length > 0" class="device-chip-list">
-        <button
-          v-for="device in primarySection.devices"
-          :key="device.id"
-          class="device-chip"
-          :class="{
-            active: uiStore.activeDevice === device.id,
-            online: device.online,
-          }"
-          @click="focusDevice(device.id, primarySection.floorId)"
-        >
-          <span class="device-chip__type">{{ device.type }}</span>
-          <span class="device-chip__label">{{ device.label }}</span>
-        </button>
+      <div v-if="primarySection.devices.length > 0" class="device-group-list">
+        <section v-for="group in primarySection.groups" :key="group.id" class="device-group">
+          <div class="device-group__header">
+            <span class="device-group__title">{{ group.label }}</span>
+            <span class="device-group__count">{{ group.devices.length }}</span>
+          </div>
+
+          <div class="device-chip-list">
+            <button
+              v-for="device in group.devices"
+              :key="device.id"
+              class="device-chip"
+              :class="{
+                active: uiStore.activeDevice === device.id,
+                online: device.online,
+              }"
+              @click="focusDevice(device.id, primarySection.floorId)"
+            >
+              <span class="device-chip__type">{{ device.type }}</span>
+              <span class="device-chip__label">{{ device.label }}</span>
+            </button>
+          </div>
+        </section>
       </div>
       <p v-else class="showroom-card__empty">这一层暂时没有接入可控设备。</p>
     </article>
@@ -390,6 +426,33 @@ function focusDevice(deviceId: string, floorId: string) {
   font-size: 12px;
   line-height: 1.4;
   opacity: 0.78;
+}
+
+.device-group-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.device-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.device-group__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.device-group__title,
+.device-group__count {
+  font-size: 11px;
+  color: var(--color-text-muted);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
 }
 
 .device-chip-list {

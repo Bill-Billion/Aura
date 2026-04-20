@@ -10,14 +10,15 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from backend.api.routes import router as api_router
 from backend.api.ws import ConnectionManager
+from backend.config.device_registry import (
+    build_default_devices,
+    build_default_rooms,
+    validate_device_command,
+)
 from backend.core.logging import log
 from backend.engine.state import (
     AgentRuntimeState,
-    DeviceState,
-    DeviceStateValues,
-    EnvironmentState,
     Location3D,
-    RoomState,
     UserState,
     WorldState,
 )
@@ -43,6 +44,16 @@ async def _broadcast_sim_event(event: SimEvent) -> SimEvent:
     return event
 
 
+async def _send_ws_error(ws: WebSocket, code: str, message: str, **payload: str) -> None:
+    await manager.send(
+        ws,
+        WSMessage(
+            type="ERROR",
+            payload={"code": code, "message": message, **payload},
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Default state initialisation
 # ---------------------------------------------------------------------------
@@ -53,53 +64,11 @@ def _init_default_state() -> StateManager:
     world = WorldState(scene_id="apartment_v1")
 
     # Rooms
-    rooms = {
-        "living_room": RoomState(id="living_room", temperature=25.0, humidity=0.5),
-        "bedroom": RoomState(id="bedroom", temperature=24.0, humidity=0.5),
-        "kitchen": RoomState(id="kitchen", temperature=26.0, humidity=0.6),
-        "bathroom": RoomState(id="bathroom", temperature=25.0, humidity=0.7),
-    }
+    rooms = build_default_rooms()
     world.rooms = rooms  # type: ignore[assignment]
 
     # Devices
-    world.devices = {
-        "light_living_01": DeviceState(
-            id="light_living_01",
-            type="light",
-            location=Location3D(room="living_room"),
-            state=DeviceStateValues(
-                power=True,
-                extra={"brightness": 80, "color_temp": 4000},
-            ),
-        ),
-        "light_bedroom_01": DeviceState(
-            id="light_bedroom_01",
-            type="light",
-            location=Location3D(room="bedroom"),
-            state=DeviceStateValues(
-                power=True,
-                extra={"brightness": 60, "color_temp": 3500},
-            ),
-        ),
-        "ac_living_01": DeviceState(
-            id="ac_living_01",
-            type="hvac",
-            location=Location3D(room="living_room"),
-            state=DeviceStateValues(
-                power=True,
-                extra={"target_temp": 24, "mode": "cool"},
-            ),
-        ),
-        "curtain_living_01": DeviceState(
-            id="curtain_living_01",
-            type="curtain",
-            location=Location3D(room="living_room"),
-            state=DeviceStateValues(
-                power=True,
-                extra={"open_percent": 70},
-            ),
-        ),
-    }
+    world.devices = build_default_devices()
 
     # Users
     world.users = {
@@ -204,7 +173,32 @@ async def ws_simulation(ws: WebSocket) -> None:
                 value = payload.get("value")
 
                 deltas: list = []
-                if device_id and action:
+                device = state_manager.world.devices.get(device_id) if device_id else None
+                if device_id and device is None:
+                    await _send_ws_error(
+                        ws,
+                        "UNKNOWN_DEVICE",
+                        f"设备 {device_id} 不存在",
+                        device_id=device_id,
+                    )
+                    continue
+
+                if device and action:
+                    error_code, error_message = validate_device_command(
+                        device,
+                        action=action,
+                        params=params,
+                    )
+                    if error_code:
+                        await _send_ws_error(
+                            ws,
+                            error_code,
+                            error_message,
+                            device_id=device_id,
+                            action=action,
+                        )
+                        continue
+
                     # action/params format (from frontend UI)
                     if action == "turn_on":
                         deltas = state_manager.apply_action(
@@ -221,11 +215,34 @@ async def ws_simulation(ws: WebSocket) -> None:
                                     "user", device_id, f"extra.{k}", v
                                 )
                             )
-                elif device_id and prop and value is not None:
+                elif device and prop and value is not None:
+                    error_code, error_message = validate_device_command(
+                        device,
+                        action="",
+                        property_path=prop,
+                    )
+                    if error_code:
+                        await _send_ws_error(
+                            ws,
+                            error_code,
+                            error_message,
+                            device_id=device_id,
+                            action=prop,
+                        )
+                        continue
+
                     # property/value format (legacy)
                     deltas = state_manager.apply_action(
                         "user", device_id, prop, value
                     )
+                else:
+                    await _send_ws_error(
+                        ws,
+                        "INVALID_DEVICE_COMMAND",
+                        "设备控制命令缺少 action 或 property",
+                        device_id=device_id,
+                    )
+                    continue
 
                 root_event = event_bus.coerce_event(
                     SimEvent(

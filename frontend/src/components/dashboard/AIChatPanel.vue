@@ -4,6 +4,7 @@ import { useAgentStore } from '@/stores/agentStore'
 import { useWorldStore } from '@/stores/worldStore'
 import { useWebSocket } from '@/composables/useWebSocket'
 import { useUIStore } from '@/stores/uiStore'
+import { hasDeviceCapability } from '@/utils/deviceFloorMap'
 
 const agentStore = useAgentStore()
 const worldStore = useWorldStore()
@@ -49,7 +50,7 @@ const quickActions = [
 
 function batchControl(type: string, action: string) {
   for (const [id, dev] of Object.entries(worldStore.devices)) {
-    if (type === 'all' || dev.type === type) {
+    if ((type === 'all' || dev.type === type) && hasDeviceCapability(dev, 'power')) {
       sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action })
     }
   }

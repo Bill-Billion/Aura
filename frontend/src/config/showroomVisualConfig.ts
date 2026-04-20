@@ -15,6 +15,9 @@ interface FloorVisualConfig {
   collapsedY: number
   expandedY: number
   lightBias: number
+  lightVolumeScale: number
+  lightSourceY: number
+  lightSourceSize: number
   envBias: number
   labelAnchor: [number, number, number]
   lights: [number, number, number][]
@@ -99,6 +102,9 @@ export const showroomVisualConfig: ShowroomVisualConfig = {
       collapsedY: 0.9,
       expandedY: 0,
       lightBias: 1.08,
+      lightVolumeScale: 1,
+      lightSourceY: 2.06,
+      lightSourceSize: 0.26,
       envBias: 1.14,
       labelAnchor: [9.0, 2.15, 2.2],
       lights: [[-2, 0, -1.5], [-2, 0, 1], [-1, 0, 4]],
@@ -109,6 +115,9 @@ export const showroomVisualConfig: ShowroomVisualConfig = {
       collapsedY: 7.2,
       expandedY: 18,
       lightBias: 0.5,
+      lightVolumeScale: 1.35,
+      lightSourceY: 2.06,
+      lightSourceSize: 0.22,
       envBias: 0.86,
       labelAnchor: [8.0, 2.0, 2.6],
       lights: [[-4, 0, -1.5], [3, 0, -2.5]],
@@ -119,6 +128,9 @@ export const showroomVisualConfig: ShowroomVisualConfig = {
       collapsedY: 13.3,
       expandedY: 35,
       lightBias: 0.24,
+      lightVolumeScale: 1.45,
+      lightSourceY: 2.06,
+      lightSourceSize: 0.22,
       envBias: 0.76,
       labelAnchor: [7.4, 2.0, 2.0],
       lights: [[-1, 0, 3], [3, 0, -2.5]],

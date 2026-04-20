@@ -2,6 +2,23 @@ from pydantic import BaseModel, Field
 from typing import Literal, Any
 
 
+DeviceType = Literal["light", "hvac", "curtain", "sensor", "fan", "camera"]
+DeviceUIGroup = Literal["lighting", "device", "security", "environment"]
+DeviceCapability = Literal[
+    "power",
+    "brightness",
+    "color_temp",
+    "target_temp",
+    "mode",
+    "speed",
+    "open_percent",
+    "shake",
+    "timeout",
+    "view",
+    "read",
+]
+
+
 class Location3D(BaseModel):
     room: str
     x: float = 0.0
@@ -17,8 +34,13 @@ class DeviceStateValues(BaseModel):
 
 class DeviceState(BaseModel):
     id: str
-    type: Literal["light", "hvac", "curtain", "sensor"]
+    type: DeviceType
     location: Location3D
+    display_name: str = ""
+    floor_id: str = ""
+    ui_group: DeviceUIGroup = "device"
+    capabilities: list[DeviceCapability] = Field(default_factory=list)
+    scene_bindings: dict[str, Any] = Field(default_factory=dict)
     state: DeviceStateValues
 
 

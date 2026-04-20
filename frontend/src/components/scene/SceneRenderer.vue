@@ -12,12 +12,24 @@ import { useSphericalCamera } from '@/composables/useSphericalCamera'
 import { useShaderMaterials, type LightGroupConfig } from '@/composables/useShaderMaterials'
 import { useLightUniforms } from '@/composables/useLightUniforms'
 import {
+  getFloorLightCurrent,
   initDeviceAnimStore,
+  getSceneNodesForNames,
   registerDeviceNodes,
   setupLightWatchers,
 } from '@/composables/useDeviceAnimations'
 import { showroomVisualConfig, type ShowroomMaterialRole } from '@/config/showroomVisualConfig'
-import { getFloorForDevice } from '@/utils/deviceFloorMap'
+import {
+  getSceneBindings,
+  getSelectableBindingNodes,
+} from '@/utils/sceneBindings'
+import { buildShowroomLightEntries } from '@/utils/showroomLightGroups'
+import {
+  getDeviceLabel,
+  getFloorForDevice,
+  isDeviceOnline,
+} from '@/utils/deviceFloorMap'
+import { showSceneFloorLabels } from '@/config/sceneOverlayConfig'
 import { showroomRuntime } from './showroomRuntime'
 import { SceneRenderLoop } from './SceneRenderLoop'
 import groundVert from '@/shaders/ground/vertex.glsl?raw'
@@ -29,7 +41,7 @@ const uiStore = useUIStore()
 const worldStore = useWorldStore()
 const camera = useSphericalCamera()
 const lightUniforms = useLightUniforms()
-initDeviceAnimStore(worldStore)
+initDeviceAnimStore(worldStore, uiStore)
 
 const sceneHostEl = ref<HTMLElement | null>(null)
 const glbLoader = new GLTFLoader()
@@ -44,6 +56,12 @@ const floorRefs: Record<FloorId, ReturnType<typeof shallowRef<THREE.Group | null
 }
 
 const reflectionRefs: Record<FloorId, ReturnType<typeof shallowRef<THREE.Group | null>>> = {
+  F1: shallowRef<THREE.Group | null>(null),
+  F2: shallowRef<THREE.Group | null>(null),
+  F3: shallowRef<THREE.Group | null>(null),
+}
+
+const lightSourceRefs: Record<FloorId, ReturnType<typeof shallowRef<THREE.Group | null>>> = {
   F1: shallowRef<THREE.Group | null>(null),
   F2: shallowRef<THREE.Group | null>(null),
   F3: shallowRef<THREE.Group | null>(null),
@@ -127,21 +145,18 @@ function classifyRole(nodeName: string, materialName: string): ShowroomMaterialR
   return 'furniture'
 }
 
-function resolveSceneDeviceId(floorId: FloorId, nodeName: string): string | null {
-  const lowerName = nodeName.toLowerCase()
-  if (floorId === 'F1' && lowerName.startsWith('ac')) return 'ac_living_01'
-  if (floorId === 'F1' && lowerName.startsWith('curtain')) return 'curtain_living_01'
-  return null
-}
-
 function createLightGroups(floorId: FloorId, uniforms: THREE.Vector4[]) {
   const floor = showroomVisualConfig.floors[floorId]
   const bias = floor.lightBias
+  const volumeScale = floor.lightVolumeScale ?? 1
   const makeLights = (size: [number, number, number]) => {
-    return floor.lights.map((position, index) => ({
-      position: new THREE.Vector4(position[0], position[1], position[2], uniforms[index]?.w ?? bias),
-      size: new THREE.Vector3(size[0], size[1], size[2]),
-    }))
+    return buildShowroomLightEntries(
+      floor.lights,
+      uniforms,
+      size,
+      volumeScale,
+      bias,
+    )
   }
 
   return {
@@ -216,12 +231,6 @@ function applyShowroomMaterials(
     } else if (role === 'signage') {
       obj.material = shaderMats.createSignageMaterial(sourceMaterial)
     }
-
-    const deviceId = resolveSceneDeviceId(floorId, nodeName)
-    if (deviceId) {
-      selectableMeshes.set(obj, deviceId)
-      floorForSelectable.set(obj, floorId)
-    }
   })
 }
 
@@ -237,6 +246,79 @@ function createReflectionGroup(scene: THREE.Group, shaderMats: ReturnType<typeof
   })
 
   return reflection
+}
+
+function createLightSourceGroup(floorId: FloorId) {
+  const floorConfig = showroomVisualConfig.floors[floorId]
+  const group = new THREE.Group()
+  group.name = `showroom-light-sources-${floorId}`
+
+  for (const [x, , z] of floorConfig.lights) {
+    const halo = new THREE.Mesh(
+      new THREE.CircleGeometry(floorConfig.lightSourceSize, 32),
+      new THREE.MeshBasicMaterial({
+        color: new THREE.Color(0xdce7ff),
+        transparent: true,
+        opacity: 0,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        side: THREE.DoubleSide,
+        toneMapped: false,
+      }),
+    )
+    halo.rotation.x = -Math.PI / 2
+    halo.renderOrder = 9
+
+    const core = new THREE.Mesh(
+      new THREE.CircleGeometry(floorConfig.lightSourceSize * 0.42, 24),
+      new THREE.MeshBasicMaterial({
+        color: new THREE.Color(0xf9fbff),
+        transparent: true,
+        opacity: 0,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        side: THREE.DoubleSide,
+        toneMapped: false,
+      }),
+    )
+    core.position.y = 0.01
+    core.rotation.x = -Math.PI / 2
+    core.renderOrder = 10
+
+    const source = new THREE.Group()
+    source.position.set(x, floorConfig.lightSourceY, z)
+    source.userData.baseScale = 1
+    source.add(halo, core)
+    group.add(source)
+  }
+
+  return group
+}
+
+function updateLightSourceGroup(floorId: FloorId, dt: number) {
+  const group = lightSourceRefs[floorId].value
+  if (!group) return
+
+  const gain = floorId === 'F1' ? 1 : floorId === 'F2' ? 1.15 : 1.2
+  const current = getFloorLightCurrent(floorId)
+  const normalized = THREE.MathUtils.clamp((current - 0.05) / Math.max(gain - 0.05, 0.01), 0, 1)
+  const time = Date.now() * 0.0012
+
+  for (const source of group.children) {
+    const pulse = 0.97 + Math.sin(source.position.x + time) * 0.015
+    source.scale.setScalar(THREE.MathUtils.damp(source.scale.x, 0.88 + normalized * 0.1 * pulse, 6, dt))
+    source.visible = normalized > 0.02
+
+    for (const child of source.children) {
+      if (!(child instanceof THREE.Mesh)) continue
+      const material = child.material
+      if (!(material instanceof THREE.MeshBasicMaterial)) continue
+      const targetOpacity = child === source.children[0]
+        ? normalized * 0.14
+        : normalized * 0.8
+      material.opacity = THREE.MathUtils.damp(material.opacity, targetOpacity, 8, dt)
+    }
+  }
 }
 
 function getReflectionY(sourceY: number) {
@@ -256,7 +338,7 @@ function moveFloorPair(floorId: FloorId, targetY: number, duration: number) {
 
 function buildFloorDevices(floorId: FloorId) {
   return Object.entries(worldStore.devices).filter(([, device]) => {
-    return getFloorForDevice(device.id, device.location.room) === floorId
+    return getFloorForDevice(device.id, device.location.room, device.floor_id) === floorId
   })
 }
 
@@ -275,8 +357,8 @@ function renderFloorLabel(floorId: FloorId) {
   const chipsHtml = devices.length > 0
     ? devices.map(([deviceId, device]) => {
         const activeClass = uiStore.activeDevice === deviceId ? 'active' : ''
-        const liveClass = device.state.power ? 'live' : ''
-        return `<button class="scene-floor-label__chip ${activeClass} ${liveClass}" data-device-id="${deviceId}" data-floor-id="${floorId}">${device.type}</button>`
+        const liveClass = isDeviceOnline(device) ? 'live' : ''
+        return `<button class="scene-floor-label__chip ${activeClass} ${liveClass}" data-device-id="${deviceId}" data-floor-id="${floorId}">${getDeviceLabel(device, deviceId)}</button>`
       }).join('')
     : '<span class="scene-floor-label__sub">当前没有接入设备</span>'
 
@@ -298,6 +380,8 @@ function renderFloorLabel(floorId: FloorId) {
 }
 
 function attachFloorLabel(floorId: FloorId, scene: THREE.Group) {
+  if (!showSceneFloorLabels) return
+
   const element = document.createElement('div')
   element.className = 'scene-floor-label'
   labelElements.set(floorId, element)
@@ -310,7 +394,32 @@ function attachFloorLabel(floorId: FloorId, scene: THREE.Group) {
 }
 
 function refreshFloorLabels() {
+  if (!showSceneFloorLabels) return
   floorOrder.forEach((floorId) => renderFloorLabel(floorId))
+}
+
+/**
+ * 交互命中改为读取注册表里的 scene_bindings。
+ * 这样设备扩容后，点击层不会继续卡死在少量硬编码节点上。
+ */
+function refreshSelectableMeshes() {
+  selectableMeshes.clear()
+  floorForSelectable.clear()
+
+  for (const [deviceId, device] of Object.entries(worldStore.devices)) {
+    const floorId = getFloorForDevice(deviceId, device.location.room, device.floor_id)
+    if (!floorId || !floorOrder.includes(floorId as FloorId)) continue
+
+    const bindings = getSceneBindings(device)
+    const nodeNames = getSelectableBindingNodes(bindings)
+    if (nodeNames.length === 0) continue
+
+    const nodes = getSceneNodesForNames(floorId, nodeNames)
+    for (const node of nodes) {
+      selectableMeshes.set(node, deviceId)
+      floorForSelectable.set(node, floorId as FloorId)
+    }
+  }
 }
 
 function createLabelRenderer() {
@@ -379,6 +488,7 @@ watch(
 watch(
   () => JSON.stringify(worldStore.devices),
   () => {
+    refreshSelectableMeshes()
     refreshFloorLabels()
   },
 )
@@ -393,7 +503,9 @@ watch(
 onMounted(async () => {
   try {
     uiStore.setSceneLoadStatus('loading')
-    createLabelRenderer()
+    if (showSceneFloorLabels) {
+      createLabelRenderer()
+    }
 
     const [matcapRoughness, matcapReflection] = await Promise.all([
       loadTexture('/textures/matcap_roughness_3.webp'),
@@ -422,23 +534,36 @@ onMounted(async () => {
 
       applyShowroomMaterials(scene, floorId, shaderMats, floorLightUnis)
       registerDeviceNodes(floorId, scene)
+      refreshSelectableMeshes()
 
       const reflection = createReflectionGroup(scene, shaderMats)
       reflection.position.set(0, getReflectionY(floorConfig.collapsedY), 0)
+      const lightSources = createLightSourceGroup(floorId)
+      scene.add(lightSources)
 
       attachFloorLabel(floorId, scene)
 
       floorRefs[floorId].value = scene
       reflectionRefs[floorId].value = reflection
+      lightSourceRefs[floorId].value = lightSources
     }
 
     showroomRuntime.onFrame.value = (dt, elapsed) => {
+      for (const floorId of floorOrder) {
+        const floorScene = floorRefs[floorId].value
+        if (floorScene) {
+          lightUniforms.setFloorTransform(floorId, floorScene.position)
+        }
+        updateLightSourceGroup(floorId, dt)
+      }
       shaderMats.updateShowroomEffects(dt, elapsed)
       groundMaterial.uniforms.u_time.value = elapsed
     }
 
     setupLightWatchers()
-    resizeLabelRenderer()
+    if (showSceneFloorLabels) {
+      resizeLabelRenderer()
+    }
     uiStore.setSceneLoadStatus('loaded')
   } catch (error) {
     console.error('Scene load error:', error)
@@ -485,7 +610,9 @@ onMounted(async () => {
     }
   }, 120)
 
-  window.addEventListener('resize', resizeLabelRenderer)
+  if (showSceneFloorLabels) {
+    window.addEventListener('resize', resizeLabelRenderer)
+  }
 })
 
 onBeforeUnmount(() => {
@@ -512,7 +639,9 @@ onBeforeUnmount(() => {
     if (reflectionRefs[floorId].value) gsap.killTweensOf(reflectionRefs[floorId].value.position)
   })
 
-  window.removeEventListener('resize', resizeLabelRenderer)
+  if (showSceneFloorLabels) {
+    window.removeEventListener('resize', resizeLabelRenderer)
+  }
   showroomRuntime.environment.value = null
   showroomRuntime.onFrame.value = null
   showroomRuntime.camera.value = null

@@ -3,6 +3,7 @@ import { computed } from 'vue'
 import { useWebSocket } from '@/composables/useWebSocket'
 import DeviceButton from '@/components/ui/DeviceButton.vue'
 import LevelSelector from '@/components/ui/LevelSelector.vue'
+import NumberStepper from '@/components/ui/NumberStepper.vue'
 import type { DeviceState } from '@/types/world-state'
 
 const props = defineProps<{
@@ -11,14 +12,16 @@ const props = defineProps<{
 }>()
 
 const { sendCommand } = useWebSocket()
-const isPowered = computed(() => props.device.state.power)
-const brightness = computed(() => props.device.state.extra.brightness ?? 0)
-const currentColorTemp = computed(() => props.device.state.extra.color_temp ?? 4000)
 
-const colorTempOptions = [
-  { value: 2700, label: '暖光' },
-  { value: 4000, label: '自然' },
-  { value: 5000, label: '冷光' },
+const isPowered = computed(() => props.device.state.power)
+const speed = computed(() => props.device.state.extra.speed ?? 'low')
+const shake = computed(() => Boolean(props.device.state.extra.shake))
+const timeout = computed(() => Number(props.device.state.extra.timeout ?? 0))
+
+const speedOptions = [
+  { value: 'low', label: '低速' },
+  { value: 'medium', label: '中速' },
+  { value: 'high', label: '高速' },
 ]
 
 function togglePower() {
@@ -28,20 +31,27 @@ function togglePower() {
   })
 }
 
-function setBrightness(event: Event) {
-  const value = +(event.target as HTMLInputElement).value
+function setSpeed(value: number | string) {
   sendCommand('CMD_DEVICE_CONTROL', {
     device_id: props.deviceId,
     action: 'set_state',
-    params: { brightness: value },
+    params: { speed: value },
   })
 }
 
-function setColorTemp(value: number | string) {
+function toggleShake() {
   sendCommand('CMD_DEVICE_CONTROL', {
     device_id: props.deviceId,
     action: 'set_state',
-    params: { color_temp: Number(value) },
+    params: { shake: !shake.value },
+  })
+}
+
+function setTimeoutMinutes(value: number) {
+  sendCommand('CMD_DEVICE_CONTROL', {
+    device_id: props.deviceId,
+    action: 'set_state',
+    params: { timeout: value },
   })
 }
 </script>
@@ -51,24 +61,39 @@ function setColorTemp(value: number | string) {
     <div class="device-panel__top">
       <div>
         <p class="device-panel__name">{{ device.display_name || deviceId }}</p>
-        <p class="device-panel__status">{{ isPowered ? `${brightness}%` : '已关闭' }}</p>
+        <p class="device-panel__status">
+          {{ isPowered ? `${speed} · ${shake ? '摇头中' : '固定送风'}` : '已关闭' }}
+        </p>
       </div>
       <DeviceButton :active="isPowered" :label="isPowered ? 'ON' : 'OFF'" @click="togglePower" />
     </div>
 
     <div class="device-panel__body" :class="{ disabled: !isPowered }">
-      <div class="device-panel__row">
-        <span>亮度</span>
-        <span>{{ brightness }}%</span>
-      </div>
-      <input type="range" min="0" max="100" :value="brightness" :disabled="!isPowered" @input="setBrightness" />
       <LevelSelector
-        label="色温"
-        :model-value="currentColorTemp"
-        :options="colorTempOptions"
+        label="风速"
+        :model-value="speed"
+        :options="speedOptions"
         :disabled="!isPowered"
-        @update:model-value="setColorTemp"
+        @update:model-value="setSpeed"
       />
+
+      <div class="device-panel__row">
+        <span>摇头</span>
+        <DeviceButton :active="shake" :label="shake ? '开启' : '关闭'" :disabled="!isPowered" @click="toggleShake" />
+      </div>
+
+      <div class="device-panel__timeout">
+        <span class="device-panel__label">定时</span>
+        <NumberStepper
+          :model-value="timeout"
+          :min="0"
+          :max="120"
+          :step="15"
+          unit="min"
+          :disabled="!isPowered"
+          @update:model-value="setTimeoutMinutes"
+        />
+      </div>
     </div>
   </div>
 </template>
@@ -96,7 +121,8 @@ function setColorTemp(value: number | string) {
   color: var(--color-text-primary);
 }
 
-.device-panel__status {
+.device-panel__status,
+.device-panel__label {
   margin-top: 4px;
   font-size: 11px;
   color: var(--color-text-secondary);
@@ -114,8 +140,10 @@ function setColorTemp(value: number | string) {
   pointer-events: none;
 }
 
-.device-panel__row {
-  font-size: 11px;
-  color: var(--color-text-secondary);
+.device-panel__timeout {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
 }
 </style>

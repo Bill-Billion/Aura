@@ -5,6 +5,14 @@ import { useWorldStore } from '@/stores/worldStore'
 import LightControlPanel from './panels/LightControlPanel.vue'
 import HVACControlPanel from './panels/HVACControlPanel.vue'
 import CurtainControlPanel from './panels/CurtainControlPanel.vue'
+import FanControlPanel from './panels/FanControlPanel.vue'
+import CameraPanel from './panels/CameraPanel.vue'
+import SensorPanel from './panels/SensorPanel.vue'
+import {
+  getDeviceLabel,
+  getDeviceTypeLabel,
+  getRoomLabel,
+} from '@/utils/deviceFloorMap'
 
 const uiStore = useUIStore()
 const worldStore = useWorldStore()
@@ -12,25 +20,9 @@ const worldStore = useWorldStore()
 const deviceId = computed(() => uiStore.activeDevice)
 const device = computed(() => (deviceId.value ? worldStore.devices[deviceId.value] : null))
 
-const deviceTypeLabel = computed(() => {
-  if (!device.value) return ''
-  const labels: Record<string, string> = {
-    light: '灯光控制',
-    hvac: '空调控制',
-    curtain: '窗帘控制',
-  }
-  return labels[device.value.type] ?? '设备控制'
-})
-
-const roomLabel = computed(() => {
-  const labels: Record<string, string> = {
-    living_room: '一层客厅',
-    kitchen: '一层厨房',
-    bedroom: '二层卧室',
-    bathroom: '二层卫浴',
-  }
-  return labels[device.value?.location.room ?? ''] ?? '场景设备'
-})
+const deviceTypeLabel = computed(() => getDeviceTypeLabel(device.value?.type ?? ''))
+const deviceLabel = computed(() => (device.value ? getDeviceLabel(device.value, deviceId.value ?? undefined) : ''))
+const roomLabel = computed(() => getRoomLabel(device.value?.location.room))
 
 function closePanel() {
   uiStore.setActiveDevice(null)
@@ -44,7 +36,7 @@ function closePanel() {
         <div>
           <p class="contextual-device-panel__eyebrow">选中对象</p>
           <h3 class="contextual-device-panel__title">{{ deviceTypeLabel }}</h3>
-          <p class="contextual-device-panel__sub">{{ roomLabel }} · {{ deviceId }}</p>
+          <p class="contextual-device-panel__sub">{{ roomLabel }} · {{ deviceLabel }}</p>
         </div>
         <button class="contextual-device-panel__close" @click="closePanel">关闭</button>
       </header>
@@ -61,6 +53,21 @@ function closePanel() {
       />
       <CurtainControlPanel
         v-else-if="device.type === 'curtain'"
+        :device-id="deviceId"
+        :device="device"
+      />
+      <FanControlPanel
+        v-else-if="device.type === 'fan'"
+        :device-id="deviceId"
+        :device="device"
+      />
+      <CameraPanel
+        v-else-if="device.type === 'camera'"
+        :device-id="deviceId"
+        :device="device"
+      />
+      <SensorPanel
+        v-else-if="device.type === 'sensor'"
         :device-id="deviceId"
         :device="device"
       />

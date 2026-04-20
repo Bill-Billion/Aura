@@ -10,11 +10,22 @@ export interface FloorLightConfig {
 interface LightState {
   uniform: THREE.Vector4  // xyz=worldPos, w=currentIntensity
   target: number           // target intensity (0 or 1)
+  localPosition: THREE.Vector3
 }
 
 const floorLights = new Map<string, LightState[]>()
 
 export function useLightUniforms() {
+  function setFloorTransform(floorId: string, position: THREE.Vector3Like) {
+    const states = floorLights.get(floorId)
+    if (!states) return
+
+    for (const light of states) {
+      light.uniform.x = light.localPosition.x + position.x
+      light.uniform.y = light.localPosition.y + position.y
+      light.uniform.z = light.localPosition.z + position.z
+    }
+  }
 
   function initFloor(config: FloorLightConfig): THREE.Vector4[] {
     const states: LightState[] = []
@@ -22,15 +33,17 @@ export function useLightUniforms() {
 
     for (let i = 0; i < config.numLights; i++) {
       const pos = config.positions[i] ?? [0, 0, 0]
+      const localPosition = new THREE.Vector3(pos[0], pos[1], pos[2])
       const vec = new THREE.Vector4(
-        pos[0], pos[1], pos[2], // LOCAL space — no floorY offset
+        pos[0], pos[1] + config.floorY, pos[2],
         1.0 // start with lights on
       )
-      states.push({ uniform: vec, target: 1.0 })
+      states.push({ uniform: vec, target: 1.0, localPosition })
       uniforms.push(vec)
     }
 
     floorLights.set(config.floorId, states)
+    setFloorTransform(config.floorId, new THREE.Vector3(0, config.floorY, 0))
     return uniforms
   }
 
@@ -60,6 +73,7 @@ export function useLightUniforms() {
   return {
     initFloor,
     setLightTarget,
+    setFloorTransform,
     update,
     getFloorUniforms,
   }

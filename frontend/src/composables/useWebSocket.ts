@@ -162,6 +162,11 @@ export function useWebSocket() {
         break
       }
 
+      case 'ERROR': {
+        console.warn('[WebSocket] Command rejected:', msg.payload)
+        break
+      }
+
       case 'HEARTBEAT_PING': {
         // Auto-reply with pong
         sendCommand('HEARTBEAT_PONG', { timestamp: Date.now() })

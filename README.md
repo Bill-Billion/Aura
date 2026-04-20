@@ -9,8 +9,9 @@ Aura is a simulation and visualization platform for observing how AI agents cont
 - **3D Showroom Visualization** — Multi-floor apartment rendering with TresJS/Three.js, custom GLSL shaders, world-floor reflection layers, and a tighter gamemcu-style shell
 - **AI Agent Simulation** — Rule-based agents (Lighting, HVAC) with an extensible architecture for LLM-powered autonomous agents
 - **Structured Event Flow** — `SimEvent` now carries `event_id`, `correlation_id`, `causal_parent`, and priority for user/action/feedback tracing
+- **Registered Device Catalog** — Default scene now ships with lights, HVAC, curtains, fans, cameras, and environment sensors, all with explicit metadata and capability flags
 - **Real-time Observability Foundation** — WebSocket now exposes legacy state sync and `SIM_EVENT` side by side, ready for the next-stage observability panel
-- **Interactive Dashboard** — Slim left floor rail, lighter right showroom cards, contextual device controller, compact simulation controls, and auxiliary event log
+- **Interactive Dashboard** — Slim left floor rail, lighter right showroom cards, grouped device summary, contextual device controller, compact simulation controls, and auxiliary event log
 
 ## Tech Stack
 
@@ -19,7 +20,7 @@ Aura is a simulation and visualization platform for observing how AI agents cont
 | Frontend | Vue 3.5 + TypeScript, TresJS 5.8 (Three.js), Pinia 3.0, TailwindCSS 4, GSAP 3.14 |
 | 3D | Custom GLSL shaders, DRACO + Meshopt compressed GLB models |
 | Backend | FastAPI, Pydantic v2, WebSocket, structlog |
-| Testing | pytest + pytest-asyncio (22 backend tests) |
+| Testing | pytest + pytest-asyncio (74 backend tests) |
 
 ## Architecture
 
@@ -74,6 +75,17 @@ npm run dev
 
 Open http://localhost:5173
 
+### Recommended: fresh local stack
+
+调试时优先使用仓库根目录的统一起栈脚本，它会清理已记录的旧 PID、检查 `8000/5173` 端口占用，并在启动后额外校验一次通过前端代理的 WebSocket 保活。
+
+```bash
+./scripts/dev-stack.sh start
+./scripts/dev-stack.sh status
+./scripts/dev-stack.sh verify
+./scripts/dev-stack.sh stop
+```
+
 ### Running Tests
 
 ```bash
@@ -91,6 +103,10 @@ npm run build
 ## Event Schema
 
 结构化事件字段和关联规则写在 `/docs/architecture/sim-event-schema.md`。下一阶段的 ObservabilityPanel 会直接消费这条事件流，而不是继续依赖旧的 delta 文本日志。
+
+## Device Registration
+
+默认设备注册与接入主线写在 `/docs/architecture/gamemcu-device-registration-plan.md`。当前系统已经把设备能力显式写进 `STATE_FULL`，前端可以直接按 `ui_group` 和 `capabilities` 渲染交互，不需要再维护一套分散的硬编码映射。
 
 ## Roadmap
 

@@ -1,9 +1,4 @@
-export const DEVICE_FLOOR_OVERRIDES: Record<string, string> = {
-  light_living_01: 'F1',
-  light_bedroom_01: 'F2',
-  curtain_living_01: 'F1',
-  ac_living_01: 'F1',
-}
+import type { DeviceCapability, DeviceState } from '@/types/world-state'
 
 export const ROOM_FLOOR_MAP: Record<string, string> = {
   living_room: 'F1',
@@ -14,12 +9,38 @@ export const ROOM_FLOOR_MAP: Record<string, string> = {
   utility: 'F3',
 }
 
-/**
- * 统一设备所在楼层的推导逻辑，避免 3D 动画、面板和事件链各自写一套规则。
- */
-export function getFloorForDevice(deviceId: string, roomId?: string | null): string | null {
-  if (DEVICE_FLOOR_OVERRIDES[deviceId]) {
-    return DEVICE_FLOOR_OVERRIDES[deviceId]
+const ROOM_LABELS: Record<string, string> = {
+  living_room: '一层客厅',
+  kitchen: '一层厨房',
+  bedroom: '二层卧室',
+  bathroom: '二层卫浴',
+  loft: '三层阁楼',
+  utility: '三层设备间',
+}
+
+const TYPE_LABELS: Record<string, string> = {
+  light: '灯光控制',
+  hvac: '空调控制',
+  curtain: '窗帘控制',
+  fan: '风扇控制',
+  camera: '摄像头预览',
+  sensor: '环境读数',
+}
+
+const GROUP_LABELS: Record<string, string> = {
+  lighting: '照明',
+  device: '设备',
+  security: '安防',
+  environment: '环境',
+}
+
+export function getFloorForDevice(
+  deviceId: string,
+  roomId?: string | null,
+  explicitFloorId?: string | null,
+): string | null {
+  if (explicitFloorId) {
+    return explicitFloorId
   }
 
   if (roomId && ROOM_FLOOR_MAP[roomId]) {
@@ -37,4 +58,45 @@ export function getFloorForDevice(deviceId: string, roomId?: string | null): str
   }
 
   return null
+}
+
+export function getDeviceLabel(device: DeviceState, fallbackId?: string): string {
+  return device.display_name || fallbackId || device.id
+}
+
+export function getDeviceTypeLabel(deviceType: string): string {
+  return TYPE_LABELS[deviceType] ?? '设备控制'
+}
+
+export function getDeviceGroupLabel(group: string): string {
+  return GROUP_LABELS[group] ?? '设备'
+}
+
+export function getRoomLabel(roomId?: string | null): string {
+  if (!roomId) return '场景设备'
+  return ROOM_LABELS[roomId] ?? roomId
+}
+
+export function hasDeviceCapability(
+  device: DeviceState | null | undefined,
+  capability: DeviceCapability,
+): boolean {
+  if (!device) return false
+  return device.capabilities.includes(capability)
+}
+
+export function isDeviceWritable(device: DeviceState | null | undefined): boolean {
+  if (!device) return false
+  return device.capabilities.some((capability) => capability !== 'read' && capability !== 'view')
+}
+
+export function isDeviceOnline(device: DeviceState | null | undefined): boolean {
+  if (!device) return false
+  if (device.type === 'camera') {
+    return Boolean(device.state.extra.online)
+  }
+  if (device.type === 'sensor') {
+    return device.state.power
+  }
+  return Boolean(device.state.power)
 }

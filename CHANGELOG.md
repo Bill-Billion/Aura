@@ -2,6 +2,83 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.3.4] - 2026-04-20
+
+### Changed
+
+- **Upper-floor light source rendering**: 修正二层和三层灯位 uniform 没有真正绑定到 shader 的问题，楼层升降后灯光现在会跟着场景一起移动，不再靠墙体泛白伪装亮灯
+- **Light source presence**: 为各层补了跟随灯状态的展厅灯源片，二层和三层点亮后会看到明确的光源位置，不再只有墙面和玻璃发白
+- **Upper-floor tuning**: 下调二层和三层的光体积、发光片尺寸和上层增益，避免之前那种整屋过曝的白片感
+
+### Testing
+
+- 前端 `node --experimental-strip-types --test tests/*.test.ts` 通过
+- 前端 `npm run build` 通过
+- 本地浏览器完成 F2 / F3 开关灯截图回归，确认上层由“墙面泛白”改成“有可见灯源 + 房间受光”
+
+## [0.1.3.3] - 2026-04-20
+
+### Changed
+
+- **Upper-floor lighting**: 二层和三层的 SDF 灯光现在会跟随楼层升降同步到世界坐标，不再停在 `y=0` 导致高楼层几乎没有受光
+- **Light aggregation**: 同层多盏灯改成按最大亮度聚合，避免“一盏开一盏关”时后写入的设备把整层灯光误压暗
+- **Shader response**: 为上层展厅补了更强的墙体、楼板和家具受光响应，二层和三层开关灯时会有明确的亮暗变化
+
+### Testing
+
+- 前端 `node --experimental-strip-types --test tests/*.test.ts` 通过，新增楼层灯光 uniform 回归测试
+- 前端 `npm run build` 通过
+- 本地开发环境完成 F2 / F3 开灯关灯截图对照，确认右侧状态与场景亮暗变化一致
+
+## [0.1.3.2] - 2026-04-20
+
+### Added
+
+- **Dev stack entrypoint**: 新增 `scripts/dev-stack.sh` 和 `scripts/check_ws_keepalive.py`，统一处理本地前后端起栈、PID/日志记录、端口冲突检测和 `5173/ws/simulation` 的 5 秒保活校验
+
+### Changed
+
+- **Curtain runtime**: 窗帘位姿改成“外侧边缘固定、内侧边缘滑动”，打开时会收在窗口两侧，关闭时回到中间
+- **Animation coverage**: 开发环境下如果设备声明了 `scene_bindings.animation` 却没有命中对应场景节点，会打印一次明确告警，避免出现“注册了设备但场景没有反应”的假绑定
+- **Fan binding guard**: 为风扇 `rotor_nodes` / `head_nodes` 增加不重叠回归校验，锁住“扇叶转、机头摆”的绑定语义
+
+### Testing
+
+- 后端 `backend/.venv/bin/python -m pytest tests/test_main.py tests/test_device_registry.py -q` 通过，包含 5 秒 WebSocket longevity 校验
+- 前端 `node --experimental-strip-types --test frontend/tests/deviceAnimationMath.test.ts` 通过
+- `./scripts/dev-stack.sh start` 可完成 HTTP health 与代理 WebSocket keepalive 校验
+
+## [0.1.3.1] - 2026-04-19
+
+### Changed
+
+- **Curtain runtime**: 二层和三层窗帘的绑定轴改回 GLB 本地 `z`，窗帘滑动距离改成按内边缘和父坐标系边界计算，打开时会沿正确轨道方向滑开
+- **Fan runtime**: 客厅风扇重新绑定为 `fan01` 扇叶旋转、`fan02` 头部摇头，默认送风时只转扇叶，不再整颗风扇头一起自转
+
+### Testing
+
+- 后端 `backend/.venv/bin/python -m pytest tests -q` 通过，74 个测试全部通过
+- 前端 `node --experimental-strip-types --test frontend/tests/*.test.ts` 和 `npm run build` 通过
+
+## [0.1.3.0] - 2026-04-18
+
+### Added
+
+- **Device registry**: 新增统一设备注册表，默认场景一次性接入灯光、空调、窗帘、风扇、摄像头和环境传感器
+- **New control surfaces**: 右侧 contextual panel 新增风扇控制、摄像头预览和传感器只读面板
+
+### Changed
+
+- **World state metadata**: `STATE_FULL` 里的设备现在自带 `display_name`、`floor_id`、`ui_group` 和 `capabilities`
+- **Command validation**: WebSocket 设备控制按能力校验，风扇支持 `speed / shake / timeout`，传感器写入会返回明确错误
+- **Showroom shell**: 右侧楼层摘要改成按“照明 / 设备 / 安防 / 环境”分组，设备列表不再依赖硬编码 ID
+- **HVAC control**: 空调面板补齐风速和更多模式，与 gamemcu 的控制语义更接近
+
+### Testing
+
+- 后端 `pytest tests -v` 通过，73 个测试全部通过
+- 前端 `npm run build` 通过
+
 ## [0.1.2.0] - 2026-04-18
 
 ### Changed
