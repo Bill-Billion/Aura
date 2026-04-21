@@ -10,6 +10,12 @@ export type KnownSimEventType =
   | 'environment.state_refresh'
   | 'user.command'
   | 'user.activity_change'
+  | 'reasoning.perception_snapshot'
+  | 'reasoning.intent_recognized'
+  | 'reasoning.task_decomposition'
+  | 'reasoning.coordination_decision'
+  | 'reasoning.execution_plan'
+  | 'reasoning.fallback_rule_based'
   | 'action.device_control'
   | 'feedback.state_delta'
 
@@ -43,6 +49,8 @@ export interface EnvironmentStateRefreshData {
   simulated_dt: number
   time_of_day: string
   outdoor_temp: number
+  significant_change_reasons?: string[]
+  updates?: Record<string, number>
 }
 
 export interface UserCommandData {
@@ -65,6 +73,58 @@ export interface ActionDeviceControlData {
   property: string
   value: unknown
   reason: string
+}
+
+export interface CommandProposalData {
+  device_id: string
+  property: string
+  value: unknown
+  reason: string
+}
+
+export interface ReasoningPerceptionSnapshotData {
+  agent_id: string
+  trigger_event_type: string
+  world_summary: string
+  relevant_devices: string[]
+  relevant_rooms: string[]
+}
+
+export interface ReasoningIntentRecognizedData {
+  agent_id: string
+  intent: string
+  confidence: number
+  explanation: string
+  provider: string
+  model: string
+  latency_ms: number
+}
+
+export interface ReasoningTaskDecompositionData {
+  agent_id: string
+  intent: string
+  task_steps: string[]
+}
+
+export interface ReasoningCoordinationDecisionData {
+  agent_id: string
+  outcome: string
+  priority: string
+  conflicts: Array<Record<string, unknown>>
+  winning_commands: CommandProposalData[]
+}
+
+export interface ReasoningExecutionPlanData {
+  agent_id: string
+  execution_mode: string
+  commands: CommandProposalData[]
+}
+
+export interface ReasoningFallbackRuleBasedData {
+  agent_id: string
+  reason: 'timeout' | 'provider_error' | 'invalid_output' | string
+  failed_step: string
+  fallback_strategy: string
 }
 
 export interface SystemTimerTickEvent
@@ -94,6 +154,24 @@ export interface ActionDeviceControlEvent
 export interface FeedbackStateDeltaEvent
   extends SimEventBase<'feedback.state_delta', DeltaChange> {}
 
+export interface ReasoningPerceptionSnapshotEvent
+  extends SimEventBase<'reasoning.perception_snapshot', ReasoningPerceptionSnapshotData> {}
+
+export interface ReasoningIntentRecognizedEvent
+  extends SimEventBase<'reasoning.intent_recognized', ReasoningIntentRecognizedData> {}
+
+export interface ReasoningTaskDecompositionEvent
+  extends SimEventBase<'reasoning.task_decomposition', ReasoningTaskDecompositionData> {}
+
+export interface ReasoningCoordinationDecisionEvent
+  extends SimEventBase<'reasoning.coordination_decision', ReasoningCoordinationDecisionData> {}
+
+export interface ReasoningExecutionPlanEvent
+  extends SimEventBase<'reasoning.execution_plan', ReasoningExecutionPlanData> {}
+
+export interface ReasoningFallbackRuleBasedEvent
+  extends SimEventBase<'reasoning.fallback_rule_based', ReasoningFallbackRuleBasedData> {}
+
 export type KnownSimEvent =
   | SystemTimerTickEvent
   | SystemSimulationStartedEvent
@@ -102,6 +180,12 @@ export type KnownSimEvent =
   | EnvironmentStateRefreshEvent
   | UserCommandEvent
   | UserActivityChangeEvent
+  | ReasoningPerceptionSnapshotEvent
+  | ReasoningIntentRecognizedEvent
+  | ReasoningTaskDecompositionEvent
+  | ReasoningCoordinationDecisionEvent
+  | ReasoningExecutionPlanEvent
+  | ReasoningFallbackRuleBasedEvent
   | ActionDeviceControlEvent
   | FeedbackStateDeltaEvent
 

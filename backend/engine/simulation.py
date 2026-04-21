@@ -3,17 +3,17 @@
 from __future__ import annotations
 
 import time
-import uuid
 from typing import Any
 
 from backend.agents.hvac import HVACAgent
 from backend.agents.lighting import LightingAgent
+from backend.agents.llm import LLMProvider
 from backend.agents.runtime import AgentRuntime
 from backend.api.ws import ConnectionManager
 from backend.core.logging import log
 from backend.engine.event_bus import EventBus, SimEvent, WorldEvent
 from backend.engine.simulator_timer import SimulatorTimer
-from backend.engine.state import AgentRuntimeState, Location3D
+from backend.engine.state import Location3D, WorldState
 from backend.engine.state_manager import DeltaChange, StateManager
 from backend.models.schemas import WSMessage
 from backend.simulators.environment import EnvironmentSimulator
@@ -31,26 +31,40 @@ class SimulationEngine:
         event_bus: EventBus,
         state_manager: StateManager,
         connection_manager: ConnectionManager,
+        llm_provider: LLMProvider | None = None,
+        agent_episode_timeout_ms: int | None = None,
     ) -> None:
         self.event_bus = event_bus
         self.state_manager = state_manager
         self.conn = connection_manager
         self.is_running = False
 
-        self.agent_runtime = AgentRuntime()
-        self.agent_runtime.register(LightingAgent())
-        self.agent_runtime.register(HVACAgent())
         self.env_sim = EnvironmentSimulator()
         self.user_sim = UserBehaviorSimulator()
-
         self.timer = SimulatorTimer(
             publish_event=self._publish_sim_event,
             tick_interval=self.TICK_INTERVAL,
             simulated_dt=self.SIMULATED_DT,
         )
+
         self._pending_deltas: list[DeltaChange] = []
         self._subscriptions_registered = False
+        self._is_processing_timer_tick = False
+
+        self.agent_runtime = AgentRuntime(
+            llm_provider=llm_provider,
+            episode_timeout_ms=agent_episode_timeout_ms,
+        )
+        self.agent_runtime.register(LightingAgent())
+        self.agent_runtime.register(HVACAgent())
+
         self._subscribe_handlers()
+        self.agent_runtime.bind(
+            event_bus=self.event_bus,
+            state_manager=self.state_manager,
+            connection_manager=self.conn,
+            publish_event=self._publish_sim_event,
+        )
 
     @property
     def speed(self) -> float:
@@ -62,7 +76,6 @@ class SimulationEngine:
         self.state_manager.world.simulation_speed = float(value)
 
     async def start(self) -> None:
-        """Start the timer-driven simulation loop."""
         if self.is_running:
             return
 
@@ -82,7 +95,6 @@ class SimulationEngine:
         log.info("sim_started")
 
     async def pause(self) -> None:
-        """Pause the timer-driven simulation loop."""
         if not self.is_running:
             return
 
@@ -104,7 +116,6 @@ class SimulationEngine:
         await self.pause()
 
     async def reset(self, new_state_manager: StateManager | None = None) -> None:
-        """Pause and reset simulation state, optionally replacing the world."""
         await self.pause()
         if new_state_manager is not None:
             self.state_manager = new_state_manager
@@ -116,6 +127,8 @@ class SimulationEngine:
         self.timer.reset()
         self.user_sim = UserBehaviorSimulator()
         self._pending_deltas = []
+        self.agent_runtime.update_state_manager(self.state_manager)
+        self.agent_runtime.reset()
         await self._publish_sim_event(
             SimEvent(
                 event_type="system.simulation_reset",
@@ -130,6 +143,7 @@ class SimulationEngine:
     async def close(self) -> None:
         await self.stop()
         self._unsubscribe_handlers()
+        await self.agent_runtime.close()
 
     def _subscribe_handlers(self) -> None:
         if self._subscriptions_registered:
@@ -152,10 +166,13 @@ class SimulationEngine:
     async def _handle_timer_tick(self, event: SimEvent) -> None:
         world = self.state_manager.world
         self._pending_deltas = []
+        self._is_processing_timer_tick = True
 
         timer_tick = int(event.data["tick"])
         simulated_dt = float(event.data["simulated_dt"])
-        time_of_day = self._next_time_of_day(world.environment.time_of_day, simulated_dt)
+        previous_time_of_day = world.environment.time_of_day
+        previous_weather = world.environment.weather
+        time_of_day = self._next_time_of_day(previous_time_of_day, simulated_dt)
 
         self._pending_deltas.extend(
             self.state_manager.apply_updates(
@@ -171,9 +188,8 @@ class SimulationEngine:
         )
 
         root_event = event
-        user_events = self.user_sim.step(world)
         published_user_events: list[SimEvent] = []
-        for user_event in user_events:
+        for user_event in self.user_sim.step(world):
             published = await self._publish_sim_event(
                 SimEvent.from_world_event(
                     user_event,
@@ -186,6 +202,15 @@ class SimulationEngine:
 
         if published_user_events:
             root_event = published_user_events[-1]
+
+        env_updates = self.env_sim.step(world, dt=simulated_dt)
+        significant_change_reasons = self._collect_environment_change_reasons(
+            world=world,
+            updates=env_updates,
+            previous_time_of_day=previous_time_of_day,
+            previous_weather=previous_weather,
+            next_time_of_day=time_of_day,
+        )
 
         await self._publish_sim_event(
             SimEvent(
@@ -200,50 +225,13 @@ class SimulationEngine:
                     "simulated_dt": simulated_dt,
                     "time_of_day": world.environment.time_of_day,
                     "outdoor_temp": world.environment.outdoor_temp,
+                    "significant_change_reasons": significant_change_reasons,
+                    "updates": env_updates,
                 },
             )
         )
 
-        actions = await self.agent_runtime.step(world)
-        for action in actions:
-            action_event = self._build_action_event(
-                world_tick=world.simulation_tick,
-                action=action,
-                root_event=root_event,
-            )
-            published_action = await self._publish_sim_event(action_event)
-            try:
-                deltas = self.state_manager.apply_action(
-                    agent_id=action["agent_id"],
-                    device_id=action["device_id"],
-                    property_path=action["property"],
-                    new_value=action["value"],
-                    reason=action.get("reason", ""),
-                )
-            except KeyError:
-                log.warning(
-                    "agent_action_failed",
-                    device_id=action.get("device_id"),
-                    agent_id=action.get("agent_id"),
-                )
-                continue
-
-            self._pending_deltas.extend(deltas)
-            for delta in deltas:
-                await self._publish_sim_event(
-                    SimEvent(
-                        event_type="feedback.state_delta",
-                        source="state_manager",
-                        timestamp=float(world.simulation_tick),
-                        wall_time=time.time(),
-                        correlation_id=published_action.correlation_id,
-                        causal_parent=published_action.event_id,
-                        priority=1,
-                        data=delta.model_dump(),
-                    )
-                )
-
-        self._sync_agent_states(world, actions)
+        self._is_processing_timer_tick = False
         await self._flush_pending_deltas()
         await self._broadcast_agent_status(world)
 
@@ -265,19 +253,23 @@ class SimulationEngine:
 
         if old_room and old_room in world.rooms:
             remaining = [person for person in world.rooms[old_room].persons if person != user_id]
-            updates.extend([
-                (f"rooms[{old_room}].persons", remaining),
-                (f"rooms[{old_room}].occupancy", bool(remaining)),
-            ])
+            updates.extend(
+                [
+                    (f"rooms[{old_room}].persons", remaining),
+                    (f"rooms[{old_room}].occupancy", bool(remaining)),
+                ]
+            )
 
         if target_room in world.rooms:
             next_persons = [*world.rooms[target_room].persons]
             if user_id not in next_persons:
                 next_persons.append(user_id)
-            updates.extend([
-                (f"rooms[{target_room}].persons", next_persons),
-                (f"rooms[{target_room}].occupancy", True),
-            ])
+            updates.extend(
+                [
+                    (f"rooms[{target_room}].persons", next_persons),
+                    (f"rooms[{target_room}].occupancy", True),
+                ]
+            )
 
         self._pending_deltas.extend(
             self.state_manager.apply_updates(
@@ -287,18 +279,24 @@ class SimulationEngine:
             )
         )
 
+        if not self._is_processing_timer_tick:
+            await self._flush_pending_deltas()
+
     async def _handle_environment_refresh(self, event: SimEvent) -> None:
-        updates = self.env_sim.step(
+        updates = event.data.get("updates") or self.env_sim.step(
             self.state_manager.world,
             dt=float(event.data["simulated_dt"]),
         )
         self._pending_deltas.extend(
             self.state_manager.apply_updates(
                 caused_by=event.source,
-                updates=list(updates.items()),
+                updates=list(dict(updates).items()),
                 reason="apply environment refresh",
             )
         )
+
+        if not self._is_processing_timer_tick:
+            await self._flush_pending_deltas()
 
     async def _flush_pending_deltas(self) -> None:
         if not self._pending_deltas:
@@ -312,7 +310,7 @@ class SimulationEngine:
         )
         self._pending_deltas = []
 
-    async def _broadcast_agent_status(self, world: "WorldState") -> None:  # noqa: F821
+    async def _broadcast_agent_status(self, world: WorldState) -> None:
         await self.conn.broadcast(
             WSMessage(
                 type="AGENT_STATUS",
@@ -327,55 +325,47 @@ class SimulationEngine:
         total_minutes %= 24 * 60
         return f"{int(total_minutes // 60):02d}:{int(total_minutes % 60):02d}"
 
-    def _build_action_event(
-        self,
-        world_tick: int,
-        action: dict,
-        root_event: SimEvent | None,
-    ) -> SimEvent:
-        correlation_id = root_event.correlation_id if root_event else None
-        causal_parent = root_event.event_id if root_event else None
-        return SimEvent(
-            event_type="action.device_control",
-            source=action["agent_id"],
-            timestamp=float(world_tick),
-            wall_time=time.time(),
-            correlation_id=correlation_id or uuid.uuid4().hex,
-            causal_parent=causal_parent,
-            priority=2,
-            data={
-                "agent_name": action.get("agent_name", ""),
-                "device_id": action["device_id"],
-                "property": action["property"],
-                "value": action["value"],
-                "reason": action.get("reason", ""),
-            },
-        )
-
     async def _publish_sim_event(self, event: WorldEvent | SimEvent) -> SimEvent:
         sim_event = self.event_bus.coerce_event(event)
-        # 先对外广播根事件，再让订阅器派生子事件，这样前端看到的因果顺序才稳定。
         await self.conn.broadcast(WSMessage(type="SIM_EVENT", payload=sim_event.model_dump()))
         await self.event_bus.publish(sim_event)
         return sim_event
 
-    def _sync_agent_states(self, world: "WorldState", actions: list[dict]) -> None:  # noqa: F821
-        """Update AgentRuntimeState entries in the world based on latest actions."""
-        agent_action_map: dict[str, str] = {}
-        for action in actions:
-            aid = action.get("agent_id", "")
-            agent_action_map[aid] = action.get("reason", "")
+    def _collect_environment_change_reasons(
+        self,
+        *,
+        world: WorldState,
+        updates: dict[str, float],
+        previous_time_of_day: str,
+        previous_weather: str,
+        next_time_of_day: str,
+    ) -> list[str]:
+        reasons: list[str] = []
+        if self._time_bucket(previous_time_of_day) != self._time_bucket(next_time_of_day):
+            reasons.append("time_bucket")
+        if previous_weather != world.environment.weather:
+            reasons.append("weather")
 
-        for agent in self.agent_runtime.agents:
-            entry = world.agents.get(agent.agent_id)
-            if entry is None:
-                entry = AgentRuntimeState(id=agent.agent_id, name=agent.name)
-                world.agents[agent.agent_id] = entry
+        for path, next_value in updates.items():
+            if not path.endswith(".temperature"):
+                continue
+            try:
+                current_value = float(StateManager._get_nested(world, path))
+            except Exception:
+                continue
+            if abs(float(next_value) - current_value) >= 0.5:
+                reasons.append("room_temperature_delta")
+                break
 
-            if agent.agent_id in agent_action_map:
-                entry.status = "active"
-                entry.last_action = agent_action_map[agent.agent_id]
-                entry.current_strategy = "auto"
-                entry.confidence = 0.8
-            else:
-                entry.status = "idle"
+        return reasons
+
+    @staticmethod
+    def _time_bucket(time_of_day: str) -> str:
+        hour = int(time_of_day.split(":")[0])
+        if 6 <= hour < 12:
+            return "morning"
+        if 12 <= hour < 18:
+            return "day"
+        if 18 <= hour < 23:
+            return "evening"
+        return "night"

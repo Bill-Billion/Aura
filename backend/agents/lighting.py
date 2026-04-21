@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from backend.agents.base import BaseAgent
-from backend.engine.state import WorldState
+from backend.engine.event_bus import SimEvent
+from backend.engine.state import DeviceState, WorldState
 
 
 def _parse_hour(time_of_day: str) -> int:
@@ -19,6 +22,44 @@ class LightingAgent(BaseAgent):
     def get_controlled_device_types(self) -> list[str]:
         return ["light"]
 
+    def get_allowed_command_specs(
+        self,
+        world_state: WorldState,
+        root_event: SimEvent,
+    ) -> list[dict[str, Any]]:
+        specs: list[dict[str, Any]] = []
+        for device in self.get_relevant_devices(world_state, root_event):
+            specs.extend(
+                [
+                    {"device_id": device.id, "property": "power"},
+                    {"device_id": device.id, "property": "extra.brightness"},
+                    {"device_id": device.id, "property": "extra.color_temp"},
+                ]
+            )
+        return specs
+
+    def determine_priority(
+        self,
+        world_state: WorldState,
+        root_event: SimEvent,
+    ) -> str:
+        if root_event.event_type == "user.command":
+            return "direct_user_command"
+
+        relevant_rooms = self.get_relevant_rooms(world_state, root_event)
+        if any(world_state.rooms.get(room_id) and world_state.rooms[room_id].occupancy for room_id in relevant_rooms):
+            return "user_comfort"
+
+        return "convenience"
+
+    def get_relevant_devices(self, world_state: WorldState, root_event: SimEvent) -> list[DeviceState]:
+        if root_event.event_type == "user.command":
+            device_id = str(root_event.data.get("device_id") or "")
+            device = world_state.devices.get(device_id)
+            if device is not None and device.type == "light":
+                return [device]
+        return self._get_my_devices(world_state)
+
     def decide(self, world_state: WorldState) -> list[dict]:
         hour = _parse_hour(world_state.environment.time_of_day)
         actions: list[dict] = []
@@ -33,7 +74,6 @@ class LightingAgent(BaseAgent):
             current_brightness = device.state.extra.get("brightness", 0)
             current_color_temp = device.state.extra.get("color_temp", 4000)
 
-            # Only act if difference exceeds threshold
             if abs(current_brightness - target_brightness) > 5:
                 actions.append({
                     "device_id": device.id,
@@ -54,22 +94,15 @@ class LightingAgent(BaseAgent):
 
     @staticmethod
     def _targets(hour: int, occupied: bool) -> tuple[int, int]:
-        """Return (brightness, color_temp) for a given hour and occupancy."""
         if 6 <= hour < 9:
-            # Morning: bright cool light
             return (90, 5000)
-        elif 9 <= hour < 17:
-            # Daytime
+        if 9 <= hour < 17:
             brightness = 40 if occupied else 10
             return (brightness, 4500)
-        elif 17 <= hour < 21:
-            # Evening
+        if 17 <= hour < 21:
             brightness = 70 if occupied else 20
             return (brightness, 3000)
-        elif 21 <= hour < 23:
-            # Late evening
+        if 21 <= hour < 23:
             brightness = 30 if occupied else 5
             return (brightness, 2700)
-        else:
-            # Night
-            return (5, 2700)
+        return (5, 2700)

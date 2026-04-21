@@ -38,6 +38,10 @@ export interface EnvironmentState {
 export interface AgentState {
   id: string; name: string; status: string
   current_strategy: string; confidence: number; last_action: string
+  mode: string
+  active_correlation_id: string | null
+  last_reasoning_step: string
+  last_fallback_reason: string | null
 }
 
 export interface UserState {

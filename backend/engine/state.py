@@ -1,5 +1,6 @@
+from typing import Any, Literal
+
 from pydantic import BaseModel, Field
-from typing import Literal, Any
 
 
 DeviceType = Literal["light", "hvac", "curtain", "sensor", "fan", "camera"]
@@ -67,6 +68,10 @@ class AgentRuntimeState(BaseModel):
     current_strategy: str = ""
     confidence: float = 0.5
     last_action: str = ""
+    mode: str = "idle"
+    active_correlation_id: str | None = None
+    last_reasoning_step: str = ""
+    last_fallback_reason: str | None = None
 
 
 class UserState(BaseModel):

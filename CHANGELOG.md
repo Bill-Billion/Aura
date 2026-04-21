@@ -2,6 +2,56 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.3.8] - 2026-04-20
+
+### Changed
+
+- **Agent episode concurrency**: `AgentRuntime` 现在会并发评估同一根事件下的多个 agent，避免兼容 provider 串行阻塞把整条推理链拖慢
+- **Episode timeout fallback**: 新增 `AGENT_EPISODE_TIMEOUT_MS` 配置，默认跟随 `LLM_TIMEOUT_MS`，慢 provider 会在 episode 级别快速超时并回退到规则逻辑
+- **Provider timeout diagnostics**: OpenAI Responses 和 Anthropic-compatible provider 的 timeout 错误现在会生成明确消息，不再出现空白异常；Anthropic invalid output 仍会附带 raw preview
+
+### Testing
+
+- `pytest tests/test_openai_provider.py tests/test_anthropic_provider.py tests/test_phase2_runtime.py -q` 通过
+- 后端 `pytest tests -q`、前端 `node --experimental-strip-types --test tests/*.test.ts` 和 `npm run build` 通过
+
+## [0.1.3.7] - 2026-04-20
+
+### Added
+
+- **Anthropic-compatible provider**: 新增 `AnthropicCompatibleProvider`，可通过 Anthropic 风格的 `messages` 接口接 MiniMax 这类兼容服务，并统一映射成现有 `AgentLLMDecision`
+- **Provider selection test**: 新增 `tests/test_anthropic_provider.py` 和运行时 provider 选择回归，锁住 Anthropic-compatible provider 的请求格式、超时映射和 JSON 解析行为
+
+### Changed
+
+- **Runtime provider selection**: `AgentRuntime` 现在支持通过 `LLM_PROVIDER=anthropic_compatible` 显式切到 Anthropic-compatible provider；未显式指定时，会先尝试 OpenAI，再尝试 Anthropic-compatible 环境变量
+- **Decision parsing**: LLM 输出解析层现在会容忍 ```json fenced block``` 这类常见返回格式，避免兼容模型因为包了一层 markdown 就直接掉到 fallback
+- **README setup**: README 增补了 MiniMax Anthropic-compatible 接入示例和相关环境变量说明
+
+### Testing
+
+- `pytest tests/test_anthropic_provider.py tests/test_openai_provider.py tests/test_phase2_components.py -q` 通过
+
+## [0.1.3.6] - 2026-04-20
+
+### Added
+
+- **Phase 2 agent runtime**: 新增 `backend/agents/llm.py`、`backend/agents/memory.py`、`backend/agents/arbiter.py` 和 `backend/agents/types.py`，把事件驱动 Agent 运行时需要的 LLM provider、短期记忆、冲突仲裁和结构化契约收拢成独立模块
+- **Reasoning event contract**: 新增 `reasoning.perception_snapshot`、`reasoning.intent_recognized`、`reasoning.task_decomposition`、`reasoning.coordination_decision`、`reasoning.execution_plan` 和 `reasoning.fallback_rule_based` 事件类型，并补齐前端 TS 类型
+
+### Changed
+
+- **Event-driven agents**: `LightingAgent` 和 `HVACAgent` 升级成事件驱动接口，保留旧 `decide(world)` 作为 fallback 规则逻辑
+- **Simulation orchestration**: `SimulationEngine` 移除 timer tick 内的直接 `agent_runtime.step(world)` 调用，改成由 `AgentRuntime` 订阅 `user.activity_change` 和显著 `environment.state_refresh` 根事件异步起 episode
+- **OpenAI integration**: 默认接入 OpenAI Responses API，模型配置由 `OPENAI_MODEL`、`OPENAI_REASONING_EFFORT`、`LLM_TIMEOUT_MS` 控制；缺失 key 或调用失败时自动发 `reasoning.fallback_rule_based`
+- **Agent status fields**: `AgentRuntimeState` 与前端状态类型新增 `mode`、`active_correlation_id`、`last_reasoning_step`、`last_fallback_reason`
+- **Protocol docs**: README 和 `docs/architecture/ws-protocol.md` 更新到 Phase 2，补充 reasoning 事件 payload、环境变量和 Agent 状态字段说明
+
+### Testing
+
+- `pytest tests/test_phase2_components.py tests/test_openai_provider.py tests/test_phase2_runtime.py -q` 通过
+- `pytest tests/test_agents.py tests/test_simulation.py tests/test_main.py tests/test_ws.py tests/test_state.py -q` 通过
+
 ## [0.1.3.5] - 2026-04-20
 
 ### Added
@@ -146,25 +196,8 @@ All notable changes to this project will be documented in this file.
 - **Agent system**: LightingAgent + HVACAgent with rule-based strategies, AgentRuntime for multi-agent orchestration
 - **World models**: Pydantic WorldState models with room/device/agent schemas, WSMessage protocol types
 - **REST API**: `/api/scenes` endpoint for scene listing, `/api/health` health check
-- **Frontend scaffold**: Vue 3 + TresJS + Pinia + TailwindCSS project structure
-- **State management**: Pinia stores for world state (delta updates), agent logs, simulation control, and UI state
-- **WebSocket client**: Auto-reconnect composable with exponential backoff and message routing
-- **3D scene**: Procedural apartment rendering with animated device meshes (lights, HVAC, curtains)
-- **Dashboard UI**: Control panel for device commands, agent action log, simulation control bar, status bar
-- **Design system**: CSS variables, glassmorphism theme, GSAP animations
-- **GLSL shaders**: SDF area lights, mathematical matcap materials, Fresnel glass effect
-- **3D composables**: Spherical camera with spring damping, shader materials, GLB loader (DRACO + Meshopt), device animations
-- **Config-driven rooms**: SceneConfig JSON types, useSceneConfig composable, RoomModule + SceneManager
-- **Mi Home scene**: Apartment_v1 scene configuration, multi-floor GLB models (F1/F2/F3), gamemcu-style rendering
-- **Dashboard overlay**: Floor selector, home panel groups, AI chat panel, scene selector
-- **App layout**: Integrated SceneRenderer + DashboardOverlay with sidebar navigation
+- **Frontend scaffold**: Vue 3 + Vite project structure with 3D scene and dashboard overlay
 
 ### Testing
 
-- Backend test suite: 22 tests across test_main.py (WebSocket handler), test_ws.py (ConnectionManager), test_routes.py (REST API)
-- All tests passing with pytest + pytest-asyncio + anyio
-
-### Infrastructure
-
-- Project scaffolding for backend (FastAPI) and frontend (Vue 3 + Vite)
-- gstack skill routing rules in CLAUDE.md
+- 后端测试套件初始化完成，覆盖 REST、WebSocket 和基础状态模型

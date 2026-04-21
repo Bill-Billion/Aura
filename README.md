@@ -1,14 +1,13 @@
 # SmartHomeSim
 
-SmartHomeSim 是一个面向智能家居 Agent 的 3D 仿真与观测平台。当前版本已经完成 Phase 1 的事件驱动迁移，后端会同时外发兼容旧界面的状态消息和给后续可观测性面板使用的结构化事件流。
+SmartHomeSim 是一个面向智能家居 Agent 的 3D 仿真与观测平台。当前版本已经完成 Phase 2 的主链改造，后端同时保留 `STATE_FULL / STATE_DELTA / AGENT_STATUS / SIM_EVENT` 兼容输出，并把 Lighting / HVAC Agent 升级成事件驱动运行时，支持 OpenAI Responses 和 Anthropic-compatible provider 两条 LLM 接入路径。
 
 ## 当前能力
 
 - 多楼层 3D 展厅渲染，支持灯光、空调、窗帘、风扇、摄像头和环境传感器
-- 规则型 Lighting / HVAC Agent 与用户行为模拟
-- `STATE_FULL + STATE_DELTA + AGENT_STATUS + SIM_EVENT` 并行输出
-- 事件链字段 `event_id / correlation_id / causal_parent / priority`
-- 统一设备注册表与场景绑定
+- 事件驱动仿真内核，`SimEvent` 已覆盖 timer、环境刷新、用户活动、设备动作和状态反馈
+- Lighting / HVAC Agent 以事件订阅方式运行，支持 `user.activity_change` 和显著 `environment.state_refresh` 触发
+- OpenAI Responses 和 Anthropic-compatible provider 双路接入，推理结果统一落成 `reasoning.*` 事件，超时或异常会自动回退到现有规则逻辑
 - 一键本地起栈脚本和 Docker Compose 联调入口
 
 ## 技术栈
@@ -16,7 +15,7 @@ SmartHomeSim 是一个面向智能家居 Agent 的 3D 仿真与观测平台。�
 | 层 | 技术 |
 | --- | --- |
 | Frontend | Vue 3.5、TypeScript、TresJS、Three.js、Pinia、TailwindCSS、GSAP |
-| Backend | FastAPI、Pydantic v2、WebSocket、structlog |
+| Backend | FastAPI、Pydantic v2、WebSocket、structlog、httpx |
 | Runtime | Python 3.10+、Node.js 18+ |
 | Testing | pytest、node:test、Vue TSC、Vite build |
 
@@ -31,8 +30,33 @@ cd backend
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+export OPENAI_API_KEY=your_key_here
+export OPENAI_MODEL=gpt-5.4
+export OPENAI_REASONING_EFFORT=medium
+export LLM_TIMEOUT_MS=5000
+export AGENT_EPISODE_TIMEOUT_MS=5000
 uvicorn main:app --reload --port 8000
 ```
+
+如果没有配置 `OPENAI_API_KEY`，Agent 会继续工作，但会直接回退到规则逻辑，不会调用 LLM。
+
+如果要走 Anthropic-compatible provider，比如 MiniMax，可以改成：
+
+```bash
+export LLM_PROVIDER=anthropic_compatible
+export ANTHROPIC_BASE_URL=https://api.minimaxi.com/anthropic
+export ANTHROPIC_API_KEY=your_key_here
+export ANTHROPIC_MODEL=MiniMax-M2.7
+export LLM_TIMEOUT_MS=15000
+export AGENT_EPISODE_TIMEOUT_MS=15000
+uvicorn main:app --reload --port 8000
+```
+
+如果没有显式设置 `LLM_PROVIDER`，运行时会优先尝试 `OPENAI_API_KEY`，否则再尝试 `ANTHROPIC_API_KEY / ANTHROPIC_COMPAT_API_KEY`。
+
+`LLM_TIMEOUT_MS` 控制单次 provider HTTP 请求的超时，`AGENT_EPISODE_TIMEOUT_MS` 控制单个 agent episode 最长占用时间。默认情况下 episode timeout 会跟随 `LLM_TIMEOUT_MS`，这样兼容 provider 即使没有及时断开，也不会把整条事件链长时间卡住。
+
+像 MiniMax 这类响应更慢的 Anthropic-compatible provider，如果继续用 `5000ms`，系统会更快回退到规则逻辑；如果希望真实走完 LLM 决策链，需要把两个 timeout 一起调高。
 
 再启动前端：
 
@@ -46,8 +70,6 @@ npm run dev
 
 ### 方式二：用统一起栈脚本
 
-如果本机已经有旧实例，优先用仓库脚本。它会检查端口占用、记录 PID/日志，并补一条代理 WebSocket 保活校验。
-
 ```bash
 ./scripts/dev-stack.sh start
 ./scripts/dev-stack.sh verify
@@ -60,7 +82,7 @@ npm run dev
 docker compose up --build
 ```
 
-Compose 环境下前端代理会自动指向 `http://backend:8000`，不再把 `/ws` 和 `/api` 打回容器里的自己。
+Compose 环境下前端代理会自动指向 `http://backend:8000`。
 
 ## WebSocket 公共契约
 
@@ -87,7 +109,7 @@ Compose 环境下前端代理会自动指向 `http://backend:8000`，不再把 `
 
 ### 结构化事件
 
-Phase 1 对外开放的 `SIM_EVENT.event_type`：
+当前公开的 `SIM_EVENT.event_type`：
 
 - `system.timer_tick`
 - `system.simulation_started`
@@ -96,21 +118,29 @@ Phase 1 对外开放的 `SIM_EVENT.event_type`：
 - `environment.state_refresh`
 - `user.command`
 - `user.activity_change`
+- `reasoning.perception_snapshot`
+- `reasoning.intent_recognized`
+- `reasoning.task_decomposition`
+- `reasoning.coordination_decision`
+- `reasoning.execution_plan`
+- `reasoning.fallback_rule_based`
 - `action.device_control`
 - `feedback.state_delta`
 
-### 错误格式
+### Agent 状态字段
 
-```json
-{
-  "code": "DEVICE_NOT_CONTROLLABLE",
-  "message": "客厅温度传感器不支持修改: value",
-  "details": {
-    "device_id": "sensor_living_temp_01",
-    "action": "set_state"
-  }
-}
-```
+`AGENT_STATUS` 和 `STATE_FULL.agents` 目前包含这些字段：
+
+- `id`
+- `name`
+- `status`
+- `current_strategy`
+- `confidence`
+- `last_action`
+- `mode`
+- `active_correlation_id`
+- `last_reasoning_step`
+- `last_fallback_reason`
 
 更完整的协议说明见 `docs/architecture/ws-protocol.md`。
 
@@ -129,7 +159,7 @@ Phase 1 对外开放的 `SIM_EVENT.event_type`：
 ```text
 SmartHomeSim/
 ├── backend/
-│   ├── agents/        # 规则型 Agent
+│   ├── agents/        # Lighting / HVAC agent runtime、LLM provider、arbiter、memory
 │   ├── api/           # FastAPI 路由与 WebSocket 网关
 │   ├── config/        # 默认设备与场景配置
 │   ├── engine/        # EventBus、SimulationEngine、SimulatorTimer、StateManager
@@ -171,4 +201,4 @@ docker compose config
 
 ## 下一阶段
 
-Phase 1 已收口完成。下一步会沿着 `GSTACK_FINAL_PLAN.md` 进入事件流消费侧，把右侧可观测性面板从旧日志模式切到事件时间线和 reasoning detail，而不是提前跳到 LLM Agent。
+Phase 2 完成后，下一步是进入 Phase 3，把右侧旧日志壳层替换成真正的 ObservabilityPanel，让前端按事件时间线和 reasoning detail 消费这批结构化事件。

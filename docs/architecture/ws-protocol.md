@@ -3,7 +3,7 @@
 Author: Bill Billion  
 Date: 2026-04-20
 
-这份文档定义 SmartHomeSim Phase 1 对外开放的 WebSocket 命令、服务端消息、结构化事件类型和错误格式。目标只有一个，让旧前端继续可用，同时给事件驱动链路留出稳定的公共契约。
+这份文档定义 SmartHomeSim 当前对外开放的 WebSocket 命令、服务端消息、结构化事件类型和错误格式。当前阶段已经进入 Phase 2，所以除了 Phase 1 的世界状态同步消息，还会通过 `SIM_EVENT` 实时外发 `reasoning.*` 事件。
 
 ## 连接入口
 
@@ -15,11 +15,11 @@ WebSocket 入口固定为 `/ws/simulation`。
 
 当前开放的命令只有五类：
 
-- `CMD_SIM_START`：启动仿真
-- `CMD_SIM_PAUSE`：暂停仿真
-- `CMD_SIM_RESET`：重置仿真到默认场景
-- `CMD_SIM_SPEED`：调整仿真速度，`payload.speed` 为数字
-- `CMD_DEVICE_CONTROL`：控制设备
+- `CMD_SIM_START`
+- `CMD_SIM_PAUSE`
+- `CMD_SIM_RESET`
+- `CMD_SIM_SPEED`
+- `CMD_DEVICE_CONTROL`
 
 命令信封格式统一如下：
 
@@ -41,7 +41,7 @@ WebSocket 入口固定为 `/ws/simulation`。
 
 ## 服务端消息
 
-Phase 1 保留六类公开消息：
+当前保留六类公开消息：
 
 - `STATE_FULL`：全量世界状态快照
 - `STATE_DELTA`：批量状态增量，`payload.deltas` 为数组
@@ -93,9 +93,24 @@ Phase 1 保留六类公开消息：
 }
 ```
 
+### `AGENT_STATUS`
+
+`payload.agents` 是一个以 `agent_id` 为 key 的状态表。当前字段包括：
+
+- `id`
+- `name`
+- `status`
+- `current_strategy`
+- `confidence`
+- `last_action`
+- `mode`
+- `active_correlation_id`
+- `last_reasoning_step`
+- `last_fallback_reason`
+
 ### `SIM_EVENT`
 
-`payload` 直接是一个 `SimEvent`。迁移期已经对外开放的事件类型如下：
+`payload` 直接是一个 `SimEvent`。当前对外开放的事件类型如下：
 
 - `system.timer_tick`
 - `system.simulation_started`
@@ -104,10 +119,20 @@ Phase 1 保留六类公开消息：
 - `environment.state_refresh`
 - `user.command`
 - `user.activity_change`
+- `reasoning.perception_snapshot`
+- `reasoning.intent_recognized`
+- `reasoning.task_decomposition`
+- `reasoning.coordination_decision`
+- `reasoning.execution_plan`
+- `reasoning.fallback_rule_based`
 - `action.device_control`
 - `feedback.state_delta`
 
-其中 `system.timer_tick` 和 `environment.state_refresh` 现在也会实时外发，不再只存在后端内部。
+说明：
+
+- `system.timer_tick` 和 `environment.state_refresh` 继续实时外发
+- `reasoning.*` 不新增新的 envelope，全部通过 `SIM_EVENT` 输出
+- 当前前端低层 `CMD_DEVICE_CONTROL` 仍然先走旧的直接控制链，兼容现有面板即时反馈
 
 ### `SIMULATION_STATUS`
 
@@ -151,6 +176,91 @@ Phase 1 保留六类公开消息：
 - `data`
 
 字段约束和因果链规则以 `docs/architecture/sim-event-schema.md` 为准。
+
+## Phase 2 reasoning payload
+
+### `reasoning.perception_snapshot`
+
+```json
+{
+  "agent_id": "lighting_agent",
+  "trigger_event_type": "user.activity_change",
+  "world_summary": "event=user.activity_change; time=19:00; weather=clear; ...",
+  "relevant_devices": ["light_living_01"],
+  "relevant_rooms": ["living_room"]
+}
+```
+
+### `reasoning.intent_recognized`
+
+```json
+{
+  "agent_id": "lighting_agent",
+  "intent": "light occupied room",
+  "confidence": 0.94,
+  "explanation": "Occupancy increased in the living room during the evening",
+  "provider": "openai_responses",
+  "model": "gpt-5.4",
+  "latency_ms": 320
+}
+```
+
+### `reasoning.task_decomposition`
+
+```json
+{
+  "agent_id": "lighting_agent",
+  "intent": "light occupied room",
+  "task_steps": ["raise brightness", "warm color"]
+}
+```
+
+### `reasoning.coordination_decision`
+
+```json
+{
+  "agent_id": "lighting_agent",
+  "outcome": "approved",
+  "priority": "user_comfort",
+  "conflicts": [],
+  "winning_commands": [
+    {
+      "device_id": "light_living_01",
+      "property": "extra.brightness",
+      "value": 70,
+      "reason": "occupied evening lighting"
+    }
+  ]
+}
+```
+
+### `reasoning.execution_plan`
+
+```json
+{
+  "agent_id": "lighting_agent",
+  "execution_mode": "llm",
+  "commands": [
+    {
+      "device_id": "light_living_01",
+      "property": "extra.brightness",
+      "value": 70,
+      "reason": "occupied evening lighting"
+    }
+  ]
+}
+```
+
+### `reasoning.fallback_rule_based`
+
+```json
+{
+  "agent_id": "lighting_agent",
+  "reason": "timeout",
+  "failed_step": "intent_generation",
+  "fallback_strategy": "rule_based"
+}
+```
 
 ## 当前开放的设备类型
 

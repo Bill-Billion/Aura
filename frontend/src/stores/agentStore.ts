@@ -28,6 +28,10 @@ export const useAgentStore = defineStore('agent', () => {
         current_strategy: data.current_strategy ?? '',
         confidence: data.confidence ?? 0,
         last_action: data.last_action ?? '',
+        mode: data.mode ?? 'idle',
+        active_correlation_id: data.active_correlation_id ?? null,
+        last_reasoning_step: data.last_reasoning_step ?? '',
+        last_fallback_reason: data.last_fallback_reason ?? null,
       }
     } else {
       Object.assign(agents[agentId], data)
