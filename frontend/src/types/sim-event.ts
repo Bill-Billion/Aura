@@ -190,3 +190,104 @@ export type KnownSimEvent =
   | FeedbackStateDeltaEvent
 
 export type SimEvent = KnownSimEvent | SimEventBase
+
+export type EventCategory =
+  | 'system'
+  | 'environment'
+  | 'user'
+  | 'reasoning'
+  | 'action'
+  | 'feedback'
+
+export type EventCategoryFilter = EventCategory | 'all'
+export type EventAgentFilter = string | 'all'
+
+export interface EventFilters {
+  category: EventCategoryFilter
+  agentId: EventAgentFilter
+  fallbackOnly: boolean
+}
+
+export interface EpisodeSummary {
+  correlationId: string
+  rootEventId: string
+  rootEventType: string
+  rootEvent: SimEvent
+  lastEventId: string
+  lastUpdatedAt: number
+  eventCount: number
+  primaryAgentId: string | null
+  agentIds: string[]
+  hasFallback: boolean
+  isActive: boolean
+  categories: EventCategory[]
+  events: SimEvent[]
+}
+
+export interface EpisodeNode {
+  eventId: string
+  parentEventId: string | null
+  depth: number
+  category: EventCategory
+  isRoot: boolean
+  isOrphan: boolean
+  event: SimEvent
+}
+
+export type DetailTone = 'default' | 'muted' | 'accent' | 'warning'
+
+export interface EventDetailField {
+  label: string
+  value: string
+  tone?: DetailTone
+}
+
+export interface EventDetailCommand {
+  deviceId: string
+  property: string
+  value: string
+  reason: string
+}
+
+export interface ReasoningStepView {
+  eventType: KnownSimEventType
+  label: string
+  state: 'done' | 'current' | 'pending'
+}
+
+export type EventDetailKind =
+  | 'reasoning'
+  | 'user'
+  | 'action'
+  | 'feedback'
+  | 'environment'
+  | 'system'
+
+export interface EventDetailView {
+  kind: EventDetailKind
+  category: EventCategory
+  title: string
+  subtitle: string
+  summary?: string
+  fields: EventDetailField[]
+  reasoningSteps?: ReasoningStepView[]
+  listTitle?: string
+  listItems?: string[]
+  commands?: EventDetailCommand[]
+}
+
+export type ObservabilitySurfaceState =
+  | 'loading'
+  | 'needs_start'
+  | 'disconnected'
+  | 'empty'
+  | 'ready'
+
+export interface ObservabilityStateView {
+  status: ObservabilitySurfaceState
+  title: string
+  message: string
+  fallbackMessage?: string | null
+}
+
+export type ConnectionStateDerived = 'connecting' | 'connected' | 'disconnected'

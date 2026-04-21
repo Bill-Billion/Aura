@@ -3,7 +3,7 @@ import StatusBar from './StatusBar.vue'
 import FloorSelector from './FloorSelector.vue'
 import HomePanelGroup from './HomePanelGroup.vue'
 import SimControlBar from './SimControlBar.vue'
-import AIChatPanel from './AIChatPanel.vue'
+import ObservabilityPanel from './ObservabilityPanel.vue'
 import SidebarToggle from './SidebarToggle.vue'
 import SceneSelector from './SceneSelector.vue'
 import ContextualDevicePanel from './ContextualDevicePanel.vue'
@@ -14,7 +14,10 @@ const uiStore = useUIStore()
 </script>
 
 <template>
-  <div class="overlay-root no-select" :style="{ '--showroom-panel-width': `${showroomVisualConfig.overlay.panelWidth}px` }">
+  <div
+    class="overlay-root no-select"
+    :style="{ '--showroom-panel-width': `${showroomVisualConfig.overlay.panelWidth}px` }"
+  >
     <FloorSelector class="zone-left" />
 
     <aside class="zone-right">
@@ -29,7 +32,7 @@ const uiStore = useUIStore()
     </div>
 
     <Transition name="slide-right">
-      <AIChatPanel v-if="uiStore.sidebarOpen" class="zone-sidebar" />
+      <ObservabilityPanel v-if="uiStore.sidebarOpen" class="zone-sidebar" />
     </Transition>
 
     <SceneSelector v-if="uiStore.sceneSelectorOpen" />
@@ -42,6 +45,7 @@ const uiStore = useUIStore()
   inset: 0;
   pointer-events: none;
   z-index: var(--z-overlay);
+  --showroom-sidebar-width: 400px;
 }
 
 .zone-left {
@@ -84,7 +88,7 @@ const uiStore = useUIStore()
   top: 0;
   right: 0;
   bottom: 0;
-  width: 360px;
+  width: var(--showroom-sidebar-width);
   pointer-events: auto;
 }
 
@@ -97,6 +101,19 @@ const uiStore = useUIStore()
 .slide-right-leave-to {
   transform: translateX(100%);
   opacity: 0;
+}
+
+@media (min-width: 1920px) {
+  .overlay-root {
+    --showroom-sidebar-width: 480px;
+  }
+}
+
+@media (max-width: 1365px) {
+  .zone-sidebar {
+    left: 0;
+    width: 100vw;
+  }
 }
 
 @media (max-width: 1200px) {

@@ -8,10 +8,10 @@ const uiStore = useUIStore()
   <button
     class="sidebar-toggle"
     :class="{ active: uiStore.sidebarOpen }"
-    title="事件日志"
+    title="观测侧栏"
     @click="uiStore.toggleSidebar()"
   >
-    <span class="sidebar-toggle__label">日志</span>
+    <span class="sidebar-toggle__label">观测</span>
   </button>
 </template>
 
@@ -28,7 +28,9 @@ const uiStore = useUIStore()
   background: rgba(255, 255, 255, 0.02);
   color: var(--color-text-muted);
   cursor: pointer;
-  transition: all var(--transition-fast);
+  transition-property: border-color, color, background-color, transform;
+  transition-duration: var(--transition-fast);
+  transition-timing-function: ease;
 }
 
 .sidebar-toggle:hover {

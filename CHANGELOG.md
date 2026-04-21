@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.3.9] - 2026-04-21
+
+### Added
+
+- **ObservabilityPanel**: 新增真正的右滑观测侧栏，顶部展示 episode 摘要和筛选，中段展示因果链时间线，底部展示 reasoning / action / feedback 细节
+- **Episode view model**: 前端新增 episode 聚合、事件分类、详情映射和面板状态推导工具，默认按 `correlation_id` 把 `SIM_EVENT` 组织成 episode 视图
+- **Observability tests**: 新增 `frontend/tests/observability.test.ts`，覆盖 episode 分组、根事件识别、默认选中、详情映射和 500 条窗口截断回归
+
+### Changed
+
+- **Sidebar replacement**: `DashboardOverlay` 已经用 `ObservabilityPanel` 替换旧 `AIChatPanel`，底部开关文案从“日志”切到“观测”
+- **Event store upgrade**: `eventStore` 从单纯 `events[]` 升级成带 `episodes`、筛选、选中 episode / event 和连接派生状态的前端观测 store
+- **Responsive sidebar**: 观测侧栏现在按视口分档，桌面宽屏用 480px，常规桌面用 400px，中等桌面改为全屏叠加
+
+### Testing
+
+- 前端 `node --experimental-strip-types --test tests/*.test.ts` 通过
+- 前端 `npm run build` 通过
+- 构建结果继续保持现有大包 warning，没有新增 TypeScript 或 Vue 编译错误
+
 ## [0.1.3.8] - 2026-04-20
 
 ### Changed

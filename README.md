@@ -1,6 +1,6 @@
 # SmartHomeSim
 
-SmartHomeSim 是一个面向智能家居 Agent 的 3D 仿真与观测平台。当前版本已经完成 Phase 2 的主链改造，后端同时保留 `STATE_FULL / STATE_DELTA / AGENT_STATUS / SIM_EVENT` 兼容输出，并把 Lighting / HVAC Agent 升级成事件驱动运行时，支持 OpenAI Responses 和 Anthropic-compatible provider 两条 LLM 接入路径。
+SmartHomeSim 是一个面向智能家居 Agent 的 3D 仿真与观测平台。当前版本已经完成 Phase 3 的前端观测侧栏替换，后端继续保留 `STATE_FULL / STATE_DELTA / AGENT_STATUS / SIM_EVENT` 兼容输出，前端则把 episode 级可观测性正式接到右滑侧栏上。
 
 ## 当前能力
 
@@ -8,6 +8,7 @@ SmartHomeSim 是一个面向智能家居 Agent 的 3D 仿真与观测平台。�
 - 事件驱动仿真内核，`SimEvent` 已覆盖 timer、环境刷新、用户活动、设备动作和状态反馈
 - Lighting / HVAC Agent 以事件订阅方式运行，支持 `user.activity_change` 和显著 `environment.state_refresh` 触发
 - OpenAI Responses 和 Anthropic-compatible provider 双路接入，推理结果统一落成 `reasoning.*` 事件，超时或异常会自动回退到现有规则逻辑
+- 右滑 `ObservabilityPanel` 默认按 episode 展示 `root -> reasoning -> action -> feedback` 链路，并支持 agent / 类别 / fallback 本地筛选
 - 一键本地起栈脚本和 Docker Compose 联调入口
 
 ## 技术栈
@@ -154,6 +155,15 @@ Compose 环境下前端代理会自动指向 `http://backend:8000`。
 
 `power`、`brightness`、`color_temp`、`target_temp`、`mode`、`speed`、`open_percent`、`shake`、`timeout`、`view`、`read`
 
+## 前端观测侧栏
+
+侧栏开关仍然使用底部的 `sidebarOpen`，但主内容已经从旧动作日志切成 episode 视图。当前侧栏会：
+
+- 默认跟随最新活跃 episode，没有活跃链路时回退到最近完成的一条
+- 按 `correlation_id` 组织时间线，自动识别根事件、reasoning 过程、设备动作和状态反馈
+- 在详情区用固定布局展示 `reasoning.*`、`action.device_control`、`feedback.state_delta` 和 `user.*` payload
+- 在 fallback episode 上显示明确提示，便于区分真实 LLM 链路和规则回退链路
+
 ## 目录结构
 
 ```text
@@ -201,4 +211,4 @@ docker compose config
 
 ## 下一阶段
 
-Phase 2 完成后，下一步是进入 Phase 3，把右侧旧日志壳层替换成真正的 ObservabilityPanel，让前端按事件时间线和 reasoning detail 消费这批结构化事件。
+Phase 3 收口后，下一步会继续补 episode 历史查询、跨链路检索和更完整的观测分析面板，而不是再回到旧日志侧栏。
