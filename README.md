@@ -1,56 +1,41 @@
-# SmartHomeSim
+# Aura: open-source smart home simulation platform
 
-SmartHomeSim 是一个面向智能家居 Agent 的 3D 仿真与可观测性平台。它把三层住宅场景、事件驱动仿真、LLM Agent 和 episode 级因果链放在同一条链路里，方便你一边看场景变化，一边看 Agent 为什么这么做。
+[![Version](https://img.shields.io/badge/version-0.1.3.11-0A84FF.svg)](./VERSION)
+[![Frontend](https://img.shields.io/badge/frontend-Vue%203%20%2B%20Three.js-42b883.svg)](./frontend)
+[![Backend](https://img.shields.io/badge/backend-FastAPI%20%2B%20WebSocket-009688.svg)](./backend)
+[![Simulation](https://img.shields.io/badge/runtime-event--driven-6c5ce7.svg)](./docs/architecture/sim-event-schema.md)
+[![Protocol](https://img.shields.io/badge/protocol-STATE__FULL%20%7C%20STATE__DELTA%20%7C%20SIM__EVENT-f39c12.svg)](./docs/architecture/ws-protocol.md)
+[![Docker](https://img.shields.io/badge/dev-docker%20compose-2496ed.svg)](./docker-compose.yml)
 
-## 你可以拿它做什么
+Aura 提供一套完整的开发环境，用来模拟三层智能住宅、运行事件驱动 Agent，并观察每一次自动化动作背后的完整因果链。它把 3D 场景、仿真时钟、结构化事件、LLM Agent 和前端可观测性面板放到同一条工作流里，适合做智能家居 Agent 的联调、演示和产品验证。
 
-- 在 3D 公寓里查看灯光、空调、窗帘、风扇、摄像头和环境传感器的实时状态
+- 查看多楼层 3D 住宅里的灯光、空调、窗帘、风扇、摄像头和环境传感器
 - 直接手动控制设备，也可以让 Lighting / HVAC Agent 自动参与链路
-- 通过 `user.activity_change`、`environment.state_refresh`、`reasoning.*`、`action.device_control`、`feedback.state_delta` 看完整因果链
-- 用 `ObservabilityPanel` 按 episode 查看 root → reasoning → action → feedback，而不是看一堆散日志
-- 在本地一键起前后端，或者用 Docker Compose 联调
+- 通过 `root -> reasoning -> action -> feedback` 的 episode 视图看清楚 Agent 为什么这么做
+- 用本地脚本或 Docker Compose 一键拉起前后端开发栈
 
-## 当前完成的能力
+## Start Aura
 
-- 事件驱动仿真内核，支持 `system.timer_tick`、`system.simulation_*`、`environment.state_refresh`、`user.activity_change`
-- `observe / demo` 双模式仿真，暂停态、运行态、reset 态都能清晰区分
-- Lighting / HVAC Agent 采用事件订阅式运行时，支持真实 LLM provider 和规则回退
-- OpenAI Responses 和 Anthropic-compatible provider 双路接入，MiniMax 这类兼容服务可以直接联调
-- `ObservabilityPanel` 已接管右滑侧栏，默认按 episode 展示推理链路
-- 3D 场景已经开始消费房间级 occupancy、天气和时间变化，不再只有设备动画在动
-- 本地 `.env.local` 自动加载、统一起栈脚本、Docker Compose 联调入口
+### Quick start
 
-## 运行效果
+推荐直接使用统一起栈脚本：
 
-你启动后会看到这些状态直接出现在界面里：
-
-- 当前是暂停还是运行
-- 当前仿真模式是 `observe` 还是 `demo`
-- LLM provider 是否已配置，当前用的是哪个 model
-- 哪个房间有人，哪个房间灯亮了，天气和时间有没有变化
-- 某次设备变化是手动点的，还是 Agent 决策出来的
-
-## 架构一览
-
-```mermaid
-flowchart LR
-  Browser["Browser / Vite UI"] --> WS["WebSocket / REST"]
-  WS --> API["FastAPI"]
-  API --> Engine["SimulationEngine"]
-  Engine --> Timer["SimulatorTimer"]
-  Engine --> Bus["EventBus"]
-  Bus --> UserSim["UserBehaviorSimulator"]
-  Bus --> EnvSim["EnvironmentSimulator"]
-  Bus --> AgentRuntime["AgentRuntime"]
-  AgentRuntime --> LLM["LLM Provider"]
-  Engine --> StateMgr["StateManager"]
-  StateMgr --> Broadcast["STATE_FULL / STATE_DELTA / SIM_EVENT / AGENT_STATUS"]
-  Broadcast --> Browser
+```bash
+./scripts/dev-stack.sh restart
 ```
 
-## 快速开始
+启动完成后访问：
 
-### 1. 准备本地环境变量
+- 前端: [http://127.0.0.1:5173](http://127.0.0.1:5173)
+- 后端健康检查: [http://127.0.0.1:8000/api/health](http://127.0.0.1:8000/api/health)
+
+停止服务：
+
+```bash
+./scripts/dev-stack.sh stop
+```
+
+### Configure an LLM provider
 
 在仓库根目录创建 `.env.local`：
 
@@ -66,30 +51,13 @@ AGENT_ENV_DEBOUNCE_MS=5000
 ENV_EOF
 ```
 
-`LLM_PROVIDER` 不设置时，运行时会先尝试 `OPENAI_API_KEY`，再尝试 Anthropic-compatible 的环境变量。
+如果没有显式设置 `LLM_PROVIDER`，Aura 会先尝试 `OPENAI_API_KEY`，再尝试 Anthropic-compatible 环境变量。
 
-### 2. 推荐方式，直接起整套开发栈
+`LLM_TIMEOUT_MS` 控制单次 provider 请求超时，`AGENT_EPISODE_TIMEOUT_MS` 控制单个 agent episode 的最长耗时，`AGENT_ENV_DEBOUNCE_MS` 控制环境事件触发 Agent 的防抖窗口。
 
-```bash
-./scripts/dev-stack.sh restart
-```
+## Running from Source
 
-这会同时启动后端、前端，并做一次 WebSocket 保活检查。
-
-### 3. 打开页面
-
-- 前端: [http://127.0.0.1:5173](http://127.0.0.1:5173)
-- 后端健康检查: [http://127.0.0.1:8000/api/health](http://127.0.0.1:8000/api/health)
-
-### 4. 停止开发栈
-
-```bash
-./scripts/dev-stack.sh stop
-```
-
-## 也可以手动启动
-
-### 后端
+### Backend
 
 ```bash
 cd backend
@@ -99,7 +67,7 @@ pip install -r requirements.txt
 uvicorn main:app --reload --port 8000
 ```
 
-### 前端
+### Frontend
 
 ```bash
 cd frontend
@@ -115,29 +83,15 @@ docker compose up --build
 
 Compose 环境下前端代理会自动指向 `http://backend:8000`。
 
-## WebSocket 协议
+## What Aura currently does
 
-### 客户端命令
+### 3D smart home simulation
 
-- `CMD_SIM_START`
-- `CMD_SIM_PAUSE`
-- `CMD_SIM_RESET`
-- `CMD_SIM_MODE`
-- `CMD_SIM_SPEED`
-- `CMD_DEVICE_CONTROL`
+Aura 现在会渲染一套三层住宅场景，并把设备状态、房间 occupancy、天气和时间变化映射到画面里。当前已经接入灯光、空调、窗帘、风扇、摄像头和环境传感器。
 
-### 服务端消息
+### Event-driven runtime
 
-- `STATE_FULL`
-- `STATE_DELTA`
-- `AGENT_STATUS`
-- `SIM_EVENT`
-- `SIMULATION_STATUS`
-- `ERROR`
-
-### 结构化事件
-
-`SIM_EVENT.event_type` 现在会覆盖这些类型：
+仿真内核已经切成事件驱动结构，核心事件包括：
 
 - `system.timer_tick`
 - `system.simulation_started`
@@ -146,64 +100,98 @@ Compose 环境下前端代理会自动指向 `http://backend:8000`。
 - `environment.state_refresh`
 - `user.command`
 - `user.activity_change`
-- `reasoning.perception_snapshot`
-- `reasoning.intent_recognized`
-- `reasoning.task_decomposition`
-- `reasoning.coordination_decision`
-- `reasoning.execution_plan`
-- `reasoning.fallback_rule_based`
 - `action.device_control`
 - `feedback.state_delta`
 
-更完整的协议细节见 `docs/architecture/ws-protocol.md` 和 `docs/architecture/sim-event-schema.md`。
+### Agent reasoning and fallback
 
-## 当前支持的设备
+Lighting / HVAC Agent 已经跑在事件订阅式运行时上。它们可以使用真实 LLM provider，也可以在 provider 超时或输出异常时自动回退到规则链路。前端可以直接看到 `reasoning.perception_snapshot`、`reasoning.intent_recognized`、`reasoning.task_decomposition`、`reasoning.coordination_decision`、`reasoning.execution_plan` 和 `reasoning.fallback_rule_based`。
 
-### 设备类型
+### Observability panel
+
+右滑侧栏已经由 `ObservabilityPanel` 接管。它会默认跟随最新活跃 episode，没有活跃 episode 时回退到最近完成的一条。面板里会把 root event、reasoning event、设备动作和状态反馈放在一条时间线上，而不是只显示零散日志。
+
+## Simulation modes
+
+Aura 现在使用固定墙钟节拍，默认每 1 秒发一次 tick。模式决定每个 tick 推进多少模拟时间：
+
+- `observe`: 每秒推进 30 秒模拟时间
+- `demo`: 每秒推进 120 秒模拟时间
+
+页面首次进入不会自动开始仿真。暂停态会明确显示“仿真未开始”、当前模式和启动后的推进节奏。
+
+## WebSocket protocol
+
+### Client commands
+
+- `CMD_SIM_START`
+- `CMD_SIM_PAUSE`
+- `CMD_SIM_RESET`
+- `CMD_SIM_MODE`
+- `CMD_SIM_SPEED`
+- `CMD_DEVICE_CONTROL`
+
+### Server messages
+
+- `STATE_FULL`
+- `STATE_DELTA`
+- `AGENT_STATUS`
+- `SIM_EVENT`
+- `SIMULATION_STATUS`
+- `ERROR`
+
+### Health endpoint
+
+`/api/health` 除了 `status: ok`，还会返回：
+
+- `simulation.is_running`
+- `simulation.mode`
+- `simulation.speed`
+- `simulation.wall_tick_ms`
+- `simulation.simulated_dt_seconds`
+- `llm.provider`
+- `llm.model`
+- `llm.configured`
+
+更完整的字段说明见 `docs/architecture/ws-protocol.md`。
+
+## Supported devices
+
+### Device types
 
 `light`、`hvac`、`curtain`、`sensor`、`fan`、`camera`
 
-### 设备能力
+### Device capabilities
 
 `power`、`brightness`、`color_temp`、`target_temp`、`mode`、`speed`、`open_percent`、`shake`、`timeout`、`view`、`read`
 
-## 环境变量
-
-| 变量 | 作用 |
-| --- | --- |
-| `LLM_PROVIDER` | 选择 provider，常用值 `anthropic_compatible`、`openai_responses` |
-| `OPENAI_BASE_URL` | OpenAI Responses API 地址 |
-| `OPENAI_API_KEY` | OpenAI key |
-| `OPENAI_MODEL` | OpenAI model |
-| `OPENAI_REASONING_EFFORT` | OpenAI reasoning 强度 |
-| `ANTHROPIC_BASE_URL` | Anthropic-compatible 地址，MiniMax 可用 |
-| `ANTHROPIC_API_KEY` | Anthropic-compatible key |
-| `ANTHROPIC_MODEL` | Anthropic-compatible model |
-| `LLM_TIMEOUT_MS` | 单次 provider 请求超时 |
-| `AGENT_EPISODE_TIMEOUT_MS` | 单个 agent episode 超时 |
-| `AGENT_ENV_DEBOUNCE_MS` | 环境刷新触发 Agent 的防抖窗口 |
-| `VITE_PROXY_TARGET` | 前端 Vite 代理目标，compose 下默认指向后端 |
-
-## 项目结构
+## Project structure
 
 ```text
-SmartHomeSim/
-├── backend/                 # FastAPI、仿真内核、Agent runtime、协议模型
-├── frontend/                # Vue 3 + TresJS + Pinia 前端
-├── docs/architecture/       # WS 协议、事件 schema、设备注册等设计文档
+Aura/
+├── backend/                 # FastAPI、SimulationEngine、Agent runtime、协议模型
+├── frontend/                # Vue 3、Three.js、TresJS、Pinia 前端
+├── docs/architecture/       # 事件 schema、WS 协议、设备注册相关文档
 ├── scripts/                 # 本地起栈和联调脚本
 └── tests/                   # 后端与前端测试
 ```
 
-## 测试
+## Documentation
 
-### 后端
+- `GSTACK_FINAL_PLAN.md`
+- `docs/architecture/ws-protocol.md`
+- `docs/architecture/sim-event-schema.md`
+- `docs/architecture/gamemcu-device-registration-plan.md`
+
+## Testing
+
+### Backend tests
 
 ```bash
 pytest tests -q
 ```
 
-### 前端
+### Frontend tests
 
 ```bash
 cd frontend
@@ -211,19 +199,16 @@ node --experimental-strip-types --test tests/*.test.ts
 npm run build
 ```
 
-### Compose 配置检查
+### Compose config check
 
 ```bash
 docker compose config
 ```
 
-## 设计文档
+## Status
 
-- `GSTACK_FINAL_PLAN.md`
-- `docs/architecture/ws-protocol.md`
-- `docs/architecture/sim-event-schema.md`
-- `docs/architecture/gamemcu-device-registration-plan.md`
+Aura 当前已经完成了事件驱动主链、双模式仿真、真实 LLM provider 联调、前端 episode 级可观测性和房间级场景反馈。现在它已经不是一个只会动模型的 demo，而是一套可以用来调 Agent、看事件链、查状态同步问题的开发平台。
 
-## 现在的方向
+## About Aura
 
-当前主线已经从“把场景跑起来”推进到“让仿真真的可用”。接下来主要看三件事，补更多房间级反馈，扩设备注册覆盖率，把 episode 历史和跨链路检索做得更顺手。
+Aura 的方向很明确，用一套可视化、可回放、可观察的智能家居仿真环境，把 Agent 产品开发里最难调的那段链路做清楚。场景在变，状态在变，Agent 在推理，前端能把这条链路讲明白，这就是它现在的价值。
