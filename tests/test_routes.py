@@ -23,4 +23,8 @@ def test_get_scenes(client):
 def test_health_check(client):
     resp = client.get("/api/health")
     assert resp.status_code == 200
-    assert resp.json() == {"status": "ok"}
+    payload = resp.json()
+    assert payload["status"] == "ok"
+    assert payload["simulation"]["mode"] == "observe"
+    assert payload["simulation"]["is_running"] is False
+    assert "provider" in payload["llm"]

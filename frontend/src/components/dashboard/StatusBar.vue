@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { computed } from 'vue'
+import { useAgentStore } from '@/stores/agentStore'
 import { useWorldStore } from '@/stores/worldStore'
 import { useSimulationStore } from '@/stores/simulationStore'
 
 const worldStore = useWorldStore()
 const simulationStore = useSimulationStore()
+const agentStore = useAgentStore()
 
 const timeOfDay = computed(() => worldStore.environment.time_of_day)
 const outdoorTemp = computed(() => worldStore.environment.outdoor_temp)
@@ -15,6 +17,9 @@ const humidity = computed(() => {
 const weather = computed(() => worldStore.environment.weather)
 const isRunning = computed(() => simulationStore.isRunning)
 const connectionStatus = computed(() => simulationStore.connectionStatus)
+const simulationMode = computed(() => simulationStore.mode)
+const simulatedDtSeconds = computed(() => simulationStore.simulatedDtSeconds)
+const primaryAgent = computed(() => Object.values(agentStore.agents)[0] ?? null)
 
 const weatherText = computed(() => {
   const labels: Record<string, string> = {
@@ -36,6 +41,13 @@ const connectionLabel = computed(() => {
   }
   return labels[connectionStatus.value] ?? connectionStatus.value
 })
+
+const agentLabel = computed(() => {
+  const agent = primaryAgent.value
+  if (!agent) return 'Agent 未初始化'
+  if (!agent.provider_configured) return '规则回退'
+  return `${agent.provider} 在线`
+})
 </script>
 
 <template>
@@ -46,17 +58,21 @@ const connectionLabel = computed(() => {
         <span class="status-bar__temp">{{ outdoorTemp }}°C</span>
         <span class="status-bar__weather-text">{{ weatherText }}</span>
       </div>
-      <p class="status-bar__sub">模拟住宅 · 湿度 {{ humidity }}% · {{ timeOfDay }}</p>
+      <p class="status-bar__sub">模拟住宅 · 湿度 {{ humidity }}% · {{ timeOfDay }} · {{ simulationMode === 'observe' ? '观察模式' : '演示模式' }}</p>
     </div>
 
     <div class="status-bar__meta">
       <div class="status-pill" :class="{ live: isRunning }">
         <span class="status-pill__dot" />
-        <span>{{ isRunning ? '模拟运行中' : '模拟已暂停' }}</span>
+        <span>{{ isRunning ? `模拟运行中 · 每秒推进 ${simulatedDtSeconds} 秒` : '仿真未开始' }}</span>
       </div>
       <div class="status-pill" :class="connectionStatus">
         <span class="status-pill__dot" />
         <span>{{ connectionLabel }}</span>
+      </div>
+      <div class="status-pill" :class="{ live: primaryAgent?.provider_configured }">
+        <span class="status-pill__dot" />
+        <span>{{ agentLabel }}</span>
       </div>
     </div>
   </section>

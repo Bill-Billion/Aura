@@ -36,6 +36,11 @@ import groundVert from '@/shaders/ground/vertex.glsl?raw'
 import groundFrag from '@/shaders/ground/fragment.glsl?raw'
 
 type FloorId = 'F1' | 'F2' | 'F3'
+type RoomFeedbackEntry = {
+  halo: THREE.Mesh
+  occupancyHalo: THREE.Mesh
+  pointLight: THREE.PointLight
+}
 
 const uiStore = useUIStore()
 const worldStore = useWorldStore()
@@ -48,6 +53,8 @@ const glbLoader = new GLTFLoader()
 const textureLoader = new THREE.TextureLoader()
 const raycaster = new THREE.Raycaster()
 const pointer = new THREE.Vector2()
+const ambientLightIntensity = ref(0.028)
+const ambientLightColor = ref('#dce4ee')
 
 const floorRefs: Record<FloorId, ReturnType<typeof shallowRef<THREE.Group | null>>> = {
   F1: shallowRef<THREE.Group | null>(null),
@@ -70,6 +77,7 @@ const lightSourceRefs: Record<FloorId, ReturnType<typeof shallowRef<THREE.Group 
 const labelElements = new Map<FloorId, HTMLDivElement>()
 const selectableMeshes = new Map<THREE.Object3D, string>()
 const floorForSelectable = new Map<THREE.Object3D, FloorId>()
+const roomFeedbackRefs = new Map<FloorId, Map<string, RoomFeedbackEntry>>()
 
 const groundMaterial = new THREE.ShaderMaterial({
   vertexShader: groundVert,
@@ -321,6 +329,127 @@ function updateLightSourceGroup(floorId: FloorId, dt: number) {
   }
 }
 
+function parseTimeHour(timeOfDay: string) {
+  const [hours, minutes] = timeOfDay.split(':').map((value) => Number(value))
+  return hours + minutes / 60
+}
+
+function createRoomFeedbackGroup(floorId: FloorId) {
+  const group = new THREE.Group()
+  group.name = `showroom-room-feedback-${floorId}`
+
+  const entries = new Map<string, RoomFeedbackEntry>()
+  const anchors = showroomVisualConfig.floors[floorId].roomAnchors
+
+  for (const [roomId, anchor] of Object.entries(anchors)) {
+    const halo = new THREE.Mesh(
+      new THREE.CircleGeometry(2.3, 40),
+      new THREE.MeshBasicMaterial({
+        color: new THREE.Color(0xffd56c),
+        transparent: true,
+        opacity: 0,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        side: THREE.DoubleSide,
+        toneMapped: false,
+      }),
+    )
+    halo.rotation.x = -Math.PI / 2
+    halo.position.set(anchor[0], anchor[1], anchor[2])
+    halo.renderOrder = 6
+
+    const occupancyHalo = new THREE.Mesh(
+      new THREE.RingGeometry(2.45, 3.2, 48),
+      new THREE.MeshBasicMaterial({
+        color: new THREE.Color(0x8dc8ff),
+        transparent: true,
+        opacity: 0,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        side: THREE.DoubleSide,
+        toneMapped: false,
+      }),
+    )
+    occupancyHalo.rotation.x = -Math.PI / 2
+    occupancyHalo.position.set(anchor[0], anchor[1] + 0.01, anchor[2])
+    occupancyHalo.renderOrder = 7
+
+    const pointLight = new THREE.PointLight(0xffe0a3, 0, 10, 2.2)
+    pointLight.position.set(anchor[0], anchor[1] + 1.8, anchor[2])
+
+    group.add(halo, occupancyHalo, pointLight)
+    entries.set(roomId, { halo, occupancyHalo, pointLight })
+  }
+
+  roomFeedbackRefs.set(floorId, entries)
+  return group
+}
+
+function updateEnvironmentLook(dt: number) {
+  const hour = parseTimeHour(worldStore.environment.time_of_day)
+  const weather = worldStore.environment.weather
+  const dayFactor = THREE.MathUtils.clamp(Math.sin(((hour - 6) / 12) * Math.PI), 0, 1)
+  const eveningFactor = THREE.MathUtils.clamp(1 - Math.abs(hour - 19) / 4, 0, 1)
+  const rainyFactor = weather === 'rainy' ? 1 : weather === 'cloudy' ? 0.45 : 0
+
+  const targetAmbient = THREE.MathUtils.lerp(0.016, 0.05, dayFactor) - rainyFactor * 0.008
+  ambientLightIntensity.value = THREE.MathUtils.damp(
+    ambientLightIntensity.value,
+    targetAmbient,
+    3.6,
+    dt,
+  )
+
+  const ambientColorObj = new THREE.Color(0x9cb6d3)
+  ambientColorObj.lerp(new THREE.Color(0xffd7a1), eveningFactor * 0.5)
+  ambientColorObj.lerp(new THREE.Color(0x7f93aa), rainyFactor * 0.45)
+  ambientLightColor.value = `#${ambientColorObj.getHexString()}`
+
+  const centerColor = new THREE.Color(0x0d1117)
+  centerColor.lerp(new THREE.Color(0x18202a), dayFactor * 0.55)
+  centerColor.lerp(new THREE.Color(0x101722), rainyFactor * 0.35)
+  groundMaterial.uniforms.u_centerColor.value.lerp(centerColor, Math.min(3.4 * dt, 1))
+
+  const reflectionColor = new THREE.Color(0x5f7487)
+  reflectionColor.lerp(new THREE.Color(0xd4b37b), eveningFactor * 0.4)
+  reflectionColor.lerp(new THREE.Color(0x7d8fa3), rainyFactor * 0.35)
+  groundMaterial.uniforms.u_reflectionColor.value.lerp(reflectionColor, Math.min(2.8 * dt, 1))
+}
+
+function updateRoomFeedback(floorId: FloorId, dt: number) {
+  const entries = roomFeedbackRefs.get(floorId)
+  if (!entries) return
+
+  const hour = parseTimeHour(worldStore.environment.time_of_day)
+  const weather = worldStore.environment.weather
+  const coolDay = hour >= 7 && hour < 17
+  const baseLightColor = new THREE.Color(coolDay ? 0xb7d7ff : 0xffd8a0)
+  if (weather === 'rainy') {
+    baseLightColor.lerp(new THREE.Color(0x8db3d8), 0.45)
+  }
+
+  for (const [roomId, entry] of entries) {
+    const room = worldStore.rooms[roomId]
+    if (!room) continue
+
+    const lightLevel = THREE.MathUtils.clamp((room.light_level ?? 0) / 520, 0, 1)
+    const occupancyBoost = room.occupancy ? 1 : 0
+    const localLightTarget = lightLevel * 1.6 + occupancyBoost * 0.28
+    const haloTarget = lightLevel * 0.18 + occupancyBoost * 0.08
+    const occupancyTarget = room.occupancy ? 0.16 + Math.sin(Date.now() * 0.002 + entry.pointLight.position.x) * 0.02 : 0
+
+    const haloMat = entry.halo.material as THREE.MeshBasicMaterial
+    haloMat.color.lerp(baseLightColor, Math.min(4.2 * dt, 1))
+    haloMat.opacity = THREE.MathUtils.damp(haloMat.opacity, haloTarget, 4.5, dt)
+
+    const occupancyMat = entry.occupancyHalo.material as THREE.MeshBasicMaterial
+    occupancyMat.opacity = THREE.MathUtils.damp(occupancyMat.opacity, Math.max(occupancyTarget, 0), 4.5, dt)
+
+    entry.pointLight.color.lerp(baseLightColor, Math.min(4.2 * dt, 1))
+    entry.pointLight.intensity = THREE.MathUtils.damp(entry.pointLight.intensity, localLightTarget, 4.2, dt)
+  }
+}
+
 function getReflectionY(sourceY: number) {
   return showroomVisualConfig.ground.planeY - Math.min(sourceY * 0.05, 0.74)
 }
@@ -540,6 +669,7 @@ onMounted(async () => {
       reflection.position.set(0, getReflectionY(floorConfig.collapsedY), 0)
       const lightSources = createLightSourceGroup(floorId)
       scene.add(lightSources)
+      scene.add(createRoomFeedbackGroup(floorId))
 
       attachFloorLabel(floorId, scene)
 
@@ -549,12 +679,14 @@ onMounted(async () => {
     }
 
     showroomRuntime.onFrame.value = (dt, elapsed) => {
+      updateEnvironmentLook(dt)
       for (const floorId of floorOrder) {
         const floorScene = floorRefs[floorId].value
         if (floorScene) {
           lightUniforms.setFloorTransform(floorId, floorScene.position)
         }
         updateLightSourceGroup(floorId, dt)
+        updateRoomFeedback(floorId, dt)
       }
       shaderMats.updateShowroomEffects(dt, elapsed)
       groundMaterial.uniforms.u_time.value = elapsed
@@ -668,7 +800,7 @@ onBeforeUnmount(() => {
         :far="320"
       />
 
-      <TresAmbientLight :intensity="0.028" color="#dce4ee" />
+      <TresAmbientLight :intensity="ambientLightIntensity" :color="ambientLightColor" />
 
       <SceneRenderLoop />
 

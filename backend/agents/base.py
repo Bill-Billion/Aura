@@ -89,6 +89,30 @@ class BaseAgent(ABC):
         rooms = {device.location.room for device in self.get_relevant_devices(world_state, root_event)}
         return sorted(rooms)
 
+    def serialize_device_for_llm(
+        self,
+        device: DeviceState,
+        world_state: WorldState,
+    ) -> dict[str, Any]:
+        room = world_state.rooms.get(device.location.room)
+        compact_state: dict[str, Any] = {"power": device.state.power}
+        if device.state.extra:
+            compact_state["extra"] = dict(device.state.extra)
+
+        payload: dict[str, Any] = {
+            "device_id": device.id,
+            "type": device.type,
+            "room": device.location.room,
+            "state": compact_state,
+        }
+        if room is not None:
+            payload["room_state"] = {
+                "temperature": round(room.temperature, 1),
+                "occupancy": room.occupancy,
+                "light_level": round(room.light_level, 1),
+            }
+        return payload
+
     def build_world_summary(self, world_state: WorldState, root_event: SimEvent) -> str:
         rooms = self.get_relevant_rooms(world_state, root_event)
         room_summaries: list[str] = []
@@ -140,12 +164,7 @@ class BaseAgent(ABC):
                     world_summary=world_summary,
                     recent_events=recent_events,
                     available_devices=[
-                        {
-                            "device_id": device.id,
-                            "type": device.type,
-                            "room": device.location.room,
-                            "state": device.state.model_dump(),
-                        }
+                        self.serialize_device_for_llm(device, world_state)
                         for device in relevant_devices
                     ],
                     allowed_commands=allowed_commands,

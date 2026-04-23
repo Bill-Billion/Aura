@@ -6,6 +6,7 @@ export type CommandMessageType =
   | 'CMD_SIM_PAUSE'
   | 'CMD_SIM_RESET'
   | 'CMD_SIM_SPEED'
+  | 'CMD_SIM_MODE'
   | 'CMD_DEVICE_CONTROL'
   | 'CMD_TRIGGER_EVENT'
   | 'HEARTBEAT_PONG'
@@ -41,6 +42,9 @@ export interface AgentStatusPayload {
 export interface SimulationStatusPayload {
   is_running?: boolean
   speed?: number
+  mode?: 'observe' | 'demo'
+  wall_tick_ms?: number
+  simulated_dt_seconds?: number
 }
 
 export interface StateDeltaPayload {

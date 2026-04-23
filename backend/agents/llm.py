@@ -13,7 +13,9 @@ from backend.agents.types import AgentLLMDecision, LLMDecisionRequest
 
 DEFAULT_AGENT_SYSTEM_PROMPT = (
     "You are a smart-home orchestration planner. "
-    "Return strict JSON only."
+    "Return strict JSON only. "
+    "Be concise. Keep intent short, keep explanation to one short sentence, "
+    "and keep task_steps to at most 3 short items."
 )
 
 AGENT_DECISION_SCHEMA: dict[str, Any] = {
@@ -59,6 +61,7 @@ ANTHROPIC_OUTPUT_INSTRUCTION = (
     "The object must use exactly these top-level keys: "
     "intent, confidence, task_steps, proposed_commands, explanation, needs_coordination. "
     "Each proposed_commands item must include device_id, property, value, reason. "
+    "Keep the JSON compact and only include commands that are necessary right now. "
     "Do not wrap the JSON in markdown."
 )
 
@@ -94,7 +97,7 @@ class OpenAIResponsesProvider(LLMProvider):
         api_key: str | None,
         model: str = "gpt-5.4",
         reasoning_effort: str = "medium",
-        timeout_ms: int = 5000,
+        timeout_ms: int = 12000,
         base_url: str = "https://api.openai.com/v1",
         transport: httpx.AsyncBaseTransport | httpx.BaseTransport | None = None,
     ) -> None:
@@ -111,7 +114,7 @@ class OpenAIResponsesProvider(LLMProvider):
             api_key=os.getenv("OPENAI_API_KEY"),
             model=os.getenv("OPENAI_MODEL", "gpt-5.4"),
             reasoning_effort=os.getenv("OPENAI_REASONING_EFFORT", "medium"),
-            timeout_ms=int(os.getenv("LLM_TIMEOUT_MS", "5000")),
+            timeout_ms=int(os.getenv("LLM_TIMEOUT_MS", "12000")),
             base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
         )
 
@@ -137,7 +140,11 @@ class OpenAIResponsesProvider(LLMProvider):
                     "content": [
                         {
                             "type": "input_text",
-                            "text": json.dumps(request.model_dump(), ensure_ascii=False),
+                            "text": json.dumps(
+                                build_compact_request_payload(request),
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
                         }
                     ],
                 },
@@ -205,7 +212,7 @@ class AnthropicCompatibleProvider(LLMProvider):
         *,
         api_key: str | None,
         model: str = "MiniMax-M2.7",
-        timeout_ms: int = 5000,
+        timeout_ms: int = 12000,
         max_tokens: int = 1200,
         base_url: str = "https://api.minimaxi.com/anthropic",
         anthropic_version: str = "2023-06-01",
@@ -213,7 +220,7 @@ class AnthropicCompatibleProvider(LLMProvider):
     ) -> None:
         self.api_key = api_key
         self.model = model
-        self.timeout_ms = timeout_ms
+        self.timeout_ms = self._effective_timeout_ms(timeout_ms, base_url=base_url, model=model)
         self.max_tokens = max_tokens
         self.base_url = base_url.rstrip("/")
         self.anthropic_version = anthropic_version
@@ -229,7 +236,7 @@ class AnthropicCompatibleProvider(LLMProvider):
         return cls(
             api_key=api_key,
             model=os.getenv("ANTHROPIC_MODEL", os.getenv("ANTHROPIC_COMPAT_MODEL", "MiniMax-M2.7")),
-            timeout_ms=int(os.getenv("LLM_TIMEOUT_MS", "5000")),
+            timeout_ms=int(os.getenv("LLM_TIMEOUT_MS", "12000")),
             max_tokens=int(os.getenv("ANTHROPIC_MAX_TOKENS", "1200")),
             base_url=os.getenv("ANTHROPIC_BASE_URL", os.getenv("ANTHROPIC_COMPAT_BASE_URL", "https://api.minimaxi.com/anthropic")),
             anthropic_version=os.getenv("ANTHROPIC_VERSION", "2023-06-01"),
@@ -251,7 +258,7 @@ class AnthropicCompatibleProvider(LLMProvider):
                             "type": "text",
                             "text": (
                                 "Plan the smart-home response from this request payload.\n"
-                                f"{json.dumps(request.model_dump(), ensure_ascii=False, indent=2)}"
+                                f"{json.dumps(build_compact_request_payload(request), ensure_ascii=False, separators=(',', ':'))}"
                             ),
                         }
                     ],
@@ -296,6 +303,16 @@ class AnthropicCompatibleProvider(LLMProvider):
         if self.base_url.endswith("/v1"):
             return "/messages"
         return "/v1/messages"
+
+    @staticmethod
+    def _effective_timeout_ms(timeout_ms: int, *, base_url: str, model: str) -> int:
+        normalized_base = base_url.lower()
+        normalized_model = model.lower()
+        if "minimax" in normalized_base or normalized_model.startswith("minimax"):
+            # 设计意图：MiniMax 在 Anthropic 兼容路径下首字节波动明显，
+            # 给它一个略高于默认值的超时下限，避免实机联调时频繁假性 timeout。
+            return max(timeout_ms, 15000)
+        return timeout_ms
 
     @staticmethod
     def _extract_text(payload: dict[str, Any]) -> str:
@@ -370,6 +387,13 @@ def _normalize_agent_decision_payload(payload: dict[str, Any]) -> dict[str, Any]
             normalized["intent"] = "no device changes needed"
 
     return normalized
+
+
+def build_compact_request_payload(request: LLMDecisionRequest) -> dict[str, Any]:
+    payload = request.model_dump()
+    if payload.get("recent_events"):
+        payload["recent_events"] = payload["recent_events"][-4:]
+    return payload
 
 
 def build_invalid_output_error(

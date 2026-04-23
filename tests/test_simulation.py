@@ -80,6 +80,7 @@ def _make_engine() -> SimulationEngine:
         state_manager=sm,
         connection_manager=cm,
     )
+    engine.timer.tick_interval = 0.01
     return engine
 
 
@@ -211,7 +212,7 @@ class TestSimulationEngine:
     @pytest.mark.anyio
     async def test_next_time_of_day_wraps_at_midnight(self):
         engine = _make_engine()
-        assert engine._next_time_of_day("23:59") == "00:00"
+        assert engine._next_time_of_day("23:59", 60.0) == "00:00"
 
     @pytest.mark.anyio
     async def test_speed_control(self):
@@ -219,6 +220,7 @@ class TestSimulationEngine:
         engine.speed = 5.0
         assert engine.speed == 5.0
         assert engine.timer.speed == 5.0
+        assert engine.mode == "demo"
 
     @pytest.mark.anyio
     async def test_timer_tick_produces_delta_and_status_broadcasts(self):

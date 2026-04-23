@@ -23,8 +23,8 @@ from backend.simulators.user_behavior import UserBehaviorSimulator
 class SimulationEngine:
     """Event-driven simulation orchestrator."""
 
-    TICK_INTERVAL = 0.1
-    SIMULATED_DT = 60.0
+    TICK_INTERVAL = 1.0
+    DEFAULT_MODE = "observe"
 
     def __init__(
         self,
@@ -44,12 +44,15 @@ class SimulationEngine:
         self.timer = SimulatorTimer(
             publish_event=self._publish_sim_event,
             tick_interval=self.TICK_INTERVAL,
-            simulated_dt=self.SIMULATED_DT,
+            default_mode=self.DEFAULT_MODE,
         )
 
         self._pending_deltas: list[DeltaChange] = []
         self._subscriptions_registered = False
         self._is_processing_timer_tick = False
+        self._time_of_day_seconds = self._parse_time_of_day_to_seconds(
+            self.state_manager.world.environment.time_of_day
+        )
 
         self.agent_runtime = AgentRuntime(
             llm_provider=llm_provider,
@@ -65,6 +68,8 @@ class SimulationEngine:
             connection_manager=self.conn,
             publish_event=self._publish_sim_event,
         )
+        self._sync_world_timing_state(reset_mode=True)
+        self._sync_agent_diagnostics()
 
     @property
     def speed(self) -> float:
@@ -72,8 +77,28 @@ class SimulationEngine:
 
     @speed.setter
     def speed(self, value: float) -> None:
-        self.timer.speed = float(value)
-        self.state_manager.world.simulation_speed = float(value)
+        self.apply_legacy_speed(float(value))
+
+    @property
+    def mode(self) -> str:
+        return self.timer.mode
+
+    @mode.setter
+    def mode(self, value: str) -> None:
+        self.timer.set_mode(value)
+        self._sync_world_timing_state()
+
+    @property
+    def wall_tick_ms(self) -> int:
+        return int(self.timer.tick_interval * 1000)
+
+    @property
+    def simulated_dt_seconds(self) -> float:
+        return self.timer.simulated_dt
+
+    def apply_legacy_speed(self, value: float) -> None:
+        self.timer.apply_legacy_speed(value)
+        self._sync_world_timing_state()
 
     async def start(self) -> None:
         if self.is_running:
@@ -81,14 +106,15 @@ class SimulationEngine:
 
         self.is_running = True
         self.state_manager.world.is_running = True
-        self.state_manager.world.simulation_speed = self.speed
+        self._sync_world_timing_state()
+        self._sync_agent_diagnostics()
         await self._publish_sim_event(
             SimEvent(
                 event_type="system.simulation_started",
                 source="simulation_engine",
                 timestamp=float(self.state_manager.world.simulation_tick),
                 priority=2,
-                data={"simulation_speed": self.speed},
+                data=self.build_simulation_status_payload(),
             )
         )
         await self.timer.start()
@@ -101,13 +127,14 @@ class SimulationEngine:
         await self.timer.pause()
         self.is_running = False
         self.state_manager.world.is_running = False
+        self._sync_world_timing_state()
         await self._publish_sim_event(
             SimEvent(
                 event_type="system.simulation_paused",
                 source="simulation_engine",
                 timestamp=float(self.state_manager.world.simulation_tick),
                 priority=2,
-                data={"simulation_speed": self.speed},
+                data=self.build_simulation_status_payload(),
             )
         )
         log.info("sim_paused")
@@ -125,17 +152,26 @@ class SimulationEngine:
             self.state_manager.world.is_running = False
 
         self.timer.reset()
+        self.timer.set_mode(self.DEFAULT_MODE)
         self.user_sim = UserBehaviorSimulator()
         self._pending_deltas = []
+        self._time_of_day_seconds = self._parse_time_of_day_to_seconds(
+            self.state_manager.world.environment.time_of_day
+        )
         self.agent_runtime.update_state_manager(self.state_manager)
         self.agent_runtime.reset()
+        self._sync_world_timing_state(reset_mode=True)
+        self._sync_agent_diagnostics()
         await self._publish_sim_event(
             SimEvent(
                 event_type="system.simulation_reset",
                 source="simulation_engine",
                 timestamp=float(self.state_manager.world.simulation_tick),
                 priority=2,
-                data={"scene_id": self.state_manager.world.scene_id},
+                data={
+                    "scene_id": self.state_manager.world.scene_id,
+                    **self.build_simulation_status_payload(),
+                },
             )
         )
         log.info("sim_reset")
@@ -172,7 +208,10 @@ class SimulationEngine:
         simulated_dt = float(event.data["simulated_dt"])
         previous_time_of_day = world.environment.time_of_day
         previous_weather = world.environment.weather
-        time_of_day = self._next_time_of_day(previous_time_of_day, simulated_dt)
+        self._time_of_day_seconds = (
+            self._time_of_day_seconds + simulated_dt
+        ) % (24 * 60 * 60)
+        time_of_day = self._format_time_of_day(self._time_of_day_seconds)
 
         self._pending_deltas.extend(
             self.state_manager.apply_updates(
@@ -180,6 +219,9 @@ class SimulationEngine:
                 updates=[
                     ("simulation_tick", timer_tick),
                     ("simulation_speed", float(event.data["simulation_speed"])),
+                    ("simulation_mode", str(event.data["mode"])),
+                    ("wall_tick_ms", int(event.data["wall_tick_ms"])),
+                    ("simulated_dt_seconds", simulated_dt),
                     ("is_running", True),
                     ("environment.time_of_day", time_of_day),
                 ],
@@ -224,7 +266,9 @@ class SimulationEngine:
                 data={
                     "simulated_dt": simulated_dt,
                     "time_of_day": world.environment.time_of_day,
-                    "outdoor_temp": world.environment.outdoor_temp,
+                    "outdoor_temp": env_updates.get("environment.outdoor_temp", world.environment.outdoor_temp),
+                    "outdoor_humidity": env_updates.get("environment.outdoor_humidity", world.environment.outdoor_humidity),
+                    "weather": env_updates.get("environment.weather", world.environment.weather),
                     "significant_change_reasons": significant_change_reasons,
                     "updates": env_updates,
                 },
@@ -311,6 +355,7 @@ class SimulationEngine:
         self._pending_deltas = []
 
     async def _broadcast_agent_status(self, world: WorldState) -> None:
+        self._sync_agent_diagnostics()
         await self.conn.broadcast(
             WSMessage(
                 type="AGENT_STATUS",
@@ -319,11 +364,11 @@ class SimulationEngine:
         )
 
     def _next_time_of_day(self, time_of_day: str, simulated_dt: float | None = None) -> str:
-        simulated_dt = self.SIMULATED_DT if simulated_dt is None else simulated_dt
-        hours, minutes = time_of_day.split(":")
-        total_minutes = int(hours) * 60 + int(minutes) + simulated_dt / 60.0
-        total_minutes %= 24 * 60
-        return f"{int(total_minutes // 60):02d}:{int(total_minutes % 60):02d}"
+        simulated_dt = self.simulated_dt_seconds if simulated_dt is None else simulated_dt
+        total_seconds = (
+            self._parse_time_of_day_to_seconds(time_of_day) + simulated_dt
+        ) % (24 * 60 * 60)
+        return self._format_time_of_day(total_seconds)
 
     async def _publish_sim_event(self, event: WorldEvent | SimEvent) -> SimEvent:
         sim_event = self.event_bus.coerce_event(event)
@@ -343,7 +388,8 @@ class SimulationEngine:
         reasons: list[str] = []
         if self._time_bucket(previous_time_of_day) != self._time_bucket(next_time_of_day):
             reasons.append("time_bucket")
-        if previous_weather != world.environment.weather:
+        next_weather = str(updates.get("environment.weather", previous_weather))
+        if previous_weather != next_weather:
             reasons.append("weather")
 
         for path, next_value in updates.items():
@@ -353,7 +399,7 @@ class SimulationEngine:
                 current_value = float(StateManager._get_nested(world, path))
             except Exception:
                 continue
-            if abs(float(next_value) - current_value) >= 0.5:
+            if abs(float(next_value) - current_value) >= 1.0:
                 reasons.append("room_temperature_delta")
                 break
 
@@ -369,3 +415,38 @@ class SimulationEngine:
         if 18 <= hour < 23:
             return "evening"
         return "night"
+
+    def build_simulation_status_payload(self) -> dict[str, object]:
+        return {
+            "is_running": self.is_running,
+            "speed": self.speed,
+            "mode": self.mode,
+            "wall_tick_ms": self.wall_tick_ms,
+            "simulated_dt_seconds": self.simulated_dt_seconds,
+        }
+
+    def _sync_world_timing_state(self, *, reset_mode: bool = False) -> None:
+        world = self.state_manager.world
+        if reset_mode:
+            world.simulation_mode = self.mode  # type: ignore[assignment]
+        world.simulation_speed = float(self.speed)
+        world.simulation_mode = self.mode  # type: ignore[assignment]
+        world.wall_tick_ms = self.wall_tick_ms
+        world.simulated_dt_seconds = self.simulated_dt_seconds
+
+    def _sync_agent_diagnostics(self) -> None:
+        provider_name = getattr(self.agent_runtime.llm_provider, "provider_name", "disabled")
+        configured = self.agent_runtime.is_provider_configured
+        for agent in self.state_manager.world.agents.values():
+            agent.provider = provider_name
+            agent.provider_configured = configured
+
+    @staticmethod
+    def _parse_time_of_day_to_seconds(time_of_day: str) -> float:
+        hours, minutes = time_of_day.split(":")
+        return int(hours) * 3600 + int(minutes) * 60
+
+    @staticmethod
+    def _format_time_of_day(total_seconds: float) -> str:
+        total_minutes = int(total_seconds // 60) % (24 * 60)
+        return f"{int(total_minutes // 60):02d}:{int(total_minutes % 60):02d}"

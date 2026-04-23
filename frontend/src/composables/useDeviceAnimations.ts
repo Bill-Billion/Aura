@@ -521,9 +521,11 @@ export function updateDeviceAnimations(dt: number) {
   animationTime += dt
 
   const floorTargets = new Map<string, number>()
+  const floorLightCounts = new Map<string, number>()
   const floorsWithLightDevices = new Set<string>()
   for (const floorId of floorMaterials.keys()) {
     floorTargets.set(floorId, 0)
+    floorLightCounts.set(floorId, 0)
   }
 
   for (const [deviceId, device] of Object.entries(store.devices)) {
@@ -534,15 +536,19 @@ export function updateDeviceAnimations(dt: number) {
 
     const gain = FLOOR_LIGHT_GAIN[floorId] ?? 1
     const intensity = device.state.power
-      ? Math.max(0.18, (device.state.extra.brightness ?? 50) / 100) * gain
-      : 0.05
-    floorTargets.set(floorId, Math.max(floorTargets.get(floorId) ?? 0, intensity))
+      ? Math.max(0.12, (device.state.extra.brightness ?? 50) / 100) * gain
+      : 0
+    floorTargets.set(floorId, (floorTargets.get(floorId) ?? 0) + intensity)
+    floorLightCounts.set(floorId, (floorLightCounts.get(floorId) ?? 0) + 1)
   }
 
   for (const [floorId, mats] of floorMaterials) {
+    const base = FLOOR_BASE_LIGHTS[floorId] ?? 0.55
+    const count = floorLightCounts.get(floorId) ?? 0
+    const averageBoost = count > 0 ? (floorTargets.get(floorId) ?? 0) / count : 0
     const target = floorsWithLightDevices.has(floorId)
-      ? (floorTargets.get(floorId) ?? 0.05)
-      : (FLOOR_BASE_LIGHTS[floorId] ?? 0.55)
+      ? base + averageBoost * 0.18
+      : base
     const current = lightCurrents.get(floorId) ?? target
     const next = THREE.MathUtils.lerp(current, target, Math.min(4.5 * dt, 1))
     lightCurrents.set(floorId, next)

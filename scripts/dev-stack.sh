@@ -12,6 +12,46 @@ FRONTEND_PORT=5173
 
 mkdir -p "$OUTPUT_DIR"
 
+runtime_path() {
+  local updated_path="$PATH"
+  local candidate=""
+
+  # 设计意图：优先把宿主机 Node 所在目录放到前面，避免 Codex 内置 Node
+  # 去加载 Vite / rolldown 的原生 binding 时触发签名冲突。
+  for candidate in /opt/homebrew/bin /usr/local/bin; do
+    if [[ -d "$candidate" ]] && [[ ":$updated_path:" != *":$candidate:"* ]]; then
+      updated_path="${candidate}:${updated_path}"
+    fi
+  done
+
+  printf '%s\n' "$updated_path"
+}
+
+resolve_node_bin() {
+  local candidate=""
+
+  for candidate in /opt/homebrew/bin/node /usr/local/bin/node "$(command -v node 2>/dev/null || true)"; do
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+load_local_env() {
+  local env_file
+  for env_file in "$ROOT_DIR/.env.local" "$ROOT_DIR/.env"; do
+    if [[ -f "$env_file" ]]; then
+      set -a
+      # shellcheck disable=SC1090
+      source "$env_file"
+      set +a
+    fi
+  done
+}
+
 pid_is_running() {
   local pid="$1"
   [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
@@ -101,8 +141,12 @@ run_ws_check() {
 
 start_backend() {
   echo "[dev-stack] 启动后端 ..."
+  : > "$BACKEND_LOG"
   (
     cd "$ROOT_DIR"
+    load_local_env
+    export PATH
+    PATH="$(runtime_path)"
     python3 - "$BACKEND_PID_FILE" "$BACKEND_LOG" \
       backend/.venv/bin/python -m uvicorn backend.main:app --host 127.0.0.1 --port "$BACKEND_PORT" <<'PY'
 import os
@@ -130,11 +174,23 @@ PY
 }
 
 start_frontend() {
+  local node_bin=""
+  local vite_entry="$ROOT_DIR/frontend/node_modules/vite/bin/vite.js"
+
+  node_bin="$(resolve_node_bin)" || {
+    echo "[dev-stack] 未找到可用的宿主机 Node，可执行前端启动失败。" >&2
+    exit 1
+  }
+
   echo "[dev-stack] 启动前端 ..."
+  : > "$FRONTEND_LOG"
   (
     cd "$ROOT_DIR/frontend"
+    load_local_env
+    export PATH
+    PATH="$(runtime_path)"
     python3 - "$FRONTEND_PID_FILE" "$FRONTEND_LOG" \
-      ./node_modules/.bin/vite --host 127.0.0.1 --port "$FRONTEND_PORT" <<'PY'
+      "$node_bin" "$vite_entry" --host 127.0.0.1 --port "$FRONTEND_PORT" <<'PY'
 import os
 import subprocess
 import sys

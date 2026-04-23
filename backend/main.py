@@ -8,7 +8,7 @@ from typing import AsyncGenerator
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.api.routes import router as api_router
+from backend.api.routes import configure_health_provider, router as api_router
 from backend.api.ws import ConnectionManager
 from backend.config.device_registry import (
     build_default_devices,
@@ -16,6 +16,7 @@ from backend.config.device_registry import (
     validate_device_command,
 )
 from backend.core.logging import log
+from backend.core.local_env import load_local_env
 from backend.engine.state import (
     AgentRuntimeState,
     Location3D,
@@ -36,6 +37,7 @@ manager = ConnectionManager()
 event_bus = EventBus()
 state_manager: StateManager | None = None
 simulation_engine: SimulationEngine | None = None
+load_local_env()
 
 
 async def _broadcast_sim_event(event: SimEvent) -> SimEvent:
@@ -57,6 +59,50 @@ async def _send_ws_error(
             payload=ErrorMessage(code=code, message=message, details=details).model_dump(),
         ),
     )
+
+
+def _simulation_health() -> dict[str, object]:
+    if simulation_engine is None:
+        return {
+            "is_running": False,
+            "mode": "observe",
+            "speed": 1.0,
+            "wall_tick_ms": 1000,
+            "simulated_dt_seconds": 30.0,
+        }
+
+    return {
+        "is_running": simulation_engine.is_running,
+        "mode": simulation_engine.mode,
+        "speed": simulation_engine.speed,
+        "wall_tick_ms": simulation_engine.wall_tick_ms,
+        "simulated_dt_seconds": simulation_engine.simulated_dt_seconds,
+    }
+
+
+def _llm_health() -> dict[str, object]:
+    if simulation_engine is None:
+        return {
+            "provider": "disabled",
+            "model": "rule_based",
+            "configured": False,
+        }
+
+    runtime = simulation_engine.agent_runtime
+    provider = runtime.llm_provider
+    return {
+        "provider": getattr(provider, "provider_name", "disabled"),
+        "model": getattr(provider, "model", "rule_based"),
+        "configured": runtime.is_provider_configured,
+    }
+
+
+def _runtime_health() -> dict[str, object]:
+    return {
+        "status": "ok",
+        "simulation": _simulation_health(),
+        "llm": _llm_health(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +188,7 @@ app.add_middleware(
 )
 
 app.include_router(api_router)
+configure_health_provider(_runtime_health)
 
 
 # ---------------------------------------------------------------------------
@@ -293,24 +340,24 @@ async def ws_simulation(ws: WebSocket) -> None:
                     )
 
             elif msg_type == "CMD_SIM_START":
-                await manager.broadcast(
-                    WSMessage(
-                        type="SIMULATION_STATUS",
-                        payload={"is_running": True},
-                    )
-                )
                 if simulation_engine is not None:
                     await simulation_engine.start()
+                    await manager.broadcast(
+                        WSMessage(
+                            type="SIMULATION_STATUS",
+                            payload=simulation_engine.build_simulation_status_payload(),
+                        )
+                    )
 
             elif msg_type == "CMD_SIM_PAUSE":
-                await manager.broadcast(
-                    WSMessage(
-                        type="SIMULATION_STATUS",
-                        payload={"is_running": False},
-                    )
-                )
                 if simulation_engine is not None:
                     await simulation_engine.pause()
+                    await manager.broadcast(
+                        WSMessage(
+                            type="SIMULATION_STATUS",
+                            payload=simulation_engine.build_simulation_status_payload(),
+                        )
+                    )
 
             elif msg_type == "CMD_SIM_RESET":
                 state_manager = _init_default_state()
@@ -320,18 +367,39 @@ async def ws_simulation(ws: WebSocket) -> None:
                 await manager.broadcast(
                     WSMessage(type="STATE_FULL", payload=full)
                 )
+                if simulation_engine is not None:
+                    await manager.broadcast(
+                        WSMessage(
+                            type="SIMULATION_STATUS",
+                            payload=simulation_engine.build_simulation_status_payload(),
+                        )
+                    )
 
             elif msg_type == "CMD_SIM_SPEED":
                 speed = payload.get("speed", 1.0)
                 if simulation_engine is not None:
-                    simulation_engine.speed = float(speed)
-                state_manager.world.simulation_speed = float(speed)
+                    simulation_engine.apply_legacy_speed(float(speed))
                 await manager.broadcast(
                     WSMessage(
                         type="SIMULATION_STATUS",
-                        payload={"speed": float(speed)},
+                        payload=(
+                            simulation_engine.build_simulation_status_payload()
+                            if simulation_engine is not None
+                            else {"speed": float(speed)}
+                        ),
                     )
                 )
+
+            elif msg_type == "CMD_SIM_MODE":
+                mode = str(payload.get("mode", "observe"))
+                if simulation_engine is not None:
+                    simulation_engine.mode = mode
+                    await manager.broadcast(
+                        WSMessage(
+                            type="SIMULATION_STATUS",
+                            payload=simulation_engine.build_simulation_status_payload(),
+                        )
+                    )
 
     except WebSocketDisconnect:
         manager.disconnect(ws)

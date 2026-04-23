@@ -42,6 +42,10 @@ export interface AgentState {
   active_correlation_id: string | null
   last_reasoning_step: string
   last_fallback_reason: string | null
+  provider: string
+  provider_configured: boolean
+  last_latency_ms: number | null
+  last_trigger_event: string
 }
 
 export interface UserState {
@@ -54,6 +58,9 @@ export interface UserState {
 
 export interface WorldStateSnapshot {
   simulation_tick: number; simulation_speed: number
+  simulation_mode: 'observe' | 'demo'
+  wall_tick_ms: number
+  simulated_dt_seconds: number
   is_running: boolean; scene_id: string
   environment: EnvironmentState
   devices: Record<string, DeviceState>

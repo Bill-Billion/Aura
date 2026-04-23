@@ -53,7 +53,12 @@ class HVACAgent(BaseAgent):
             device = world_state.devices.get(device_id)
             if device is not None and device.type == "hvac":
                 return [device]
-        return self._get_my_devices(world_state)
+
+        focus_rooms = self._focus_rooms(world_state, root_event)
+        devices = self._get_my_devices(world_state)
+        if not focus_rooms:
+            return devices
+        return [device for device in devices if device.location.room in focus_rooms]
 
     def decide(self, world_state: WorldState) -> list[dict]:
         actions: list[dict] = []
@@ -91,3 +96,20 @@ class HVACAgent(BaseAgent):
                     })
 
         return actions
+
+    @staticmethod
+    def _focus_rooms(world_state: WorldState, root_event: SimEvent) -> set[str]:
+        rooms: set[str] = set()
+        for key in ("from_room", "to_room"):
+            room_id = str(root_event.data.get(key) or "")
+            if room_id and room_id != "outside" and room_id in world_state.rooms:
+                rooms.add(room_id)
+
+        if root_event.event_type == "environment.state_refresh":
+            rooms.update(
+                room_id
+                for room_id, room in world_state.rooms.items()
+                if room.occupancy
+            )
+
+        return rooms

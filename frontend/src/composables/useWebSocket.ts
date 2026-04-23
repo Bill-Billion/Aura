@@ -113,6 +113,9 @@ export function useWebSocket() {
         agentStore.setAllAgents(snap.agents)
         simulationStore.setRunning(snap.is_running)
         simulationStore.setSpeed(snap.simulation_speed)
+        simulationStore.setMode(snap.simulation_mode)
+        simulationStore.setWallTickMs(snap.wall_tick_ms)
+        simulationStore.setSimulatedDtSeconds(snap.simulated_dt_seconds)
         break
       }
 
@@ -163,6 +166,18 @@ export function useWebSocket() {
         if (typeof p?.speed === 'number') {
           simulationStore.setSpeed(p.speed)
           worldStore.simulationSpeed = p.speed
+        }
+        if (p?.mode === 'observe' || p?.mode === 'demo') {
+          simulationStore.setMode(p.mode)
+          worldStore.simulationMode = p.mode
+        }
+        if (typeof p?.wall_tick_ms === 'number') {
+          simulationStore.setWallTickMs(p.wall_tick_ms)
+          worldStore.wallTickMs = p.wall_tick_ms
+        }
+        if (typeof p?.simulated_dt_seconds === 'number') {
+          simulationStore.setSimulatedDtSeconds(p.simulated_dt_seconds)
+          worldStore.simulatedDtSeconds = p.simulated_dt_seconds
         }
         break
       }

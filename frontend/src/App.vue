@@ -2,17 +2,38 @@
 import { onMounted, computed } from 'vue'
 import { useWebSocket } from '@/composables/useWebSocket'
 import { useSimulationStore } from '@/stores/simulationStore'
+import { useWorldStore } from '@/stores/worldStore'
 import { useUIStore } from '@/stores/uiStore'
 import SceneRenderer from '@/components/scene/SceneRenderer.vue'
 import DashboardOverlay from '@/components/dashboard/DashboardOverlay.vue'
 
 const { connect } = useWebSocket()
 const simulationStore = useSimulationStore()
+const worldStore = useWorldStore()
 const uiStore = useUIStore()
 
 const connectionStatus = computed(() => simulationStore.connectionStatus)
 const sceneLoading = computed(() => uiStore.sceneLoadStatus === 'loading')
 const sceneError = computed(() => uiStore.sceneLoadStatus === 'error')
+const atmosphereStyle = computed(() => {
+  const [hours, minutes] = worldStore.environment.time_of_day.split(':').map((value) => Number(value))
+  const hour = hours + minutes / 60
+  const dayFactor = Math.max(0, Math.sin(((hour - 6) / 12) * Math.PI))
+  const weather = worldStore.environment.weather
+  const tint = weather === 'rainy'
+    ? 'rgba(102, 138, 178, 0.24)'
+    : weather === 'cloudy'
+      ? 'rgba(148, 168, 188, 0.14)'
+      : 'rgba(255, 214, 152, 0.12)'
+  return {
+    opacity: `${0.7 + dayFactor * 0.2}`,
+    background: `
+      radial-gradient(circle at 74% 26%, ${tint}, transparent 24%),
+      radial-gradient(circle at 18% 12%, rgba(255, 230, 163, ${0.08 + dayFactor * 0.08}), transparent 28%),
+      linear-gradient(180deg, rgba(255,255,255,${0.05 + dayFactor * 0.03}), transparent 22%, transparent 78%, rgba(0,0,0,0.3))
+    `,
+  }
+})
 
 function getWsUrl(): string {
   const proto = window.location.protocol === 'https:' ? 'wss' : 'ws'
@@ -31,7 +52,7 @@ onMounted(() => {
 <template>
   <div class="app-root">
     <SceneRenderer />
-    <div class="app-atmosphere" />
+    <div class="app-atmosphere" :style="atmosphereStyle" />
     <DashboardOverlay />
 
     <div v-if="sceneLoading" class="status-overlay showroom-card">

@@ -24,40 +24,37 @@ SmartHomeSim 是一个面向智能家居 Agent 的 3D 仿真与观测平台。�
 
 ### 方式一：直接在本机运行
 
-先启动后端：
+先在仓库根目录创建本地环境文件：
+
+```bash
+cat > .env.local <<'EOF'
+LLM_PROVIDER=anthropic_compatible
+ANTHROPIC_BASE_URL=https://api.minimaxi.com/anthropic
+ANTHROPIC_API_KEY=your_key_here
+ANTHROPIC_MODEL=MiniMax-M2.7
+LLM_TIMEOUT_MS=12000
+AGENT_EPISODE_TIMEOUT_MS=15000
+AGENT_ENV_DEBOUNCE_MS=5000
+EOF
+```
+
+后端和本地起栈脚本都会自动读取仓库根目录的 `.env.local` / `.env`，不需要再手工 `export`。
+
+再启动后端：
 
 ```bash
 cd backend
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-export OPENAI_API_KEY=your_key_here
-export OPENAI_MODEL=gpt-5.4
-export OPENAI_REASONING_EFFORT=medium
-export LLM_TIMEOUT_MS=5000
-export AGENT_EPISODE_TIMEOUT_MS=5000
-uvicorn main:app --reload --port 8000
-```
-
-如果没有配置 `OPENAI_API_KEY`，Agent 会继续工作，但会直接回退到规则逻辑，不会调用 LLM。
-
-如果要走 Anthropic-compatible provider，比如 MiniMax，可以改成：
-
-```bash
-export LLM_PROVIDER=anthropic_compatible
-export ANTHROPIC_BASE_URL=https://api.minimaxi.com/anthropic
-export ANTHROPIC_API_KEY=your_key_here
-export ANTHROPIC_MODEL=MiniMax-M2.7
-export LLM_TIMEOUT_MS=15000
-export AGENT_EPISODE_TIMEOUT_MS=15000
 uvicorn main:app --reload --port 8000
 ```
 
 如果没有显式设置 `LLM_PROVIDER`，运行时会优先尝试 `OPENAI_API_KEY`，否则再尝试 `ANTHROPIC_API_KEY / ANTHROPIC_COMPAT_API_KEY`。
 
-`LLM_TIMEOUT_MS` 控制单次 provider HTTP 请求的超时，`AGENT_EPISODE_TIMEOUT_MS` 控制单个 agent episode 最长占用时间。默认情况下 episode timeout 会跟随 `LLM_TIMEOUT_MS`，这样兼容 provider 即使没有及时断开，也不会把整条事件链长时间卡住。
+`LLM_TIMEOUT_MS` 控制单次 provider HTTP 请求的超时，`AGENT_EPISODE_TIMEOUT_MS` 控制单个 agent episode 最长占用时间，`AGENT_ENV_DEBOUNCE_MS` 控制环境刷新触发 Agent 的防抖窗口。
 
-像 MiniMax 这类响应更慢的 Anthropic-compatible provider，如果继续用 `5000ms`，系统会更快回退到规则逻辑；如果希望真实走完 LLM 决策链，需要把两个 timeout 一起调高。
+像 MiniMax 这类响应更慢的 Anthropic-compatible provider，如果继续用过短超时，系统会更快回退到规则逻辑；示例仍推荐从 `12000 / 15000ms` 起步，但运行时会给 MiniMax 自动补一层超时缓冲，避免刚好卡在线上。
 
 再启动前端：
 
@@ -94,6 +91,7 @@ Compose 环境下前端代理会自动指向 `http://backend:8000`。
 - `CMD_SIM_START`
 - `CMD_SIM_PAUSE`
 - `CMD_SIM_RESET`
+- `CMD_SIM_MODE`
 - `CMD_SIM_SPEED`
 - `CMD_DEVICE_CONTROL`
 
@@ -142,6 +140,21 @@ Compose 环境下前端代理会自动指向 `http://backend:8000`。
 - `active_correlation_id`
 - `last_reasoning_step`
 - `last_fallback_reason`
+- `provider`
+- `provider_configured`
+- `last_latency_ms`
+- `last_trigger_event`
+
+`/api/health` 现在除了 `status: ok`，还会补充：
+
+- `simulation.is_running`
+- `simulation.mode`
+- `simulation.speed`
+- `simulation.wall_tick_ms`
+- `simulation.simulated_dt_seconds`
+- `llm.provider`
+- `llm.model`
+- `llm.configured`
 
 更完整的协议说明见 `docs/architecture/ws-protocol.md`。
 

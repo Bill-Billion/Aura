@@ -13,6 +13,9 @@ export const useWorldStore = defineStore('world', () => {
   // --- State ---
   const simulationTick = ref(0)
   const simulationSpeed = ref(1)
+  const simulationMode = ref<'observe' | 'demo'>('observe')
+  const wallTickMs = ref(1000)
+  const simulatedDtSeconds = ref(30)
   const isRunning = ref(false)
   const sceneId = ref('')
 
@@ -33,6 +36,9 @@ export const useWorldStore = defineStore('world', () => {
   function applyFullState(snap: WorldStateSnapshot) {
     simulationTick.value = snap.simulation_tick
     simulationSpeed.value = snap.simulation_speed
+    simulationMode.value = snap.simulation_mode
+    wallTickMs.value = snap.wall_tick_ms
+    simulatedDtSeconds.value = snap.simulated_dt_seconds
     isRunning.value = snap.is_running
     sceneId.value = snap.scene_id
 
@@ -79,11 +85,22 @@ export const useWorldStore = defineStore('world', () => {
     // or "environment.outdoor_temp"
     // or "simulation_tick"
 
-    const directKeys = ['simulation_tick', 'simulation_speed', 'is_running', 'scene_id']
+    const directKeys = [
+      'simulation_tick',
+      'simulation_speed',
+      'simulation_mode',
+      'wall_tick_ms',
+      'simulated_dt_seconds',
+      'is_running',
+      'scene_id',
+    ]
     if (directKeys.includes(path)) {
       switch (path) {
         case 'simulation_tick': simulationTick.value = Number(value); break
         case 'simulation_speed': simulationSpeed.value = Number(value); break
+        case 'simulation_mode': simulationMode.value = String(value) === 'demo' ? 'demo' : 'observe'; break
+        case 'wall_tick_ms': wallTickMs.value = Number(value); break
+        case 'simulated_dt_seconds': simulatedDtSeconds.value = Number(value); break
         case 'is_running': isRunning.value = Boolean(value); break
         case 'scene_id': sceneId.value = String(value); break
       }
@@ -137,6 +154,9 @@ export const useWorldStore = defineStore('world', () => {
   return {
     simulationTick,
     simulationSpeed,
+    simulationMode,
+    wallTickMs,
+    simulatedDtSeconds,
     isRunning,
     sceneId,
     environment,

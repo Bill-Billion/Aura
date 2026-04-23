@@ -1,74 +1,74 @@
-"""Schedule-based user behavior simulator.
-
-Moves the simulated user between rooms based on a fixed daily schedule.
-Emits ``user.activity_change`` events when the hour changes.
-"""
+"""Schedule-based user behavior simulator."""
 
 from __future__ import annotations
 
 import time as _time
+from dataclasses import dataclass
 
 from backend.engine.event_bus import WorldEvent
 from backend.engine.state import WorldState
 
 
-# ---------------------------------------------------------------------------
-# Daily schedule: hour -> (room, activity)
-# ---------------------------------------------------------------------------
-
-SCHEDULE: dict[int, tuple[str, str]] = {
-    7: ("bedroom", "waking_up"),
-    8: ("kitchen", "breakfast"),
-    9: ("living_room", "idle"),
-    12: ("kitchen", "lunch"),
-    14: ("living_room", "working"),
-    18: ("kitchen", "dinner"),
-    19: ("living_room", "watching_tv"),
-    22: ("bedroom", "sleeping"),
-}
+@dataclass(frozen=True)
+class ScheduleEntry:
+    minute_of_day: int
+    room: str
+    activity: str
 
 
-def _parse_hour(time_of_day: str) -> int:
-    """Return the integer hour from a 'HH:MM' string."""
-    return int(time_of_day.split(":")[0])
+SCHEDULE: tuple[ScheduleEntry, ...] = (
+    ScheduleEntry(0, "bedroom", "sleeping"),
+    ScheduleEntry(390, "bedroom", "waking_up"),
+    ScheduleEntry(420, "bathroom", "getting_ready"),
+    ScheduleEntry(450, "kitchen", "breakfast"),
+    ScheduleEntry(510, "outside", "away"),
+    ScheduleEntry(750, "kitchen", "lunch"),
+    ScheduleEntry(810, "outside", "away"),
+    ScheduleEntry(1110, "living_room", "arrive_home"),
+    ScheduleEntry(1170, "kitchen", "cooking"),
+    ScheduleEntry(1200, "living_room", "relaxing"),
+    ScheduleEntry(1350, "bedroom", "sleeping"),
+)
 
 
-def _current_schedule_entry(hour: int) -> tuple[str, str]:
-    """Return (room, activity) for the given hour using the most recent
-    schedule entry that is <= *hour*."""
-    # Find the latest schedule hour <= current hour
-    candidates = [h for h in SCHEDULE if h <= hour]
+def _parse_minutes(time_of_day: str) -> int:
+    hour, minute = time_of_day.split(":")
+    return int(hour) * 60 + int(minute)
+
+
+def _half_hour_slot(minute_of_day: int) -> int:
+    return minute_of_day // 30
+
+
+def _current_schedule_entry(minute_of_day: int) -> ScheduleEntry:
+    candidates = [entry for entry in SCHEDULE if entry.minute_of_day <= minute_of_day]
     if not candidates:
-        # Before first schedule entry (e.g. 0:00-6:59) -> sleeping in bedroom
-        return ("bedroom", "sleeping")
-    return SCHEDULE[max(candidates)]
+        return SCHEDULE[0]
+    return candidates[-1]
 
 
 class UserBehaviorSimulator:
-    """Moves users between rooms based on a daily schedule."""
+    """按半小时节拍产出用户活动事件。"""
 
     def __init__(self) -> None:
-        self._last_hour: int | None = None
+        self._last_slot: int | None = None
 
     def step(self, state: WorldState) -> list[WorldEvent]:
-        """Check if the simulated hour changed and emit user activity events.
-
-        Returns a (possibly empty) list of ``WorldEvent`` objects.
-        """
         events: list[WorldEvent] = []
-        hour = _parse_hour(state.environment.time_of_day)
+        minute_of_day = _parse_minutes(state.environment.time_of_day)
+        slot = _half_hour_slot(minute_of_day)
 
-        # Only act when the hour changes
-        if hour == self._last_hour:
+        if slot == self._last_slot:
             return events
 
-        self._last_hour = hour
-        target_room, activity = _current_schedule_entry(hour)
+        self._last_slot = slot
+        target = _current_schedule_entry(minute_of_day)
 
+        # 设计意图：用户活动脚本只负责“宣布变化”，真正的房间占用与用户位置写回由 SimulationEngine 统一处理。
         for user_id, user in state.users.items():
             old_room = user.location.room if user.location else ""
-            if old_room == target_room and user.activity == activity:
-                continue  # no change needed
+            if old_room == target.room and user.activity == target.activity:
+                continue
 
             events.append(
                 WorldEvent(
@@ -78,8 +78,8 @@ class UserBehaviorSimulator:
                     data={
                         "user_id": user_id,
                         "from_room": old_room,
-                        "to_room": target_room,
-                        "activity": activity,
+                        "to_room": target.room,
+                        "activity": target.activity,
                     },
                 )
             )

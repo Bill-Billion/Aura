@@ -1,7 +1,7 @@
 # WebSocket 协议
 
 Author: Bill Billion  
-Date: 2026-04-20
+Date: 2026-04-22
 
 这份文档定义 SmartHomeSim 当前对外开放的 WebSocket 命令、服务端消息、结构化事件类型和错误格式。当前阶段已经进入 Phase 2，所以除了 Phase 1 的世界状态同步消息，还会通过 `SIM_EVENT` 实时外发 `reasoning.*` 事件。
 
@@ -13,11 +13,12 @@ WebSocket 入口固定为 `/ws/simulation`。
 
 ## 客户端命令
 
-当前开放的命令只有五类：
+当前开放的命令有六类：
 
 - `CMD_SIM_START`
 - `CMD_SIM_PAUSE`
 - `CMD_SIM_RESET`
+- `CMD_SIM_MODE`
 - `CMD_SIM_SPEED`
 - `CMD_DEVICE_CONTROL`
 
@@ -56,6 +57,9 @@ WebSocket 入口固定为 `/ws/simulation`。
 
 - `simulation_tick`
 - `simulation_speed`
+- `simulation_mode`
+- `wall_tick_ms`
+- `simulated_dt_seconds`
 - `is_running`
 - `scene_id`
 - `environment`
@@ -107,6 +111,10 @@ WebSocket 入口固定为 `/ws/simulation`。
 - `active_correlation_id`
 - `last_reasoning_step`
 - `last_fallback_reason`
+- `provider`
+- `provider_configured`
+- `last_latency_ms`
+- `last_trigger_event`
 
 ### `SIM_EVENT`
 
@@ -136,10 +144,13 @@ WebSocket 入口固定为 `/ws/simulation`。
 
 ### `SIMULATION_STATUS`
 
-当前只会下发两类字段：
+当前会下发这些字段：
 
 - `is_running`
 - `speed`
+- `mode`
+- `wall_tick_ms`
+- `simulated_dt_seconds`
 
 ### `ERROR`
 

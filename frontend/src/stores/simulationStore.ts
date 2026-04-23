@@ -7,6 +7,9 @@ export const useSimulationStore = defineStore('simulation', () => {
   // --- State ---
   const isRunning = ref(false)
   const speed = ref(1)
+  const mode = ref<'observe' | 'demo'>('observe')
+  const wallTickMs = ref(1000)
+  const simulatedDtSeconds = ref(30)
   const connectionStatus = ref<ConnectionStatus>('disconnected')
 
   // --- Actions ---
@@ -18,6 +21,18 @@ export const useSimulationStore = defineStore('simulation', () => {
     speed.value = value
   }
 
+  function setMode(value: 'observe' | 'demo') {
+    mode.value = value
+  }
+
+  function setWallTickMs(value: number) {
+    wallTickMs.value = value
+  }
+
+  function setSimulatedDtSeconds(value: number) {
+    simulatedDtSeconds.value = value
+  }
+
   function setConnectionStatus(status: ConnectionStatus) {
     connectionStatus.value = status
   }
@@ -25,15 +40,24 @@ export const useSimulationStore = defineStore('simulation', () => {
   function $reset() {
     isRunning.value = false
     speed.value = 1
+    mode.value = 'observe'
+    wallTickMs.value = 1000
+    simulatedDtSeconds.value = 30
     connectionStatus.value = 'disconnected'
   }
 
   return {
     isRunning,
     speed,
+    mode,
+    wallTickMs,
+    simulatedDtSeconds,
     connectionStatus,
     setRunning,
     setSpeed,
+    setMode,
+    setWallTickMs,
+    setSimulatedDtSeconds,
     setConnectionStatus,
     $reset,
   }

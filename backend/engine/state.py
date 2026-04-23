@@ -72,6 +72,10 @@ class AgentRuntimeState(BaseModel):
     active_correlation_id: str | None = None
     last_reasoning_step: str = ""
     last_fallback_reason: str | None = None
+    provider: str = "disabled"
+    provider_configured: bool = False
+    last_latency_ms: int | None = None
+    last_trigger_event: str = ""
 
 
 class UserState(BaseModel):
@@ -85,6 +89,9 @@ class UserState(BaseModel):
 class WorldState(BaseModel):
     simulation_tick: int = 0
     simulation_speed: float = 1.0
+    simulation_mode: Literal["observe", "demo"] = "observe"
+    wall_tick_ms: int = 1000
+    simulated_dt_seconds: float = 30.0
     is_running: bool = False
     scene_id: str = ""
     environment: EnvironmentState = Field(default_factory=EnvironmentState)

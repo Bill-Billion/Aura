@@ -21,6 +21,7 @@ interface FloorVisualConfig {
   envBias: number
   labelAnchor: [number, number, number]
   lights: [number, number, number][]
+  roomAnchors: Record<string, [number, number, number]>
 }
 
 interface ShowroomGroundConfig {
@@ -108,6 +109,10 @@ export const showroomVisualConfig: ShowroomVisualConfig = {
       envBias: 1.14,
       labelAnchor: [9.0, 2.15, 2.2],
       lights: [[-2, 0, -1.5], [-2, 0, 1], [-1, 0, 4]],
+      roomAnchors: {
+        living_room: [-2, 0.05, -0.5],
+        kitchen: [-1, 0.05, 3.6],
+      },
     },
     F2: {
       id: 'F2',
@@ -121,6 +126,10 @@ export const showroomVisualConfig: ShowroomVisualConfig = {
       envBias: 0.86,
       labelAnchor: [8.0, 2.0, 2.6],
       lights: [[-4, 0, -1.5], [3, 0, -2.5]],
+      roomAnchors: {
+        bedroom: [-4, 0.05, -1.5],
+        bathroom: [2.8, 0.05, -2.4],
+      },
     },
     F3: {
       id: 'F3',
@@ -134,6 +143,10 @@ export const showroomVisualConfig: ShowroomVisualConfig = {
       envBias: 0.76,
       labelAnchor: [7.4, 2.0, 2.0],
       lights: [[-1, 0, 3], [3, 0, -2.5]],
+      roomAnchors: {
+        loft: [-1, 0.05, 3.0],
+        utility: [2.8, 0.05, -2.4],
+      },
     },
   },
   materialPalette: {

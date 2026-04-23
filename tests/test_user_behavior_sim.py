@@ -35,20 +35,22 @@ class TestUserBehavior:
         sim = UserBehaviorSimulator()
         world = _make_world("06:00")
 
-        # Advance through the day hour by hour
+        # Advance through the day in half-hour steps
         expected_transitions = [
-            (7, "bedroom", "waking_up"),
-            (8, "kitchen", "breakfast"),
-            (9, "living_room", "idle"),
-            (12, "kitchen", "lunch"),
-            (14, "living_room", "working"),
-            (18, "kitchen", "dinner"),
-            (19, "living_room", "watching_tv"),
-            (22, "bedroom", "sleeping"),
+            ("06:30", "bedroom", "waking_up"),
+            ("07:00", "bathroom", "getting_ready"),
+            ("07:30", "kitchen", "breakfast"),
+            ("08:30", "outside", "away"),
+            ("12:30", "kitchen", "lunch"),
+            ("13:30", "outside", "away"),
+            ("18:30", "living_room", "arrive_home"),
+            ("19:30", "kitchen", "cooking"),
+            ("20:00", "living_room", "relaxing"),
+            ("22:30", "bedroom", "sleeping"),
         ]
 
-        for hour, expected_room, expected_activity in expected_transitions:
-            world.environment.time_of_day = f"{hour:02d}:00"
+        for time_of_day, expected_room, expected_activity in expected_transitions:
+            world.environment.time_of_day = time_of_day
             events = sim.step(world)
 
             user = world.users["user_01"]
@@ -57,7 +59,7 @@ class TestUserBehavior:
             if expected_room == "bedroom" and expected_activity == "sleeping":
                 assert len(events) == 0
             else:
-                assert len(events) > 0, f"Expected event at {hour}:00"
+                assert len(events) > 0, f"Expected event at {time_of_day}"
                 assert events[0].event_type == "user.activity_change"
                 assert events[0].data["to_room"] == expected_room
                 assert events[0].data["activity"] == expected_activity

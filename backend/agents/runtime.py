@@ -78,16 +78,26 @@ class AgentRuntime:
         if episode_timeout_ms is None:
             # 设计意图：默认把单个 agent episode 的最长耗时压到和 LLM 超时同量级，
             # 避免兼容 provider 没有及时中断时，把整条事件链长时间卡住。
-            timeout_value = os.getenv(
-                "AGENT_EPISODE_TIMEOUT_MS",
-                os.getenv("LLM_TIMEOUT_MS", "5000"),
-            ).strip()
+            timeout_value = os.getenv("AGENT_EPISODE_TIMEOUT_MS", "15000").strip()
             episode_timeout_ms = int(timeout_value) if timeout_value else None
+        provider_timeout_ms = getattr(self.llm_provider, "timeout_ms", None)
+        if episode_timeout_ms is not None and isinstance(provider_timeout_ms, int):
+            # 设计意图：episode 超时至少比 provider 超时多留一点缓冲，
+            # 避免 provider 已经拿到结果，但协作层还没来得及落地就被外层取消。
+            episode_timeout_ms = max(episode_timeout_ms, provider_timeout_ms + 3000)
         self.episode_timeout_ms = episode_timeout_ms
         self._subscriptions_registered = False
         self._subscribed_event_types: set[str] = set()
         self._active_tasks: dict[str, asyncio.Task[None]] = {}
         self._background_tasks: set[asyncio.Task[None]] = set()
+        self.environment_debounce_ms = int(os.getenv("AGENT_ENV_DEBOUNCE_MS", "5000"))
+        self._last_environment_episode_started_at: dict[str, float] = {}
+
+    @property
+    def is_provider_configured(self) -> bool:
+        if isinstance(self.llm_provider, DisabledLLMProvider):
+            return False
+        return bool(getattr(self.llm_provider, "api_key", None))
 
     @staticmethod
     def _build_default_provider() -> LLMProvider:
@@ -153,6 +163,7 @@ class AgentRuntime:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._active_tasks.clear()
         self._background_tasks.clear()
+        self._last_environment_episode_started_at.clear()
 
     async def step(self, world_state: WorldState) -> list[dict]:
         all_actions: list[dict] = []
@@ -211,15 +222,32 @@ class AgentRuntime:
         if not relevant_agents:
             return
 
+        now = time.monotonic()
+        agents_to_run: list[BaseAgent] = []
         for agent in relevant_agents:
+            if event.event_type == "environment.state_refresh":
+                existing = self._active_tasks.get(agent.agent_id)
+                if existing is not None and not existing.done():
+                    continue
+                last_started_at = self._last_environment_episode_started_at.get(agent.agent_id, 0.0)
+                if (now - last_started_at) * 1000 < self.environment_debounce_ms:
+                    continue
+            agents_to_run.append(agent)
+
+        if not agents_to_run:
+            return
+
+        for agent in agents_to_run:
             existing = self._active_tasks.get(agent.agent_id)
             if existing is not None and not existing.done():
                 existing.cancel()
 
-        task = asyncio.create_task(self._run_episode(event, relevant_agents))
+        task = asyncio.create_task(self._run_episode(event, agents_to_run))
         self._background_tasks.add(task)
-        for agent in relevant_agents:
+        for agent in agents_to_run:
             self._active_tasks[agent.agent_id] = task
+            if event.event_type == "environment.state_refresh":
+                self._last_environment_episode_started_at[agent.agent_id] = now
 
         def _cleanup(done_task: asyncio.Task[None], agent_ids: list[str]) -> None:
             self._background_tasks.discard(done_task)
@@ -227,7 +255,7 @@ class AgentRuntime:
                 if self._active_tasks.get(agent_id) is done_task:
                     self._active_tasks.pop(agent_id, None)
 
-        task.add_done_callback(lambda done_task, agent_ids=[agent.agent_id for agent in relevant_agents]: _cleanup(done_task, agent_ids))
+        task.add_done_callback(lambda done_task, agent_ids=[agent.agent_id for agent in agents_to_run]: _cleanup(done_task, agent_ids))
 
     async def _run_episode(self, root_event: SimEvent, agents: list[BaseAgent]) -> None:
         if self.state_manager is None or self.publish_event is None or self.conn is None:
@@ -240,7 +268,7 @@ class AgentRuntime:
 
         for agent in agents:
             self._ensure_agent_state(agent)
-            self._set_agent_thinking(agent, root_event.correlation_id)
+            self._set_agent_thinking(agent, root_event.correlation_id, root_event.event_type)
         await self._broadcast_agent_status()
 
         # 同一根事件下的 agent episode 并发执行，避免慢 provider 把整条因果链串行拖死。
@@ -578,7 +606,7 @@ class AgentRuntime:
             self.state_manager.world.agents[agent.agent_id] = entry
         return entry
 
-    def _set_agent_thinking(self, agent: BaseAgent, correlation_id: str) -> None:
+    def _set_agent_thinking(self, agent: BaseAgent, correlation_id: str, trigger_event_type: str) -> None:
         entry = self._ensure_agent_state(agent)
         entry.status = "thinking"
         entry.mode = "llm"
@@ -586,6 +614,10 @@ class AgentRuntime:
         entry.active_correlation_id = correlation_id
         entry.last_reasoning_step = "reasoning.perception_snapshot"
         entry.last_fallback_reason = None
+        entry.last_latency_ms = None
+        entry.last_trigger_event = trigger_event_type
+        entry.provider = getattr(self.llm_provider, "provider_name", "disabled")
+        entry.provider_configured = self.is_provider_configured
 
     def _update_reasoning_step(self, agent_id: str, event_type: str) -> None:
         if self.state_manager is None:
@@ -614,6 +646,10 @@ class AgentRuntime:
         entry.last_action = last_action
         entry.active_correlation_id = None
         entry.last_fallback_reason = envelope.fallback_reason
+        entry.provider = getattr(self.llm_provider, "provider_name", envelope.provider_name)
+        entry.provider_configured = self.is_provider_configured
+        entry.last_latency_ms = envelope.latency_ms
+        entry.last_trigger_event = envelope.trigger_event_type
 
     def _set_agent_idle(self, agent_id: str) -> None:
         if self.state_manager is None:
@@ -622,6 +658,8 @@ class AgentRuntime:
         if entry is not None:
             entry.status = "idle"
             entry.active_correlation_id = None
+            entry.provider = getattr(self.llm_provider, "provider_name", entry.provider)
+            entry.provider_configured = self.is_provider_configured
 
     async def _broadcast_agent_status(self) -> None:
         if self.conn is None or self.state_manager is None:

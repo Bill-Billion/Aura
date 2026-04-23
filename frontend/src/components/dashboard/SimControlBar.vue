@@ -7,8 +7,16 @@ const simulationStore = useSimulationStore()
 const { sendCommand } = useWebSocket()
 
 const isRunning = computed(() => simulationStore.isRunning)
-const currentSpeed = computed(() => simulationStore.speed)
-const speedOptions = [0.5, 1, 2, 5]
+const currentMode = computed(() => simulationStore.mode)
+const simulatedDtSeconds = computed(() => simulationStore.simulatedDtSeconds)
+const modeOptions = [
+  { value: 'observe', label: '观察', desc: '每秒推进 30 秒' },
+  { value: 'demo', label: '演示', desc: '每秒推进 120 秒' },
+] as const
+const pausedHint = computed(() => {
+  const seconds = simulatedDtSeconds.value
+  return `仿真未开始 · 当前${currentMode.value === 'observe' ? '观察' : '演示'}模式 · 启动后每秒推进 ${seconds} 秒`
+})
 
 function startSimulation() {
   sendCommand('CMD_SIM_START')
@@ -22,9 +30,9 @@ function resetSimulation() {
   sendCommand('CMD_SIM_RESET')
 }
 
-function setSpeed(speed: number) {
-  simulationStore.setSpeed(speed)
-  sendCommand('CMD_SIM_SPEED', { speed })
+function setMode(mode: 'observe' | 'demo') {
+  simulationStore.setMode(mode)
+  sendCommand('CMD_SIM_MODE', { mode })
 }
 </script>
 
@@ -35,17 +43,18 @@ function setSpeed(speed: number) {
       <button class="sim-btn" :disabled="!isRunning" @click="pauseSimulation">暂停</button>
       <button class="sim-btn" @click="resetSimulation">重置</button>
     </div>
-    <div class="sim-control__group sim-control__group--speed">
+    <div class="sim-control__group sim-control__group--mode">
       <button
-        v-for="sp in speedOptions"
-        :key="sp"
-        class="sim-btn sim-btn--speed"
-        :class="{ active: currentSpeed === sp }"
-        @click="setSpeed(sp)"
+        v-for="item in modeOptions"
+        :key="item.value"
+        class="sim-btn sim-btn--mode"
+        :class="{ active: currentMode === item.value }"
+        @click="setMode(item.value)"
       >
-        {{ sp }}x
+        {{ item.label }}
       </button>
     </div>
+    <p v-if="!isRunning" class="sim-control__hint">{{ pausedHint }}</p>
   </section>
 </template>
 
@@ -53,7 +62,8 @@ function setSpeed(speed: number) {
 .sim-control {
   display: inline-flex;
   align-items: center;
-  gap: 10px;
+  flex-wrap: wrap;
+  gap: 10px 12px;
   padding: 6px 10px;
 }
 
@@ -87,6 +97,12 @@ function setSpeed(speed: number) {
   border-color: rgba(255, 231, 74, 0.5);
   background: rgba(255, 231, 74, 0.08);
   color: var(--color-primary);
+}
+
+.sim-control__hint {
+  margin: 0;
+  font-size: 11px;
+  color: var(--color-text-secondary);
 }
 
 .sim-btn:active:not(:disabled) {

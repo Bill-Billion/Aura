@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.3.11] - 2026-04-22
+
+### Added
+
+- **Simulation mode contract**: 新增 `observe / demo` 双模式、`CMD_SIM_MODE` 命令、`simulation_mode / wall_tick_ms / simulated_dt_seconds` 世界状态字段，以及 `/api/health` 的运行时摘要
+- **Agent diagnostics**: `AGENT_STATUS` 和 `STATE_FULL.agents` 补充 `provider`、`provider_configured`、`last_latency_ms`、`last_trigger_event`，现在可以直接看出 MiniMax 是否真的在线
+- **Room-level scene feedback**: 3D 场景新增房间局部 halo、房间点光源和环境光调色，开始消费 `rooms.*` 与 `environment.*`，不再只有设备动画在动
+
+### Changed
+
+- **Local env loading**: 后端、本地起栈脚本和 Docker Compose 统一改成从仓库根目录 `.env.local / .env` 读取本地 provider 配置，不再依赖手工 shell export
+- **Simulation cadence**: 仿真改成固定墙钟节拍，默认 `observe` 每秒推进 30 秒、`demo` 每秒推进 120 秒；reset 也会把模式与显示状态一起归位
+- **User/environment scripts**: 用户行为改成半小时粒度日常脚本，环境仿真改成确定性的天气/室外温度日变化，并把显著环境变化阈值收紧到更适合 LLM 的级别
+- **Status UX**: 前端状态条和底部控制条现在会明确显示“仿真未开始 / 观察模式 / 演示模式 / Agent 是否在线”，暂停态不再像系统坏掉
+- **Dev stack startup**: `scripts/dev-stack.sh` 现在会优先使用宿主机 Node 启动前端，并在每次启动时清空本轮日志，修掉 Codex 内置 Node 触发的 rolldown 原生 binding 签名冲突
+- **MiniMax stability**: Anthropic-compatible MiniMax 路径增加了超时缓冲、episode 外层缓冲和更紧凑的 LLM 上下文，Lighting / HVAC 在本地联调里都能稳定进入真实 LLM 链路
+
+### Testing
+
+- 后端 `pytest tests -q` 通过
+- 前端 `node --experimental-strip-types --test tests/*.test.ts` 通过
+- 前端 `PATH=\"/opt/homebrew/bin:$PATH\" npm run build` 通过
+- 本地 `./scripts/dev-stack.sh restart` 通过，`/api/health` 正常返回 `anthropic_compatible + MiniMax-M2.7 + configured=true`
+
 ## [0.1.3.9] - 2026-04-21
 
 ### Added
