@@ -46,7 +46,7 @@ function loadTexture(url: string): Promise<THREE.Texture> {
 
 // ======= Background sphere (gamemcu: uniform dark blue-gray #2d3040) =======
 const bgSphereMaterial = new THREE.MeshBasicMaterial({
-  color: new THREE.Color(0x252a35),
+  color: new THREE.Color(0x1e242d),
   side: THREE.BackSide,
   depthWrite: false,
   depthTest: false,  // render behind everything
@@ -58,8 +58,8 @@ const groundMaterial = new THREE.ShaderMaterial({
   vertexShader: groundVert,
   fragmentShader: groundFrag,
   uniforms: {
-    u_centerColor: { value: new THREE.Color(0x2a3040) },
-    u_edgeColor: { value: new THREE.Color(0x151a22) },
+    u_centerColor: { value: new THREE.Color(0x222830) },
+    u_edgeColor: { value: new THREE.Color(0x1e242d) },
     u_center: { value: new THREE.Vector2(0.48, 0.45) },
     u_radius: { value: 0.55 },
   },
@@ -283,7 +283,7 @@ onBeforeUnmount(() => {
 <template>
   <div class="w-full h-full absolute inset-0 scene-container">
     <TresCanvas
-      clear-color="#252a35"
+      clear-color="#1e242d"
       :antialias="true"
       :tone-mapping="1"
       :tone-mapping-exposure="1"
@@ -333,7 +333,7 @@ const RenderLoop = defineComponent({
     const { onBeforeRender } = useLoop()
 
     // Set scene.background directly (bypasses tone mapping!)
-    const bgColor = new THREE.Color(0x252a35)
+    const bgColor = new THREE.Color(0x1e242d)
     let bgSet = false
 
     onBeforeRender(({ delta }) => {

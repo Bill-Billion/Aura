@@ -18,6 +18,8 @@ function getStore() {
 
 // Floor shader materials (for u_lightIntensity)
 const floorMaterials = new Map<string, THREE.ShaderMaterial[]>()
+// HVAC nodes
+const hvacNodes = new Map<string, THREE.Object3D[]>()
 // Curtain nodes
 const curtainNodes = new Map<string, THREE.Object3D[]>()
 // Light intensity state
@@ -28,6 +30,7 @@ const DEVICE_FLOOR_MAP: Record<string, string> = {
   light_living_01: 'F1',
   light_bedroom_01: 'F2',
   curtain_living_01: 'F1',
+  ac_living_01: 'F1',
 }
 
 // Track which floors have been registered
@@ -51,6 +54,7 @@ function inferFloorFromDevice(deviceId: string): string | null {
 export function registerDeviceNodes(floorId: string, scene: THREE.Group) {
   const mats: THREE.ShaderMaterial[] = []
   const curtains: THREE.Object3D[] = []
+  const hvacs: THREE.Object3D[] = []
 
   scene.traverse((obj) => {
     if ((obj as THREE.Mesh).isMesh) {
@@ -60,16 +64,20 @@ export function registerDeviceNodes(floorId: string, scene: THREE.Group) {
       }
     }
     const name = obj.name.toLowerCase()
-    if (name === 'curtain' || name === 'curtain1' || name === 'curtain2') {
+    if (name === 'curtain' || name.startsWith('curtain')) {
       curtains.push(obj)
+    }
+    if (name.startsWith('ac') || name.startsWith('air')) {
+      hvacs.push(obj)
     }
   })
 
   floorMaterials.set(floorId, mats)
   curtainNodes.set(floorId, curtains)
+  hvacNodes.set(floorId, hvacs)
   lightCurrents.set(floorId, 1.0)
   registeredFloors.add(floorId)
-  console.log(`[DeviceAnim] ${floorId}: ${mats.length} shader mats, ${curtains.length} curtains`)
+  console.log(`[DeviceAnim] ${floorId}: ${mats.length} shader mats, ${curtains.length} curtains, ${hvacs.length} hvacs`)
 }
 
 // No watchers needed — we read worldStore directly every frame
@@ -126,17 +134,46 @@ export function updateDeviceAnimations(dt: number) {
     }
   }
 
-  // === CURTAINS: lerp scale ===
-  const curtainDevice = store.devices['curtain_living_01']
-  if (curtainDevice) {
-    const openPct = curtainDevice.state.extra.open_percent ?? 0
+  // === CURTAINS: iterate all curtain devices ===
+  for (const [deviceId, device] of Object.entries(store.devices)) {
+    if (device.type !== 'curtain') continue
+    const floorId = inferFloorFromDevice(deviceId)
+    if (!floorId) continue
+    const openPct = device.state.extra.open_percent ?? 0
     const targetScale = THREE.MathUtils.lerp(1.0, 0.15, openPct / 100)
 
-    const f1Curtains = curtainNodes.get('F1') ?? []
-    for (const node of f1Curtains) {
+    const floorCurtains = curtainNodes.get(floorId) ?? []
+    for (const node of floorCurtains) {
       node.traverse((child) => {
         if (child.name.toLowerCase().includes('curtain0')) {
           child.scale.z = THREE.MathUtils.lerp(child.scale.z, targetScale, 2 * dt)
+        }
+      })
+    }
+  }
+
+  // === HVAC: update emissive based on power/mode ===
+  for (const [deviceId, device] of Object.entries(store.devices)) {
+    if (device.type !== 'hvac') continue
+    const floorId = inferFloorFromDevice(deviceId)
+    if (!floorId) continue
+    const floorHvacs = hvacNodes.get(floorId) ?? []
+    const isOn = device.state.power
+    const mode = device.state.extra.mode
+    for (const node of floorHvacs) {
+      node.traverse((child) => {
+        if (!(child as THREE.Mesh).isMesh) return
+        const mat = (child as THREE.Mesh).material
+        if (!mat) return
+        // ShaderMaterial (from applyShaderMaterials) has no emissive — skip
+        if ((mat as THREE.ShaderMaterial).isShaderMaterial) return
+        const stdMat = mat as THREE.MeshStandardMaterial
+        if (!stdMat.emissive) return
+        if (isOn) {
+          stdMat.emissive.set(mode === 'heat' ? 0xef5350 : 0x4fc3f7)
+          stdMat.emissiveIntensity = THREE.MathUtils.lerp(stdMat.emissiveIntensity, 0.4, 3 * dt)
+        } else {
+          stdMat.emissiveIntensity = THREE.MathUtils.lerp(stdMat.emissiveIntensity, 0, 3 * dt)
         }
       })
     }
