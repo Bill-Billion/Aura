@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.3.12] - 2026-04-28
+
+### Fixed
+
+- **Light control feedback**: 灯光和窗帘直控后会立即重算对应房间 `light_level`，F1/F2/F3 灯光不再只更新设备状态而不驱动 3D 房间光源。
+- **MiniMax output compatibility**: Anthropic-compatible provider 现在会把 MiniMax 常见的百分制 `confidence` 归一化到 `0..1`，避免 `confidence: 95` 被误判为非法输出并触发规则回退。
+- **WebSocket idle stability**: 移除 60 秒空闲关闭，前端不再因为观察侧栏或暂停态长时间无命令而反复重连。
+
+### Changed
+
+- **Simulation cadence**: 默认节奏改为真实墙钟每 2 秒一个 tick；`observe` 每 tick 推进 10 秒，`demo` 每 tick 推进 60 秒，让事件流和 LLM episode 更容易跟上。
+
+### Testing
+
+- 后端 `pytest tests -q` 通过
+- 前端 `node --experimental-strip-types --test tests/*.test.ts` 通过
+- 前端 `npm run build` 通过
+- 本地 `./scripts/dev-stack.sh restart` 通过，`/api/health` 返回 `wall_tick_ms=2000`、`simulated_dt_seconds=10.0`
+- WebSocket smoke 验证 `light_loft_01` 直控会返回 `rooms[loft].light_level` delta，真实 MiniMax episode 能产出非 fallback 的 `reasoning.intent_recognized`
+
 ## [0.1.3.11] - 2026-04-22
 
 ### Added
@@ -13,7 +33,7 @@ All notable changes to this project will be documented in this file.
 ### Changed
 
 - **Local env loading**: 后端、本地起栈脚本和 Docker Compose 统一改成从仓库根目录 `.env.local / .env` 读取本地 provider 配置，不再依赖手工 shell export
-- **Simulation cadence**: 仿真改成固定墙钟节拍，默认 `observe` 每秒推进 30 秒、`demo` 每秒推进 120 秒；reset 也会把模式与显示状态一起归位
+- **Simulation cadence**: 仿真改成固定墙钟节拍并引入 `observe / demo` 双模式；reset 也会把模式与显示状态一起归位。当前默认节奏见最新版本记录。
 - **User/environment scripts**: 用户行为改成半小时粒度日常脚本，环境仿真改成确定性的天气/室外温度日变化，并把显著环境变化阈值收紧到更适合 LLM 的级别
 - **Status UX**: 前端状态条和底部控制条现在会明确显示“仿真未开始 / 观察模式 / 演示模式 / Agent 是否在线”，暂停态不再像系统坏掉
 - **Dev stack startup**: `scripts/dev-stack.sh` 现在会优先使用宿主机 Node 启动前端，并在每次启动时清空本轮日志，修掉 Codex 内置 Node 触发的 rolldown 原生 binding 签名冲突

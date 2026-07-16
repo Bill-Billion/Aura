@@ -23,7 +23,7 @@ from backend.simulators.user_behavior import UserBehaviorSimulator
 class SimulationEngine:
     """Event-driven simulation orchestrator."""
 
-    TICK_INTERVAL = 1.0
+    TICK_INTERVAL = 2.0
     DEFAULT_MODE = "observe"
 
     def __init__(

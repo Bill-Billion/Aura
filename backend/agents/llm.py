@@ -377,6 +377,17 @@ def _normalize_agent_decision_payload(payload: dict[str, Any]) -> dict[str, Any]
 
     if "confidence" not in normalized:
         normalized["confidence"] = 0.6 if normalized.get("proposed_commands") else 0.4
+    else:
+        confidence = normalized["confidence"]
+        if isinstance(confidence, str):
+            confidence = confidence.strip().removesuffix("%")
+        try:
+            confidence_value = float(confidence)
+        except (TypeError, ValueError):
+            confidence_value = 0.6 if normalized.get("proposed_commands") else 0.4
+        if confidence_value > 1.0 and confidence_value <= 100.0:
+            confidence_value = confidence_value / 100.0
+        normalized["confidence"] = max(0.0, min(confidence_value, 1.0))
 
     if "intent" not in normalized or not isinstance(normalized.get("intent"), str) or not normalized["intent"].strip():
         if isinstance(normalized.get("explanation"), str) and normalized["explanation"].strip():

@@ -27,6 +27,7 @@ from backend.engine.event_bus import EventBus, SimEvent
 from backend.engine.simulation import SimulationEngine
 from backend.engine.state_manager import StateManager
 from backend.models.schemas import ErrorMessage, WSMessage
+from backend.simulators.environment import calculate_room_light_level
 
 
 # ---------------------------------------------------------------------------
@@ -67,8 +68,8 @@ def _simulation_health() -> dict[str, object]:
             "is_running": False,
             "mode": "observe",
             "speed": 1.0,
-            "wall_tick_ms": 1000,
-            "simulated_dt_seconds": 30.0,
+            "wall_tick_ms": 2000,
+            "simulated_dt_seconds": 10.0,
         }
 
     return {
@@ -103,6 +104,44 @@ def _runtime_health() -> dict[str, object]:
         "simulation": _simulation_health(),
         "llm": _llm_health(),
     }
+
+
+def _command_affects_room_light(
+    device,
+    *,
+    action: str,
+    params: dict[str, object],
+    property_path: str,
+) -> bool:
+    normalized_property = property_path.removeprefix("extra.")
+
+    if device.type == "light":
+        return (
+            action in {"turn_on", "turn_off"}
+            or "brightness" in params
+            or normalized_property in {"power", "brightness"}
+        )
+
+    if device.type == "curtain":
+        return "open_percent" in params or normalized_property == "open_percent"
+
+    return False
+
+
+def _append_room_light_feedback(device, deltas: list) -> None:
+    assert state_manager is not None
+    room_id = device.location.room
+    if room_id not in state_manager.world.rooms:
+        return
+
+    deltas.extend(
+        state_manager.apply_path_update(
+            caused_by="user",
+            path=f"rooms[{room_id}].light_level",
+            new_value=calculate_room_light_level(state_manager.world, room_id),
+            reason="apply device light feedback",
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -206,12 +245,7 @@ async def ws_simulation(ws: WebSocket) -> None:
 
     try:
         while True:
-            try:
-                raw = await asyncio.wait_for(ws.receive_json(), timeout=60.0)
-            except asyncio.TimeoutError:
-                log.warning("ws_timeout")
-                await ws.close(code=1000, reason="idle timeout")
-                break
+            raw = await ws.receive_json()
 
             msg_type = raw.get("type", "")
             payload = raw.get("payload", {})
@@ -266,6 +300,13 @@ async def ws_simulation(ws: WebSocket) -> None:
                                     "user", device_id, f"extra.{k}", v
                                 )
                             )
+                    if _command_affects_room_light(
+                        device,
+                        action=action,
+                        params=params,
+                        property_path="",
+                    ):
+                        _append_room_light_feedback(device, deltas)
                 elif device and prop and value is not None:
                     error_code, error_message = validate_device_command(
                         device,
@@ -285,6 +326,13 @@ async def ws_simulation(ws: WebSocket) -> None:
                     deltas = state_manager.apply_action(
                         "user", device_id, prop, value
                     )
+                    if _command_affects_room_light(
+                        device,
+                        action="",
+                        params={},
+                        property_path=prop,
+                    ):
+                        _append_room_light_feedback(device, deltas)
                 else:
                     await _send_ws_error(
                         ws,

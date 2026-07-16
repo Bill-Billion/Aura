@@ -10,7 +10,7 @@ from backend.engine.state import (
     RoomState,
     WorldState,
 )
-from backend.simulators.environment import EnvironmentSimulator
+from backend.simulators.environment import EnvironmentSimulator, calculate_room_light_level
 
 
 def _make_world(
@@ -128,3 +128,16 @@ class TestLightLevel:
 
         assert updates["rooms[living_room].light_level"] == 0.0
         assert world.rooms["living_room"].light_level == 300.0
+
+    def test_calculate_room_light_level_matches_step_for_direct_feedback(self):
+        world = _make_world(
+            light_brightness=70.0,
+            light_power=True,
+            curtain_open=25.0,
+            time_of_day="12:00",
+        )
+        sim = EnvironmentSimulator()
+
+        updates = sim.step(world, dt=1.0)
+
+        assert calculate_room_light_level(world, "living_room") == updates["rooms[living_room].light_level"]

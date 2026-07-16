@@ -55,3 +55,15 @@ async def test_timer_tick_payload_reflects_speed_and_reset():
 
     timer.reset()
     assert timer.current_tick == 0
+
+
+def test_timer_defaults_to_slower_observe_mode():
+    async def publish(event):
+        return event
+
+    timer = SimulatorTimer(publish_event=publish)
+
+    assert timer.tick_interval == 2.0
+    assert timer.simulated_dt == 10.0
+    timer.set_mode("demo")
+    assert timer.simulated_dt == 60.0

@@ -9,13 +9,14 @@ const { sendCommand } = useWebSocket()
 const isRunning = computed(() => simulationStore.isRunning)
 const currentMode = computed(() => simulationStore.mode)
 const simulatedDtSeconds = computed(() => simulationStore.simulatedDtSeconds)
+const wallTickSeconds = computed(() => Math.max(1, simulationStore.wallTickMs / 1000))
 const modeOptions = [
-  { value: 'observe', label: '观察', desc: '每秒推进 30 秒' },
-  { value: 'demo', label: '演示', desc: '每秒推进 120 秒' },
+  { value: 'observe', label: '观察', desc: '每 2 秒推进 10 秒' },
+  { value: 'demo', label: '演示', desc: '每 2 秒推进 60 秒' },
 ] as const
 const pausedHint = computed(() => {
   const seconds = simulatedDtSeconds.value
-  return `仿真未开始 · 当前${currentMode.value === 'observe' ? '观察' : '演示'}模式 · 启动后每秒推进 ${seconds} 秒`
+  return `仿真未开始 · 当前${currentMode.value === 'observe' ? '观察' : '演示'}模式 · 启动后每 ${wallTickSeconds.value} 秒推进 ${seconds} 秒`
 })
 
 function startSimulation() {
@@ -51,7 +52,8 @@ function setMode(mode: 'observe' | 'demo') {
         :class="{ active: currentMode === item.value }"
         @click="setMode(item.value)"
       >
-        {{ item.label }}
+        <span>{{ item.label }}</span>
+        <small>{{ item.desc }}</small>
       </button>
     </div>
     <p v-if="!isRunning" class="sim-control__hint">{{ pausedHint }}</p>
@@ -73,6 +75,10 @@ function setMode(mode: 'observe' | 'demo') {
 }
 
 .sim-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
   min-height: 32px;
   padding: 0 12px;
   border: 1px solid var(--color-border);
@@ -81,6 +87,11 @@ function setMode(mode: 'observe' | 'demo') {
   color: var(--color-text-secondary);
   cursor: pointer;
   transition: all var(--transition-fast);
+}
+
+.sim-btn small {
+  font-size: 10px;
+  color: var(--color-text-muted);
 }
 
 .sim-btn:hover:not(:disabled) {

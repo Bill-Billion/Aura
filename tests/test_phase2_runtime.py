@@ -197,6 +197,7 @@ async def test_user_activity_change_emits_reasoning_chain_and_action_feedback():
 
     light = engine.state_manager.world.devices["light_living_01"]
     assert light.state.extra["brightness"] == 70
+    assert engine.state_manager.world.rooms["living_room"].light_level == 560.0
 
 
 @pytest.mark.anyio

@@ -14,8 +14,8 @@ export const useWorldStore = defineStore('world', () => {
   const simulationTick = ref(0)
   const simulationSpeed = ref(1)
   const simulationMode = ref<'observe' | 'demo'>('observe')
-  const wallTickMs = ref(1000)
-  const simulatedDtSeconds = ref(30)
+  const wallTickMs = ref(2000)
+  const simulatedDtSeconds = ref(10)
   const isRunning = ref(false)
   const sceneId = ref('')
 

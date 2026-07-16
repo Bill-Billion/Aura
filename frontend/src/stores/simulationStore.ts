@@ -8,8 +8,8 @@ export const useSimulationStore = defineStore('simulation', () => {
   const isRunning = ref(false)
   const speed = ref(1)
   const mode = ref<'observe' | 'demo'>('observe')
-  const wallTickMs = ref(1000)
-  const simulatedDtSeconds = ref(30)
+  const wallTickMs = ref(2000)
+  const simulatedDtSeconds = ref(10)
   const connectionStatus = ref<ConnectionStatus>('disconnected')
 
   // --- Actions ---
@@ -41,8 +41,8 @@ export const useSimulationStore = defineStore('simulation', () => {
     isRunning.value = false
     speed.value = 1
     mode.value = 'observe'
-    wallTickMs.value = 1000
-    simulatedDtSeconds.value = 30
+    wallTickMs.value = 2000
+    simulatedDtSeconds.value = 10
     connectionStatus.value = 'disconnected'
   }
 

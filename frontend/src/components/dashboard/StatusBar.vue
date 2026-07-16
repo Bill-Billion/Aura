@@ -19,6 +19,7 @@ const isRunning = computed(() => simulationStore.isRunning)
 const connectionStatus = computed(() => simulationStore.connectionStatus)
 const simulationMode = computed(() => simulationStore.mode)
 const simulatedDtSeconds = computed(() => simulationStore.simulatedDtSeconds)
+const wallTickSeconds = computed(() => Math.max(1, simulationStore.wallTickMs / 1000))
 const primaryAgent = computed(() => Object.values(agentStore.agents)[0] ?? null)
 
 const weatherText = computed(() => {
@@ -64,7 +65,7 @@ const agentLabel = computed(() => {
     <div class="status-bar__meta">
       <div class="status-pill" :class="{ live: isRunning }">
         <span class="status-pill__dot" />
-        <span>{{ isRunning ? `模拟运行中 · 每秒推进 ${simulatedDtSeconds} 秒` : '仿真未开始' }}</span>
+        <span>{{ isRunning ? `模拟运行中 · 每 ${wallTickSeconds} 秒推进 ${simulatedDtSeconds} 秒` : '仿真未开始' }}</span>
       </div>
       <div class="status-pill" :class="connectionStatus">
         <span class="status-pill__dot" />

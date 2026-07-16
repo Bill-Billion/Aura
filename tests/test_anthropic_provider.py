@@ -189,6 +189,48 @@ async def test_anthropic_provider_normalizes_common_command_aliases():
 
 
 @pytest.mark.anyio
+async def test_anthropic_provider_normalizes_percent_confidence():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(
+                            {
+                                "intent": "turn on living room light",
+                                "confidence": 95,
+                                "task_steps": ["turn on light"],
+                                "proposed_commands": [
+                                    {
+                                        "device_id": "light_living_01",
+                                        "property": "power",
+                                        "value": True,
+                                        "reason": "occupied room",
+                                    }
+                                ],
+                                "explanation": "The room is occupied.",
+                                "needs_coordination": False,
+                            }
+                        ),
+                    }
+                ]
+            },
+        )
+
+    provider = AnthropicCompatibleProvider(
+        api_key="test-key",
+        base_url="https://api.minimax.io/anthropic",
+        transport=httpx.MockTransport(handler),
+    )
+
+    decision = await provider.generate_decision(_request())
+
+    assert decision.confidence == 0.95
+
+
+@pytest.mark.anyio
 async def test_anthropic_provider_invalid_output_exposes_preview():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(

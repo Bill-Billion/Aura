@@ -33,6 +33,26 @@ def _parse_time_hour(time_of_day: str) -> float:
     return int(hour) + int(minute) / 60.0
 
 
+def calculate_room_light_level(state: WorldState, room_id: str) -> float:
+    """计算单个房间当前光照，用于 tick 和用户直控后的即时反馈。"""
+
+    hour = _parse_time_hour(state.environment.time_of_day)
+    brightness = 0.0
+    curtain_pct = 100.0
+
+    for device in state.devices.values():
+        if device.location.room != room_id:
+            continue
+        if device.type == "light" and device.state.power:
+            brightness += float(device.state.extra.get("brightness", 0.0))
+        elif device.type == "curtain":
+            curtain_pct = float(device.state.extra.get("open_percent", curtain_pct))
+
+    artificial_lux = brightness * LIGHT_LUX_PER_BRIGHTNESS
+    natural_contribution = _natural_light_lux(hour) * (curtain_pct / 100.0)
+    return round(artificial_lux + natural_contribution, 2)
+
+
 def _weather_for_hour(hour: float) -> str:
     if 6 <= hour < 11:
         return "clear"
@@ -77,21 +97,6 @@ class EnvironmentSimulator:
                     "mode": str(device.state.extra.get("mode", "cool")),
                 }
 
-        curtain_by_room: dict[str, float] = {}
-        for device in state.devices.values():
-            if device.type == "curtain":
-                curtain_by_room[device.location.room] = float(
-                    device.state.extra.get("open_percent", 100.0)
-                )
-
-        brightness_by_room: dict[str, float] = {}
-        for device in state.devices.values():
-            if device.type == "light" and device.state.power:
-                room = device.location.room
-                brightness = float(device.state.extra.get("brightness", 0.0))
-                brightness_by_room[room] = brightness_by_room.get(room, 0.0) + brightness
-
-        natural_lux = _natural_light_lux(hour)
         updates: dict[str, float | str] = {
             "environment.weather": weather,
             "environment.outdoor_temp": outdoor_temp,
@@ -113,13 +118,7 @@ class EnvironmentSimulator:
                 elif mode == "heat" and next_temperature < target:
                     next_temperature += HVAC_HEAT_RATE * dt * (target - next_temperature)
 
-            artificial_lux = brightness_by_room.get(room_id, 0.0) * LIGHT_LUX_PER_BRIGHTNESS
-            curtain_pct = curtain_by_room.get(room_id, 100.0)
-            natural_contribution = natural_lux * (curtain_pct / 100.0)
-
             updates[f"rooms[{room_id}].temperature"] = round(next_temperature, 2)
-            updates[f"rooms[{room_id}].light_level"] = round(
-                artificial_lux + natural_contribution, 2
-            )
+            updates[f"rooms[{room_id}].light_level"] = calculate_room_light_level(state, room_id)
 
         return updates

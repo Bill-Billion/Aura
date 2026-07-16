@@ -90,8 +90,8 @@ class WorldState(BaseModel):
     simulation_tick: int = 0
     simulation_speed: float = 1.0
     simulation_mode: Literal["observe", "demo"] = "observe"
-    wall_tick_ms: int = 1000
-    simulated_dt_seconds: float = 30.0
+    wall_tick_ms: int = 2000
+    simulated_dt_seconds: float = 10.0
     is_running: bool = False
     scene_id: str = ""
     environment: EnvironmentState = Field(default_factory=EnvironmentState)

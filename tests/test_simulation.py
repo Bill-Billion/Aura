@@ -173,7 +173,9 @@ class TestSimulationEngine:
         await engine.stop()
 
         assert world.simulation_tick >= initial_tick + 1
-        assert world.environment.time_of_day != "12:00"
+        assert world.wall_tick_ms == 10
+        assert world.simulated_dt_seconds == 10.0
+        assert world.environment.weather == "cloudy"
         assert engine.conn.broadcast.call_count >= 1
 
     @pytest.mark.anyio

@@ -24,8 +24,8 @@ class SimulatorTimer:
     def __init__(
         self,
         publish_event: PublishEvent,
-        tick_interval: float = 1.0,
-        simulated_dt: float = 30.0,
+        tick_interval: float = 2.0,
+        simulated_dt: float = 10.0,
         *,
         default_mode: str = "observe",
         mode_specs: dict[str, SimulationModeSpec] | None = None,
@@ -34,7 +34,7 @@ class SimulatorTimer:
         self.tick_interval = tick_interval
         self._mode_specs = mode_specs or {
             "observe": SimulationModeSpec(mode="observe", speed=1.0, simulated_dt=simulated_dt),
-            "demo": SimulationModeSpec(mode="demo", speed=4.0, simulated_dt=simulated_dt * 4),
+            "demo": SimulationModeSpec(mode="demo", speed=4.0, simulated_dt=simulated_dt * 6),
         }
         self.mode = default_mode if default_mode in self._mode_specs else "observe"
         current_spec = self._mode_specs[self.mode]

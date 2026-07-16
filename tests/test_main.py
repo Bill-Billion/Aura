@@ -213,6 +213,22 @@ def test_ws_cmd_device_control_set_state(client):
         assert data["type"] == "STATE_DELTA"
 
 
+def test_ws_light_control_updates_room_light_feedback_immediately(client):
+    with _connect(client) as ws:
+        ws.receive_json()  # initial STATE_FULL
+        ws.send_json({
+            "type": "CMD_DEVICE_CONTROL",
+            "payload": {"device_id": "light_loft_01", "action": "turn_on"},
+        })
+
+        data = ws.receive_json()
+
+        assert data["type"] == "STATE_DELTA"
+        paths = {delta["path"] for delta in data["payload"]["deltas"]}
+        assert "devices[light_loft_01].state.power" in paths
+        assert "rooms[loft].light_level" in paths
+
+
 def test_ws_cmd_device_control_updates_fan_state(client):
     with _connect(client) as ws:
         ws.receive_json()  # initial STATE_FULL

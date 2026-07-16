@@ -24,6 +24,7 @@ from backend.engine.event_bus import EventBus, SimEvent
 from backend.engine.state import AgentRuntimeState, WorldState
 from backend.engine.state_manager import DeltaChange, StateManager
 from backend.models.schemas import WSMessage
+from backend.simulators.environment import calculate_room_light_level
 
 PublishEvent = Callable[[SimEvent], Awaitable[SimEvent]]
 
@@ -48,6 +49,15 @@ class TriggerClassifier:
             reasons = event.data.get("significant_change_reasons")
             return isinstance(reasons, list) and len(reasons) > 0
         return False
+
+
+def _device_command_affects_room_light(device_type: str, property_path: str) -> bool:
+    normalized_property = property_path.removeprefix("extra.")
+    if device_type == "light":
+        return normalized_property in {"power", "brightness"}
+    if device_type == "curtain":
+        return normalized_property == "open_percent"
+    return False
 
 
 class AgentRuntime:
@@ -361,6 +371,18 @@ class AgentRuntime:
                     )
                 except KeyError:
                     continue
+                device = self.state_manager.world.devices.get(command.device_id)
+                if device is not None and _device_command_affects_room_light(device.type, command.property):
+                    room_id = device.location.room
+                    if room_id in self.state_manager.world.rooms:
+                        deltas.extend(
+                            self.state_manager.apply_path_update(
+                                caused_by=agent_id,
+                                path=f"rooms[{room_id}].light_level",
+                                new_value=calculate_room_light_level(self.state_manager.world, room_id),
+                                reason="apply device light feedback",
+                            )
+                        )
 
                 pending_deltas.extend(deltas)
                 last_action = command.reason or last_action
