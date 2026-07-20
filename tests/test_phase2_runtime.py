@@ -114,6 +114,7 @@ def _make_world() -> WorldState:
             id="light_living_01",
             type="light",
             location=Location3D(room="living_room"),
+            capabilities=["power", "brightness", "color_temp"],
             state=DeviceStateValues(
                 power=True,
                 extra={"brightness": 0, "color_temp": 4000},
@@ -123,6 +124,7 @@ def _make_world() -> WorldState:
             id="ac_living_01",
             type="hvac",
             location=Location3D(room="living_room"),
+            capabilities=["power", "target_temp", "mode", "speed"],
             state=DeviceStateValues(
                 power=True,
                 extra={"target_temp": 24.0, "mode": "cool"},

@@ -144,6 +144,9 @@ class SimulationEngine:
 
     async def reset(self, new_state_manager: StateManager | None = None) -> None:
         await self.pause()
+        # 审计必修②：cancel-before-swap——先取消并落账在飞 episode，
+        # 再替换世界，否则旧任务可能在 swap 之后、cancel 之前写入新世界。
+        await self.agent_runtime.cancel_active_episodes()
         if new_state_manager is not None:
             self.state_manager = new_state_manager
         else:

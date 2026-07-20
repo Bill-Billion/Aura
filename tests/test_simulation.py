@@ -211,6 +211,14 @@ class TestSimulationEngine:
         assert engine.timer.current_tick == 0
         assert engine.is_running is False
 
+        # 没有在飞 episode 时，reset 不应发出取消事件。
+        sim_event_types = [
+            call.args[0].payload["event_type"]
+            for call in engine.conn.broadcast.call_args_list
+            if call.args[0].type == "SIM_EVENT"
+        ]
+        assert "system.episode_cancelled" not in sim_event_types
+
     @pytest.mark.anyio
     async def test_next_time_of_day_wraps_at_midnight(self):
         engine = _make_engine()

@@ -17,8 +17,9 @@ from backend.agents.llm import (
     OpenAIResponsesProvider,
 )
 from backend.agents.memory import AgentMemoryStore
-from backend.agents.types import AgentDecisionEnvelope
+from backend.agents.types import AgentCommandProposal, AgentDecisionEnvelope
 from backend.api.ws import ConnectionManager
+from backend.config.device_registry import validate_device_command
 from backend.core.logging import log
 from backend.engine.event_bus import EventBus, SimEvent
 from backend.engine.state import AgentRuntimeState, WorldState
@@ -100,6 +101,9 @@ class AgentRuntime:
         self._subscribed_event_types: set[str] = set()
         self._active_tasks: dict[str, asyncio.Task[None]] = {}
         self._background_tasks: set[asyncio.Task[None]] = set()
+        # 每条 episode task 记 correlation/root/agents，取消时才能落账
+        # system.episode_cancelled（取消的协程自身只会收到 CancelledError）。
+        self._episode_meta: dict[asyncio.Task[None], dict[str, Any]] = {}
         self.environment_debounce_ms = int(os.getenv("AGENT_ENV_DEBOUNCE_MS", "5000"))
         self._last_environment_episode_started_at: dict[str, float] = {}
 
@@ -162,6 +166,68 @@ class AgentRuntime:
     def reset(self) -> None:
         self.memory_store.clear()
 
+    async def cancel_active_episodes(self, reason: str = "simulation_reset") -> None:
+        """Cancel in-flight episode tasks and surface each as system.episode_cancelled.
+
+        审计必修②：调用方必须在世界替换之前 await 本方法（cancel-before-swap），
+        否则旧 episode 恢复后会把命令写进重置后的新世界。
+        """
+        tasks = {task for task in self._active_tasks.values() if not task.done()} | {
+            task for task in self._background_tasks if not task.done()
+        }
+        cancelled_episodes = [
+            self._episode_meta[task] for task in tasks if task in self._episode_meta
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            # 取消可能卡在慢 provider/坏连接的收尾上，用 episode 超时同量级兜底。
+            timeout_s = self.episode_timeout_ms / 1000 if self.episode_timeout_ms else None
+            try:
+                results = await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=timeout_s,
+                )
+            except asyncio.TimeoutError:
+                log.warning(
+                    "episode_cancel_timeout",
+                    pending=len([task for task in tasks if not task.done()]),
+                )
+                results = []
+            for result in results:
+                # CancelledError 是 BaseException，这里只暴露真正的收尾异常。
+                if isinstance(result, Exception):
+                    log.warning("episode_cancel_teardown_error", error=str(result))
+        self._active_tasks.clear()
+        self._background_tasks.clear()
+        self._episode_meta.clear()
+        self._last_environment_episode_started_at.clear()
+
+        if not cancelled_episodes:
+            return
+
+        for episode in cancelled_episodes:
+            if self.publish_event is not None and self.state_manager is not None:
+                await self.publish_event(
+                    SimEvent(
+                        event_type="system.episode_cancelled",
+                        source="agent_runtime",
+                        timestamp=float(self.state_manager.world.simulation_tick),
+                        wall_time=time.time(),
+                        correlation_id=episode["correlation_id"],
+                        causal_parent=episode["root_event_id"],
+                        priority=2,
+                        data={
+                            "correlation_id": episode["correlation_id"],
+                            "agent_ids": list(episode["agent_ids"]),
+                            "reason": reason,
+                        },
+                    )
+                )
+            for agent_id in episode["agent_ids"]:
+                self._set_agent_idle(agent_id)
+        await self._broadcast_agent_status()
+
     async def close(self) -> None:
         self._unsubscribe_handlers()
         tasks = {task for task in self._active_tasks.values() if not task.done()} | {
@@ -173,6 +239,7 @@ class AgentRuntime:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._active_tasks.clear()
         self._background_tasks.clear()
+        self._episode_meta.clear()
         self._last_environment_episode_started_at.clear()
 
     async def step(self, world_state: WorldState) -> list[dict]:
@@ -254,6 +321,11 @@ class AgentRuntime:
 
         task = asyncio.create_task(self._run_episode(event, agents_to_run))
         self._background_tasks.add(task)
+        self._episode_meta[task] = {
+            "correlation_id": event.correlation_id,
+            "root_event_id": event.event_id,
+            "agent_ids": [agent.agent_id for agent in agents_to_run],
+        }
         for agent in agents_to_run:
             self._active_tasks[agent.agent_id] = task
             if event.event_type == "environment.state_refresh":
@@ -261,6 +333,7 @@ class AgentRuntime:
 
         def _cleanup(done_task: asyncio.Task[None], agent_ids: list[str]) -> None:
             self._background_tasks.discard(done_task)
+            self._episode_meta.pop(done_task, None)
             for agent_id in agent_ids:
                 if self._active_tasks.get(agent_id) is done_task:
                     self._active_tasks.pop(agent_id, None)
@@ -342,6 +415,29 @@ class AgentRuntime:
 
             last_action = envelope.explanation
             for command in winning_commands:
+                # 审计必修①：agent 路径和 UI 路径共用 validate_device_command，
+                # 校验必须发生在 action.device_control 之前（spec §10 步骤 5 先于步骤 6）。
+                device = self.state_manager.world.devices.get(command.device_id)
+                if device is None:
+                    error_code: str | None = "UNKNOWN_DEVICE"
+                    error_message = f"设备 {command.device_id} 不存在"
+                else:
+                    error_code, error_message = validate_device_command(
+                        device,
+                        action="",
+                        property_path=command.property,
+                    )
+                if error_code:
+                    await self._emit_command_failed(
+                        root_event=root_event,
+                        agent_id=agent_id,
+                        causal_parent=execution_event.event_id,
+                        command=command,
+                        error_code=error_code,
+                        reason=error_message,
+                    )
+                    continue
+
                 action_event = await self.publish_event(
                     SimEvent(
                         event_type="action.device_control",
@@ -369,7 +465,17 @@ class AgentRuntime:
                         new_value=command.value,
                         reason=command.reason,
                     )
-                except KeyError:
+                except KeyError as exc:
+                    # 校验通过后设备仍可能在 apply 前消失（如并发 reset）；
+                    # 不再静默吞掉，转成同一结构化失败事件。
+                    await self._emit_command_failed(
+                        root_event=root_event,
+                        agent_id=agent_id,
+                        causal_parent=action_event.event_id,
+                        command=command,
+                        error_code="UNKNOWN_DEVICE",
+                        reason=str(exc),
+                    )
                     continue
                 device = self.state_manager.world.devices.get(command.device_id)
                 if device is not None and _device_command_affects_room_light(device.type, command.property):
@@ -590,6 +696,39 @@ class AgentRuntime:
             parent_id = fallback_event.event_id
 
         return parent_id
+
+    async def _emit_command_failed(
+        self,
+        *,
+        root_event: SimEvent,
+        agent_id: str,
+        causal_parent: str,
+        command: AgentCommandProposal,
+        error_code: str,
+        reason: str,
+    ) -> SimEvent:
+        log.warning(
+            "agent_command_rejected",
+            agent_id=agent_id,
+            device_id=command.device_id,
+            property=command.property,
+            error_code=error_code,
+            reason=reason,
+        )
+        return await self._emit_agent_event(
+            root_event=root_event,
+            agent_id=agent_id,
+            event_type="device.command_failed",
+            causal_parent=causal_parent,
+            data={
+                "agent_id": agent_id,
+                "device_id": command.device_id,
+                "property": command.property,
+                "value": command.value,
+                "error_code": error_code,
+                "reason": reason,
+            },
+        )
 
     async def _emit_agent_event(
         self,
