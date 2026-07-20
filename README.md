@@ -212,3 +212,10 @@ Aura 当前已经完成了事件驱动主链、双模式仿真、真实 LLM prov
 ## About Aura
 
 Aura 的方向很明确，用一套可视化、可回放、可观察的智能家居仿真环境，把 Agent 产品开发里最难调的那段链路做清楚。场景在变，状态在变，Agent 在推理，前端能把这条链路讲明白，这就是它现在的价值。
+
+## License
+
+Source code is released under the [MIT License](LICENSE). Bundled media assets
+have separate provenance — notably, the floor models under
+`frontend/public/models/` are third-party and NOT covered by MIT. See
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for details.

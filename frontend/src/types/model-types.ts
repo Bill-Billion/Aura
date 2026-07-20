@@ -55,27 +55,3 @@ export interface CameraPreset {
   smoothing?: number
   rotateSmoothing?: number
 }
-
-// ======= Scene Config =======
-
-export interface GamemcuSceneConfig {
-  id: string
-  name: string
-  floors: FloorConfig[]
-  camera: {
-    overview: CameraPreset
-    floorFocus: CameraPreset
-    floorOffset: [number, number, number]
-  }
-  textures: {
-    matcapRoughness: string
-    matcapReflection: string
-    hdr: string
-  }
-  lightsInfo: {
-    smoothMin: number
-    smoothMax: number
-    cornerRadius: number
-  }
-  lightSize: [number, number, number]
-}
