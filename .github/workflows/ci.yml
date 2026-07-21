@@ -12,6 +12,8 @@ concurrency:
 jobs:
   backend:
     runs-on: ubuntu-latest
+    # 兜底：即使 pytest 本身卡死（install/collect 阶段），也不占满 GitHub 默认 6h 上限
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -21,10 +23,13 @@ jobs:
           cache-dependency-path: backend/requirements.txt
       - run: pip install -r backend/requirements.txt
       # tests/ imports `backend.*`, so pytest must run from the repo root
-      - run: pytest tests/
+      # --timeout: WS 用例走阻塞式 ws.receive_json()，少发一条消息会挂死而不是失败，
+      # 必须由 pytest-timeout 把"挂起"转成"失败"，否则 CI 会一直跑到 job 上限
+      - run: pytest tests/ --timeout=120
 
   frontend:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: frontend

@@ -19,13 +19,22 @@ from backend.agents.llm import (
 from backend.agents.memory import AgentMemoryStore
 from backend.agents.types import AgentCommandProposal, AgentDecisionEnvelope
 from backend.api.ws import ConnectionManager
-from backend.config.device_registry import validate_device_command
 from backend.core.logging import log
 from backend.engine.event_bus import EventBus, SimEvent
 from backend.engine.state import AgentRuntimeState, WorldState
 from backend.engine.state_manager import DeltaChange, StateManager
+from backend.execution.command import (
+    CommandRecord,
+    CommandSource,
+    CommandStatus,
+    DeviceCommand,
+)
+from backend.execution.executor import (
+    ACTION_EVENT_TYPE,
+    FEEDBACK_EVENT_TYPE,
+    CommandExecutor,
+)
 from backend.models.schemas import WSMessage
-from backend.simulators.environment import calculate_room_light_level
 
 PublishEvent = Callable[[SimEvent], Awaitable[SimEvent]]
 
@@ -52,15 +61,6 @@ class TriggerClassifier:
         return False
 
 
-def _device_command_affects_room_light(device_type: str, property_path: str) -> bool:
-    normalized_property = property_path.removeprefix("extra.")
-    if device_type == "light":
-        return normalized_property in {"power", "brightness"}
-    if device_type == "curtain":
-        return normalized_property == "open_percent"
-    return False
-
-
 class AgentRuntime:
     """Manage agent registration, legacy step mode, and event-driven episodes."""
 
@@ -76,12 +76,16 @@ class AgentRuntime:
         arbiter: Arbiter | None = None,
         trigger_classifier: TriggerClassifier | None = None,
         episode_timeout_ms: int | None = None,
+        command_executor: CommandExecutor | None = None,
     ) -> None:
         self.agents: list[BaseAgent] = []
         self.event_bus = event_bus
         self.state_manager = state_manager
         self.conn = connection_manager
         self.publish_event = publish_event
+        # 引擎注入的那台唯一 executor；未注入时首次用到才自建一台并长期持有
+        # （S1 review finding-8：绝不再每个 agent 每条 episode 造一台）。
+        self.command_executor = command_executor
         self.llm_provider = llm_provider or self._build_default_provider()
         self.memory_store = memory_store or AgentMemoryStore()
         self.arbiter = arbiter or Arbiter()
@@ -153,15 +157,34 @@ class AgentRuntime:
         state_manager: StateManager,
         connection_manager: ConnectionManager,
         publish_event: PublishEvent,
+        command_executor: CommandExecutor | None = None,
     ) -> None:
         self.event_bus = event_bus
         self.state_manager = state_manager
         self.conn = connection_manager
         self.publish_event = publish_event
+        if command_executor is not None:
+            self.command_executor = command_executor
         self._refresh_subscriptions()
 
     def update_state_manager(self, state_manager: StateManager) -> None:
         self.state_manager = state_manager
+
+    def _resolve_executor(self) -> CommandExecutor:
+        """本 runtime 使用的唯一 executor（引擎注入优先）。
+
+        没有注入方（独立构造的 runtime / 单测）时自建一台并缓存：注册表照样要有寿命，
+        否则 cancel_pending 与跨调用取代在这条腿上依旧是空转。
+        """
+
+        if self.state_manager is None:
+            raise RuntimeError("AgentRuntime is not bound")
+        if self.command_executor is None:
+            self.command_executor = CommandExecutor(self.state_manager)
+        elif self.command_executor.state_manager is not self.state_manager:
+            # 世界被换过（reset）而 executor 没跟上：换绑并清空上一个 run 的残留。
+            self.command_executor.bind_state_manager(self.state_manager)
+        return self.command_executor
 
     def reset(self) -> None:
         self.memory_store.clear()
@@ -337,6 +360,19 @@ class AgentRuntime:
             for agent_id in agent_ids:
                 if self._active_tasks.get(agent_id) is done_task:
                     self._active_tasks.pop(agent_id, None)
+            # episode 崩了必须当场取回异常并落成日志：不取回只会得到解释器那条
+            # "Task exception was never retrieved"，agent 却已经停在半路——正是 S1 要
+            # 根治的静默失败类（review2 finding-1 的 agent 腿症状）。
+            if not done_task.cancelled():
+                error = done_task.exception()
+                if error is not None:
+                    log.error(
+                        "agent_episode_failed",
+                        agent_ids=agent_ids,
+                        error=repr(error),
+                    )
+                    for agent_id in agent_ids:
+                        self._set_agent_idle(agent_id)
 
         task.add_done_callback(lambda done_task, agent_ids=[agent.agent_id for agent in agents_to_run]: _cleanup(done_task, agent_ids))
 
@@ -413,99 +449,49 @@ class AgentRuntime:
             causal_heads[agent_id] = execution_event.event_id
             self._update_reasoning_step(agent_id, execution_event.event_type)
 
+            # 审计必修①：命令落地全部交给 CommandExecutor——六级校验、十态生命周期、
+            # 失败事件、房间光照 effect 都在那一条流水线里，runtime 不再自己 apply_action，
+            # 也不再有 `except KeyError: continue` 的静默吞失败。
+            command_source = (
+                CommandSource.RULE_FALLBACK
+                if envelope.mode == "fallback_rule_based"
+                else CommandSource.AGENT
+            )
+            # 唯一 executor 由引擎注入；per-agent 的 publish 包装按次传给 submit，
+            # 这样 _pending 注册表跨 agent、跨 episode 只有一份（S1 review finding-8）。
+            executor = self._resolve_executor()
+            agent_publish = self._agent_publish_event(agent_id, pending_deltas)
+
+            # 仲裁 loser 不再凭空消失：走 proposed→rejected，带上冲突详情。
+            for proposal in envelope.candidate_commands:
+                if any(proposal is winner for winner in winning_commands):
+                    continue
+                await self._reject_losing_command(
+                    root_event=root_event,
+                    agent_id=agent_id,
+                    agent_name=envelope.agent_name,
+                    source=command_source,
+                    proposal=proposal,
+                    causal_parent=coordination_event.event_id,
+                    conflicts=relevant_conflicts,
+                )
+
             last_action = envelope.explanation
             for command in winning_commands:
-                # 审计必修①：agent 路径和 UI 路径共用 validate_device_command，
-                # 校验必须发生在 action.device_control 之前（spec §10 步骤 5 先于步骤 6）。
-                device = self.state_manager.world.devices.get(command.device_id)
-                if device is None:
-                    error_code: str | None = "UNKNOWN_DEVICE"
-                    error_message = f"设备 {command.device_id} 不存在"
-                else:
-                    error_code, error_message = validate_device_command(
-                        device,
-                        action="",
-                        property_path=command.property,
-                    )
-                if error_code:
-                    await self._emit_command_failed(
+                record = await executor.submit(
+                    self._build_device_command(
+                        proposal=command,
+                        source=command_source,
                         root_event=root_event,
-                        agent_id=agent_id,
                         causal_parent=execution_event.event_id,
-                        command=command,
-                        error_code=error_code,
-                        reason=error_message,
-                    )
-                    continue
-
-                action_event = await self.publish_event(
-                    SimEvent(
-                        event_type="action.device_control",
-                        source=agent_id,
-                        timestamp=float(self.state_manager.world.simulation_tick),
-                        wall_time=time.time(),
-                        correlation_id=root_event.correlation_id,
-                        causal_parent=execution_event.event_id,
-                        priority=2,
-                        data={
-                            "agent_name": envelope.agent_name,
-                            "device_id": command.device_id,
-                            "property": command.property,
-                            "value": command.value,
-                            "reason": command.reason,
-                        },
-                    )
+                        actor=agent_id,
+                        actor_name=envelope.agent_name,
+                    ),
+                    tick=int(self.state_manager.world.simulation_tick),
+                    publish=agent_publish,
                 )
-                self.memory_store.remember(action_event, agent_id=agent_id)
-                try:
-                    deltas = self.state_manager.apply_action(
-                        agent_id=agent_id,
-                        device_id=command.device_id,
-                        property_path=command.property,
-                        new_value=command.value,
-                        reason=command.reason,
-                    )
-                except KeyError as exc:
-                    # 校验通过后设备仍可能在 apply 前消失（如并发 reset）；
-                    # 不再静默吞掉，转成同一结构化失败事件。
-                    await self._emit_command_failed(
-                        root_event=root_event,
-                        agent_id=agent_id,
-                        causal_parent=action_event.event_id,
-                        command=command,
-                        error_code="UNKNOWN_DEVICE",
-                        reason=str(exc),
-                    )
-                    continue
-                device = self.state_manager.world.devices.get(command.device_id)
-                if device is not None and _device_command_affects_room_light(device.type, command.property):
-                    room_id = device.location.room
-                    if room_id in self.state_manager.world.rooms:
-                        deltas.extend(
-                            self.state_manager.apply_path_update(
-                                caused_by=agent_id,
-                                path=f"rooms[{room_id}].light_level",
-                                new_value=calculate_room_light_level(self.state_manager.world, room_id),
-                                reason="apply device light feedback",
-                            )
-                        )
-
-                pending_deltas.extend(deltas)
-                last_action = command.reason or last_action
-                for delta in deltas:
-                    feedback_event = await self.publish_event(
-                        SimEvent(
-                            event_type="feedback.state_delta",
-                            source="state_manager",
-                            timestamp=float(self.state_manager.world.simulation_tick),
-                            wall_time=time.time(),
-                            correlation_id=root_event.correlation_id,
-                            causal_parent=action_event.event_id,
-                            priority=1,
-                            data=delta.model_dump(),
-                        )
-                    )
-                    self.memory_store.remember(feedback_event, agent_id=agent_id)
+                if record.status is CommandStatus.SUCCEEDED:
+                    last_action = command.reason or last_action
 
             self._set_agent_complete(
                 agent_id=agent_id,
@@ -697,38 +683,117 @@ class AgentRuntime:
 
         return parent_id
 
-    async def _emit_command_failed(
+    def _build_device_command(
+        self,
+        *,
+        proposal: AgentCommandProposal,
+        source: CommandSource,
+        root_event: SimEvent,
+        causal_parent: str,
+        actor: str | None = None,
+        actor_name: str | None = None,
+    ) -> DeviceCommand:
+        """agent 提案 → executor 的 DeviceCommand（property 点路径归一为能力名）。
+
+        ``actor``/``actor_name`` 承载执行者身份：source 只有四个值（agent/rule_fallback…），
+        丢了 agent_id 可观测性面板就分不清是哪个 agent 干的（S1 review finding-1）。
+        """
+
+        if self.state_manager is None:
+            raise RuntimeError("AgentRuntime is not bound")
+
+        return DeviceCommand(
+            source=source,
+            actor=actor,
+            actor_name=actor_name,
+            device_id=proposal.device_id,
+            capability=proposal.property.removeprefix("extra."),
+            value=proposal.value,
+            reason=proposal.reason,
+            correlation_id=root_event.correlation_id,
+            causal_parent=causal_parent,
+            issued_tick=int(self.state_manager.world.simulation_tick),
+            priority=2,
+        )
+
+    def _agent_publish_event(
+        self, agent_id: str, collected_deltas: list[DeltaChange]
+    ) -> PublishEvent:
+        """给 executor 的 publish 包装：保留 agent 记忆归属，并采集 delta 供 STATE_DELTA 广播。
+
+        executor 只认 publish 回调，不知道 agent 记忆与 WS 广播；这层包装把
+        action/feedback 事件按原语义记进该 agent 的记忆，反馈里的 delta 攒起来在
+        episode 收尾统一广播（保持"一次 episode 一条 STATE_DELTA"的既有口径）。
+        """
+
+        async def publish(event: SimEvent) -> SimEvent:
+            if self.publish_event is None:
+                raise RuntimeError("AgentRuntime is not bound")
+            published = await self.publish_event(event)
+            if published.event_type in {ACTION_EVENT_TYPE, FEEDBACK_EVENT_TYPE}:
+                self.memory_store.remember(published, agent_id=agent_id)
+            if published.event_type == FEEDBACK_EVENT_TYPE:
+                collected_deltas.append(DeltaChange.model_validate(published.data))
+            return published
+
+        return publish
+
+    async def _reject_losing_command(
         self,
         *,
         root_event: SimEvent,
         agent_id: str,
+        agent_name: str | None = None,
+        source: CommandSource,
+        proposal: AgentCommandProposal,
         causal_parent: str,
-        command: AgentCommandProposal,
-        error_code: str,
-        reason: str,
-    ) -> SimEvent:
+        conflicts: list[dict[str, Any]],
+    ) -> CommandRecord:
+        """仲裁落败的提案：proposed→rejected，detail 记冲突详情。
+
+        §10.2 十码词表里没有"仲裁落败"这一类（那是执行前的协作结果而非执行失败），
+        因此这里只写 detail 不写 failure_code，避免在校验层词表外私自造码。
+        """
+
+        conflict = next(
+            (
+                item
+                for item in conflicts
+                if item.get("loser_agent_id") == agent_id
+                and item.get("device_id") == proposal.device_id
+                and item.get("property") == proposal.property
+            ),
+            None,
+        )
+        detail = (
+            f"仲裁落败：{conflict['winner_agent_id']}（{conflict['winner_priority']}）"
+            f"占用 {proposal.device_id}.{proposal.property}"
+            if conflict is not None
+            else f"仲裁未采纳 {proposal.device_id}.{proposal.property}"
+        )
         log.warning(
             "agent_command_rejected",
             agent_id=agent_id,
-            device_id=command.device_id,
-            property=command.property,
-            error_code=error_code,
-            reason=reason,
+            device_id=proposal.device_id,
+            property=proposal.property,
+            reason=detail,
         )
-        return await self._emit_agent_event(
-            root_event=root_event,
-            agent_id=agent_id,
-            event_type="device.command_failed",
-            causal_parent=causal_parent,
-            data={
-                "agent_id": agent_id,
-                "device_id": command.device_id,
-                "property": command.property,
-                "value": command.value,
-                "error_code": error_code,
-                "reason": reason,
-            },
+
+        tick = int(self.state_manager.world.simulation_tick) if self.state_manager else 0
+        record = await CommandRecord.propose(
+            self._build_device_command(
+                proposal=proposal,
+                source=source,
+                root_event=root_event,
+                causal_parent=causal_parent,
+                actor=agent_id,
+                actor_name=agent_name,
+            ),
+            self._agent_publish_event(agent_id, []),
+            tick=tick,
         )
+        await record.transition(CommandStatus.REJECTED, detail=detail, tick=tick)
+        return record
 
     async def _emit_agent_event(
         self,

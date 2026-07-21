@@ -11,7 +11,7 @@ from backend.agents.hvac import HVACAgent
 from backend.agents.lighting import LightingAgent
 from backend.agents.runtime import AgentRuntime
 from backend.api.ws import ConnectionManager
-from backend.engine.event_bus import EventBus
+from backend.engine.event_bus import EventBus, SimEvent
 from backend.engine.simulation import SimulationEngine
 from backend.engine.state import (
     AgentRuntimeState,
@@ -19,9 +19,15 @@ from backend.engine.state import (
     DeviceStateValues,
     Location3D,
     RoomState,
+    UserState,
     WorldState,
 )
-from backend.engine.state_manager import StateManager
+from backend.engine.state_manager import (
+    INVARIANT_VIOLATION_EVENT_TYPE,
+    StateManager,
+    verify_world_invariants,
+)
+from backend.execution.command import CommandSource, CommandStatus, DeviceCommand
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +71,16 @@ def _make_world() -> WorldState:
             id="hvac_agent", name="HVAC Agent", status="idle"
         ),
     }
-    world.users = {}
+    # §2.2：persons 里的人必须在 users 里且 location 对得上，夹具世界自身必须是合法世界，
+    # 否则仿真写入后的不变式探测会一直报一条与被测行为无关的违规。
+    world.users = {
+        "user_01": UserState(
+            id="user_01",
+            name="User",
+            location=Location3D(room="living_room"),
+            activity="idle",
+        )
+    }
     return world
 
 
@@ -269,3 +284,137 @@ class TestSimulationEngine:
         engine = _make_engine()
         await engine.pause()  # should not raise
         assert engine.is_running is False
+
+
+class TestSimulatorWriteInvariants:
+    """审计 finding 3：仿真写入路径必须自己跑不变式探测并自己背锅。"""
+
+    @staticmethod
+    def _sim_events(engine: SimulationEngine) -> list[dict]:
+        return [
+            call.args[0].payload
+            for call in engine.conn.broadcast.call_args_list
+            if call.args[0].type == "SIM_EVENT"
+        ]
+
+    @pytest.mark.anyio
+    async def test_environment_refresh_write_reports_violation_attributed_to_simulator(self):
+        """仿真把 occupancy 与 persons 写脱钩 → 系统级违规事件归因到仿真源，且不静默纠正。"""
+
+        engine = _make_engine()
+        verify_world_invariants(engine.state_manager.world)
+        engine.conn.broadcast = AsyncMock()  # type: ignore[method-assign]
+
+        await engine._handle_environment_refresh(
+            SimEvent(
+                event_type="environment.state_refresh",
+                source="environment_sim",
+                timestamp=0.0,
+                data={
+                    "simulated_dt": 10.0,
+                    "updates": {"rooms[living_room].occupancy": False},
+                },
+            )
+        )
+
+        violations = [
+            payload
+            for payload in self._sim_events(engine)
+            if payload["event_type"] == INVARIANT_VIOLATION_EVENT_TYPE
+        ]
+        assert len(violations) == 1
+        data = violations[0]["data"]
+        assert data["invariant"] == "occupancy_derivable_from_persons"
+        assert data["attributed_to"] == "environment_sim"
+        assert data["phase"] == "environment_refresh"
+        assert data["pre_existing"] is False
+        assert data["command_id"] is None
+        assert violations[0]["priority"] == 3
+        # 只检测不纠正：仿真世界不回滚，纠正与否留给上层（§2.2 禁止静默纠正）。
+        assert data["reverted_paths"] == []
+        assert engine.state_manager.world.rooms["living_room"].occupancy is False
+
+    @pytest.mark.anyio
+    async def test_same_unrepaired_violation_is_not_reported_twice(self):
+        """同一条未修复的违规不重复刷屏；世界恢复一致后再坏才重新上报。"""
+
+        engine = _make_engine()
+        engine.conn.broadcast = AsyncMock()  # type: ignore[method-assign]
+
+        async def refresh(updates: dict) -> None:
+            await engine._handle_environment_refresh(
+                SimEvent(
+                    event_type="environment.state_refresh",
+                    source="environment_sim",
+                    timestamp=0.0,
+                    data={"simulated_dt": 10.0, "updates": updates},
+                )
+            )
+
+        await refresh({"rooms[living_room].occupancy": False})
+        await refresh({"rooms[living_room].temperature": 25.0})
+
+        def violation_count() -> int:
+            return len(
+                [
+                    payload
+                    for payload in self._sim_events(engine)
+                    if payload["event_type"] == INVARIANT_VIOLATION_EVENT_TYPE
+                ]
+            )
+
+        assert violation_count() == 1
+
+        # 修好之后再次写坏 → 重新上报（不是永久静音）。
+        await refresh({"rooms[living_room].occupancy": True})
+        assert violation_count() == 1
+        await refresh({"rooms[living_room].occupancy": False})
+        assert violation_count() == 2
+
+    @pytest.mark.anyio
+    async def test_command_path_does_not_re_report_what_simulation_already_reported(self):
+        """review2 finding-3：仿真侧与命令侧共用同一份去抖签名。
+
+        否则仿真写坏世界之后，仿真侧报一条，此后每条 UI/agent 命令还各补一条
+        pre_existing 事件——一次损坏在演示里会变成一路刷屏的事件洪水。
+        """
+
+        engine = _make_engine()
+        engine.conn.broadcast = AsyncMock()  # type: ignore[method-assign]
+
+        await engine._handle_environment_refresh(
+            SimEvent(
+                event_type="environment.state_refresh",
+                source="environment_sim",
+                timestamp=0.0,
+                data={
+                    "simulated_dt": 10.0,
+                    "updates": {"rooms[living_room].occupancy": False},
+                },
+            )
+        )
+
+        def violation_count() -> int:
+            return len(
+                [
+                    payload
+                    for payload in self._sim_events(engine)
+                    if payload["event_type"] == INVARIANT_VIOLATION_EVENT_TYPE
+                ]
+            )
+
+        assert violation_count() == 1
+
+        for value in (40, 60):
+            record = await engine.command_executor.submit(
+                DeviceCommand(
+                    source=CommandSource.UI,
+                    device_id="light_living_01",
+                    capability="brightness",
+                    value=value,
+                ),
+                publish=engine._publish_sim_event,
+            )
+            assert record.status is CommandStatus.SUCCEEDED
+
+        assert violation_count() == 1

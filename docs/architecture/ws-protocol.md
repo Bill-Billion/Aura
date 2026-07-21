@@ -1,9 +1,10 @@
 # WebSocket 协议
 
 Author: Bill Billion  
-Date: 2026-04-22
+Date: 2026-04-22  
+Updated: 2026-07-21（S1：命令生命周期事件、§10.2 失败语义、事件顺序承诺）
 
-这份文档定义 SmartHomeSim 当前对外开放的 WebSocket 命令、服务端消息、结构化事件类型和错误格式。当前阶段已经进入 Phase 2，所以除了 Phase 1 的世界状态同步消息，还会通过 `SIM_EVENT` 实时外发 `reasoning.*` 事件。
+这份文档定义 SmartHomeSim 当前对外开放的 WebSocket 命令、服务端消息、结构化事件类型和错误格式。当前阶段已经进入 Phase 2，所以除了 Phase 1 的世界状态同步消息，还会通过 `SIM_EVENT` 实时外发 `reasoning.*` 事件。S1 之后，所有设备变更（UI / Agent / 场景脚本 / 规则降级四来源）都走同一台 `CommandExecutor`，因此 `SIM_EVENT` 里还会看到 `command.lifecycle`、`device.command_failed`、`system.invariant_violation` 三类新事件。
 
 ## 连接入口
 
@@ -97,6 +98,8 @@ WebSocket 入口固定为 `/ws/simulation`。
 }
 ```
 
+命令引发的 delta 里，`caused_by` 取命令来源（`ui` / `agent` / `scenario` / `rule_fallback`），`caused_by_event_id` 指向那条 `action.device_control`。同一条命令派生的效果 delta（房间 `light_level`、`perceived_temperature`、`security_coverage`）与直接 delta 归在同一条 `STATE_DELTA` 里，并共享同一个 `caused_by_event_id`。
+
 ### `AGENT_STATUS`
 
 `payload.agents` 是一个以 `agent_id` 为 key 的状态表。当前字段包括：
@@ -133,14 +136,17 @@ WebSocket 入口固定为 `/ws/simulation`。
 - `reasoning.coordination_decision`
 - `reasoning.execution_plan`
 - `reasoning.fallback_rule_based`
+- `command.lifecycle`
 - `action.device_control`
 - `feedback.state_delta`
+- `device.command_failed`
+- `system.invariant_violation`
 
 说明：
 
 - `system.timer_tick` 和 `environment.state_refresh` 继续实时外发
 - `reasoning.*` 不新增新的 envelope，全部通过 `SIM_EVENT` 输出
-- 当前前端低层 `CMD_DEVICE_CONTROL` 仍然先走旧的直接控制链，兼容现有面板即时反馈
+- S1 起 `CMD_DEVICE_CONTROL` 也走 `CommandExecutor`：与 Agent 路径同一条六级校验、同一套十态生命周期、同一份失败词表，不再有"UI 直控专用链路"
 
 ### `SIMULATION_STATUS`
 
@@ -160,17 +166,52 @@ WebSocket 入口固定为 `/ws/simulation`。
 {
   "type": "ERROR",
   "payload": {
-    "code": "DEVICE_NOT_CONTROLLABLE",
-    "message": "客厅温度传感器不支持修改: value",
+    "code": "capability_not_supported",
+    "message": "sensor 设备不支持能力 value",
     "details": {
       "device_id": "sensor_living_temp_01",
-      "action": "set_state"
+      "capability": "value",
+      "command_id": "0f2c…",
+      "status": "failed"
     }
   }
 }
 ```
 
 `details` 可选，但一旦携带，就必须是对象。
+
+`code` 取自两套正交词表：
+
+**消息层错误码**（消息本身不合法，命令还没成形）：
+
+| code | 触发条件 |
+| --- | --- |
+| `malformed_message` | 帧不是合法 JSON，或不是 JSON 对象 |
+| `invalid_payload` | `payload` 不是对象，或字段结构校验失败（`details.issues` 列出逐条问题） |
+| `invalid_device_command` | 载荷结构合法但没有可执行的 `action` / `property` |
+| `unsupported_message_type` | 未知的 `type`（`details.type` 回显原值） |
+| `internal_error` | 处理该消息时服务端内部异常 |
+
+**命令层失败码**（命令已成形，被 `CommandExecutor` 拒绝或执行失败，spec §10.2 十类）：
+
+| code | 语义 |
+| --- | --- |
+| `unknown_device` | 设备不存在（含校验通过后设备并发消失） |
+| `device_offline` | 设备离线，不接受可写命令 |
+| `capability_not_supported` | 该设备类型没有这条能力，或这台设备没声明这条能力位 |
+| `read_only_capability` | 能力存在但只读（如 `sensor.value` / `camera.view`） |
+| `invalid_value_type` | 值类型与能力矩阵声明不符 |
+| `invalid_value_range` | 数值越界或枚举取值非法 |
+| `policy_denied` | 场景策略禁止操作该设备 |
+| `execution_timeout` | 动作已下发但状态反馈超出预算窗口 |
+| `state_feedback_missing` | 执行后没有拿到状态反馈 —— **保留码，当前版本不会出现在线上**（见下） |
+| `superseded_by_newer_command` | 同一控制点被更新的命令取代，本命令不执行 |
+
+> `state_feedback_missing` 目前**没有产出方**：同步 StateManager 下 `apply_action` 立即返回，唯一的反馈类失败路径（超出预算窗口）报 `execution_timeout`。该码列在这里只为保持 §10.2 十类词表完整——客户端应认得它，但不要等它出现。引入异步 episode（S2/S3）后才会有真实产出方。
+
+此外 `system.invariant_violation` 使用独立错误码 `invariant_violation`：它描述"世界差点被改坏"（系统级故障），不属于上面十类"命令为什么没被执行"。
+
+一条坏消息只换来一条 `ERROR`，连接保持存活；同一连接后续的合法命令照常执行。
 
 ## `SimEvent` 公共字段
 
@@ -273,6 +314,91 @@ WebSocket 入口固定为 `/ws/simulation`。
 }
 ```
 
+## S1 命令生命周期 payload
+
+四来源（`ui` / `agent` / `scenario` / `rule_fallback`）的每条设备命令都会外发同一组事件，前端只需消费 `SIM_EVENT` 即可重建"命令为何影响 / 未影响世界"。
+
+### `command.lifecycle`
+
+`source` 固定为 `command_executor`。每次状态迁移发一条：
+
+```json
+{
+  "event_type": "command.lifecycle",
+  "source": "command_executor",
+  "correlation_id": "…",
+  "causal_parent": "<根事件 event_id>",
+  "data": {
+    "command_id": "…",
+    "device_id": "light_living_01",
+    "capability": "power",
+    "from_status": "validated",
+    "to_status": "executing",
+    "source": "ui",
+    "detail": null,
+    "failure_code": null
+  }
+}
+```
+
+`to_status` 取 spec §10.1 十态：`proposed`、`approved`、`rejected`、`validated`、`executing`、`succeeded`、`failed`、`timed_out`、`cancelled`、`superseded`。其中 `rejected`、`succeeded`、`failed`、`timed_out`、`cancelled`、`superseded` 是终态（吸收态，不再有后续迁移）。`from_status` 只有出生事件为 `null`。`failure_code` 仅在带失败语义的迁移上出现，取值见上面的命令层失败码表。
+
+一条成功命令的典型序列：`proposed → approved → validated → executing → succeeded`。
+
+### `device.command_failed`
+
+命令被拒绝或执行失败时，与 `command.lifecycle` 的失败迁移同码派发一条：
+
+```json
+{
+  "event_type": "device.command_failed",
+  "source": "command_executor",
+  "data": {
+    "command_id": "…",
+    "device_id": "light_living_01",
+    "capability": "brightness",
+    "value": 999,
+    "source": "ui",
+    "error_code": "invalid_value_range",
+    "reason": "brightness 超出上界 100（收到 999）"
+  }
+}
+```
+
+UI 来源的命令在此之外还会收到一条同码的 `ERROR` 消息。
+
+### `system.invariant_violation`
+
+spec §2.2 不变式被破坏时发出，`priority` 恒为 `3`（最高），且本命令已落地的 delta 会被逆序回滚——回滚路径列在 `reverted_paths` 里，禁止静默纠正：
+
+```json
+{
+  "event_type": "system.invariant_violation",
+  "source": "state_manager",
+  "priority": 3,
+  "data": {
+    "invariant": "…",
+    "message": "…",
+    "details": {},
+    "command_id": "…",
+    "device_id": "light_living_01",
+    "capability": "power",
+    "source": "agent",
+    "reverted_paths": ["devices[light_living_01].state.power"]
+  }
+}
+```
+
+### 顺序承诺
+
+同一条命令的消息顺序是稳定的，前端可以据此建因果树：
+
+1. 根事件（UI 命令为 `user.command`，Agent 命令为其推理链根事件）先于任何派生事件与 `STATE_DELTA` 外发
+2. `command.lifecycle` 的 `executing` 先于 `action.device_control`
+3. `action.device_control` 先于由它派生的 `feedback.state_delta`（后者的 `causal_parent` 即前者的 `event_id`）
+4. 终态 `command.lifecycle` 最后到达
+5. 校验失败的命令绝不产生 `action.device_control` / `feedback.state_delta`，世界零变更
+
 ## 当前开放的设备类型
 
 默认场景对外暴露的 `device.type` 固定为：
@@ -296,7 +422,8 @@ WebSocket 入口固定为 `/ws/simulation`。
 - `shake`
 - `timeout`
 - `view`
-- `read`
+- `online`（只读，camera）
+- `value`（只读，sensor；spec §3.2 表里旧名为 `read`，S1 已统一改名，见该节实现说明）
 
 ## 连接生命周期
 
@@ -309,4 +436,4 @@ WebSocket 入口固定为 `/ws/simulation`。
 5. 仿真状态变化时补发 `SIMULATION_STATUS`
 6. 命令非法时返回 `ERROR`
 
-如果 60 秒内没有收到客户端消息，服务端会主动关闭空闲连接。前端应该按自己的重连策略重新建立连接。
+服务端不设空闲踢线：只观察不操作的会话（可观测性面板的常态）会一直保持连接。客户端的 `HEARTBEAT_PONG` 只作保活，不会触发 `ERROR`。断线后前端按自己的重连策略重连即可。

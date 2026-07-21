@@ -188,7 +188,36 @@ Device type is useful for grouping. Capability is the executable contract.
 | `fan` | `timeout` | integer minutes, `0..240` | yes |
 | `camera` | `view` | read-only preview metadata | no |
 | `camera` | `online` | boolean | no by default |
-| `sensor` | `read` | read-only sensor value | no |
+| `sensor` | `value` | read-only sensor value | no |
+
+**Implementation note (S1, 2026-07-21).** The matrix above is now shipped as data in
+`backend/execution/capability_matrix.py`, which is the single value contract for all
+four command sources. Three points where this document was realigned with what S1
+actually shipped:
+
+- The `sensor` row was named `read` in the 2026-05-17 draft. S1 renamed it to `value`
+  as a deliberate decision: a capability name must equal the state field the effect
+  model writes. Sensor readings land in `state.extra.value`
+  (`backend/simulators/effects.py`) and the frontend `SensorPanel` reads that field.
+  Under the name `read`, the executor's `extra.<capability>` path pointed at a field
+  that does not exist, and a write to a real sensor was rejected as
+  `capability_not_supported` ("no such capability") instead of `read_only_capability`,
+  so the §2.2 read-only invariant could never be reached. `value` is now the name used
+  by the registry, the `DeviceCapability` literal, `docs/architecture/ws-protocol.md`
+  and every test; `read` no longer exists anywhere in the code. Do not reintroduce it.
+- The numeric bounds marked "suggested" (`color_temp`, `target_temp`) are enforced by
+  S1 exactly like the explicit ones: every numeric capability is validated against an
+  inclusive closed interval, and a value outside it fails with `invalid_value_range`.
+  "Suggested" means the bound is a modelling choice, not that it is advisory at
+  runtime.
+- `camera.online` ships as never writable in S1. "No by default" describes the intent
+  that a future scenario policy could open it; no such policy exists yet, and the
+  capability is currently read-only unconditionally.
+
+Each capability also carries the effect scope that §3.4 requires it to declare
+(`physical`, `perceived_comfort`, `security_coverage`, `ui_observability`) as
+`CapabilitySpec.effect_class`, so the declaration lives next to the value contract
+rather than in prose.
 
 ### 3.3 Command Validation Requirements
 
@@ -205,6 +234,28 @@ rule. The validation layer must check:
 
 Invalid commands must emit structured `ERROR` messages for WebSocket clients and
 structured failure events for agent episodes.
+
+**Implementation note (S1, 2026-07-21).** `backend/execution/validation.py` is the
+single implementation of this path. The six requirements above ship as a fixed
+ordered sequence of seven checks; the first one that fails wins, and each maps to
+exactly one §10.2 code:
+
+1. device exists → `unknown_device`
+2. device online → `device_offline` (the §2.2 invariant, checked here so that an
+   offline device is rejected before any value reasoning)
+3. capability exists → `capability_not_supported`, checked twice: first against the
+   §3.2 type-level matrix, then against the device instance's own `capabilities`
+   list, because the type matrix is only an upper bound and a scenario may ship a
+   device with a trimmed capability set (an instance with an empty list falls back to
+   the type-level declaration)
+4. capability writable → `read_only_capability`
+5. value type → `invalid_value_type`
+6. value range or enum → `invalid_value_range`
+7. scenario policy → `policy_denied`
+
+The scenario policy slot is an injectable interface keyed on
+`(device_id, capability)`. S1 ships a permissive default plus a
+forbidden-device-id policy; the §5.1 `ScenarioSpec` connects to it in S2.
 
 ### 3.4 Device Effect Model
 
@@ -886,6 +937,27 @@ Required sequence:
 8. StateManager emits `feedback.state_delta`.
 9. Evaluator checks scenario criteria.
 
+**Implementation note (S1, 2026-07-21).** Steps 5 to 8 ship in
+`backend/execution/executor.py`, which is the only caller of
+`state_manager.apply_action` in the system; the UI leg, the agent leg, scenario
+scripts and rule-based fallback all enter through it. Steps 2 to 4 exist only on the
+agent leg: an agent runtime, domain agents and an arbiter resolve conflicts between
+agent proposals before submission, but UI, scenario and fallback commands do not pass
+through them, so the ordering is not yet a total order over all four sources. Inside
+the executor S1 auto-approves every proposed command and exposes a `pre_submit` seam,
+called after validation and before execution, where S3 will install cross-source
+arbitration. Step 9 (evaluator) is not implemented.
+
+S1 adds one step the 2026-05-17 draft did not name: between steps 7 and 8 the
+executor re-checks the §2.2 world invariants and attributes the result. If the world
+was already inconsistent before `apply_action` ran, the violation belongs to a
+non-command writer (the simulator), so it is reported as a `pre_existing`
+`system.invariant_violation` and the command proceeds. If the world was clean before
+and inconsistent after, the command broke it: every delta is rolled back in reverse
+order and the command fails. Commands are also guarded before step 7 against the two
+command-level §2.2 invariants (writing an offline device, writing a read-only
+capability from a non-simulation source).
+
 ### 10.1 Command Lifecycle
 
 Every command must move through an explicit lifecycle.
@@ -906,6 +978,22 @@ Allowed statuses:
 Each status transition should be represented by event data so a researcher can
 reconstruct why a command did or did not affect the world.
 
+**Implementation note (S1, 2026-07-21).** All ten statuses ship with these exact
+names in `backend/execution/command.py`, together with an explicit legality table:
+only declared transitions are allowed and an illegal one raises rather than being
+silently absorbed. Six of the ten are terminal and absorbing — `rejected`,
+`succeeded`, `failed`, `timed_out`, `cancelled`, `superseded` — meaning no transition
+out of them is legal. Every transition emits one `command.lifecycle` event carrying
+`from_status` (null only for the birth event), `to_status` and, on failure-bearing
+transitions, the §10.2 `failure_code`. Under the synchronous StateManager there is no
+real in-flight window, so S1 reaches `superseded` when a newer command replaces an
+earlier one registered for the same `(device_id, capability)`, and `timed_out` from
+an injectable clock measuring dispatch to feedback against a budget. `rejected` is
+produced by the existing agent-side arbiter for proposals that lose a conflict: the
+loser is proposed and rejected without ever reaching the executor, so it never
+touches the world but is still visible in the lifecycle stream. Full ordered
+arbitration over all four command sources is S3 work.
+
 ### 10.2 Failure Semantics
 
 Command failure must be explicit. The executor should distinguish:
@@ -923,6 +1011,23 @@ Command failure must be explicit. The executor should distinguish:
 
 Failed commands should not mutate world state unless the failure mode itself is a
 state change, such as marking a device offline.
+
+**Implementation note (S1, 2026-07-21).** The ten codes ship with these exact names
+in `backend/execution/validation.py`, which is their single source of truth; the
+executor adds no code of its own. The same table is published to clients in
+`docs/architecture/ws-protocol.md`, so the two must be changed together. Two points a
+reader should not have to discover from code:
+
+- `state_feedback_missing` currently has no producer. Under the synchronous
+  StateManager `apply_action` returns immediately, so the only feedback-shaped
+  failure path (exceeding the budget window) reports `execution_timeout`. The code
+  stays in the vocabulary for completeness and clients should recognise it, but it
+  cannot appear until asynchronous episodes decouple dispatch from feedback in
+  S2/S3.
+- `system.invariant_violation` carries its own `invariant_violation` code and is
+  deliberately not one of the ten. The ten answer "why was this command not
+  executed"; an invariant violation answers "the world was nearly broken", which is a
+  system-level fault that may not be attributable to any command at all.
 
 The following components must not directly mutate device state:
 

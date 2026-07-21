@@ -258,6 +258,92 @@ test('buildEventDetailView 会把 reasoning 和 feedback 事件映射成固定�
   assert.equal(feedbackDetail.fields.find((field) => field.label === '新值')?.value, 'true')
 })
 
+// S1 之后 UI 来源的命令也会外发 action.device_control，且后端刻意不伪造 agent 身份
+// （backend/execution/command.py::_actor_fields），因此详情面板必须能在无 agent_name 时降级。
+test('buildEventDetailView 的 action 详情：有 agent 身份时显示 Agent，UI 来源时降级成命令来源', () => {
+  const agentDetail = buildEventDetailView(makeEvent({
+    event_id: 'evt-action-agent',
+    event_type: 'action.device_control',
+    source: 'lighting_agent',
+    correlation_id: 'ep-1',
+    wall_time: 102,
+    data: {
+      command_id: 'cmd-1',
+      agent_id: 'lighting_agent',
+      agent_name: 'Lighting Agent',
+      device_id: 'light_living_01',
+      capability: 'power',
+      property: 'power',
+      value: true,
+      reason: 'occupied evening lighting',
+      source: 'agent',
+    },
+  }))
+
+  assert.equal(agentDetail.kind, 'action')
+  assert.equal(agentDetail.fields.find((field) => field.label === '执行 Agent')?.value, 'Lighting Agent')
+  assert.equal(agentDetail.fields.some((field) => field.label === '执行来源'), false)
+
+  const uiDetail = buildEventDetailView(makeEvent({
+    event_id: 'evt-action-ui',
+    event_type: 'action.device_control',
+    source: 'command_executor',
+    correlation_id: 'ep-2',
+    wall_time: 103,
+    data: {
+      command_id: 'cmd-2',
+      device_id: 'light_living_01',
+      capability: 'brightness',
+      property: 'extra.brightness',
+      value: 60,
+      reason: '用户直接调节亮度',
+      source: 'ui',
+    },
+  }))
+
+  assert.equal(uiDetail.kind, 'action')
+  assert.equal(uiDetail.fields.some((field) => field.label === '执行 Agent'), false)
+  assert.equal(uiDetail.fields.find((field) => field.label === '执行来源')?.value, '用户操作')
+  // 任何一个字段都不能渲染成空串，否则详情面板会出现一行没有值的占位。
+  assert.equal(uiDetail.fields.every((field) => field.value.length > 0), true)
+
+  const scenarioDetail = buildEventDetailView(makeEvent({
+    event_id: 'evt-action-scenario',
+    event_type: 'action.device_control',
+    source: 'command_executor',
+    correlation_id: 'ep-3',
+    wall_time: 104,
+    data: {
+      device_id: 'curtain_living_01',
+      capability: 'open_percent',
+      property: 'extra.open_percent',
+      value: 80,
+      reason: '场景脚本步骤 2',
+      source: 'scenario',
+    },
+  }))
+
+  assert.equal(scenarioDetail.fields.find((field) => field.label === '执行来源')?.value, '场景脚本')
+
+  // 兜底：后端没给 source 时也不能留空字段。
+  const unknownDetail = buildEventDetailView(makeEvent({
+    event_id: 'evt-action-unknown',
+    event_type: 'action.device_control',
+    source: 'command_executor',
+    correlation_id: 'ep-4',
+    wall_time: 105,
+    data: {
+      device_id: 'fan_bedroom_01',
+      property: 'power',
+      value: true,
+      reason: '未知来源',
+    },
+  }))
+
+  assert.equal(unknownDetail.fields.find((field) => field.label === '执行来源')?.value, '未知来源')
+  assert.equal(unknownDetail.fields.every((field) => field.value.length > 0), true)
+})
+
 test('deriveObservabilityState 会覆盖 loading、disconnected、needs_start、fallback 四种面板状态', () => {
   const episode = buildEpisodeSummaries([
     makeEvent({

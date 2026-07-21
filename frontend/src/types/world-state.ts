@@ -2,6 +2,9 @@ export interface Location3D { room: string; x: number; y: number; z: number }
 
 export type DeviceType = 'light' | 'hvac' | 'curtain' | 'sensor' | 'fan' | 'camera'
 export type DeviceUIGroup = 'lighting' | 'device' | 'security' | 'environment'
+// 与 backend/execution/capability_matrix.py 的 CAPABILITY_MATRIX 一一对应（spec §3.2）。
+// 前九条可写，后三条（view / online / value）只读——只读集合的权威在
+// capability_matrix.read_only_capability_names()，前端镜像见 deviceFloorMap.ts。
 export type DeviceCapability =
   | 'power'
   | 'brightness'
@@ -13,7 +16,8 @@ export type DeviceCapability =
   | 'shake'
   | 'timeout'
   | 'view'
-  | 'read'
+  | 'online'
+  | 'value'
 
 export interface DeviceState {
   id: string; type: DeviceType; location: Location3D

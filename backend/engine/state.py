@@ -16,7 +16,12 @@ DeviceCapability = Literal[
     "shake",
     "timeout",
     "view",
-    "read",
+    # §3.2：camera.online 是只读能力语义位；设备侧同时保留 state.extra.online 镜像，
+    # 前端 CameraPanel/deviceFloorMap 读的是那个镜像，两者必须同时存在。
+    "online",
+    # §3.2：sensor 的只读读数位。名字必须与 state.extra.value 一致——effects.py 写它、
+    # 前端 SensorPanel 读它；叫 "read" 时能力名指向了一个并不存在的字段。
+    "value",
 ]
 
 
@@ -52,6 +57,10 @@ class RoomState(BaseModel):
     light_level: float = 300.0
     occupancy: bool = False
     persons: list[str] = Field(default_factory=list)
+    # §3.4 派生量（非物理 ground truth）：风扇只降体感、摄像头只掉覆盖，二者都不许改
+    # temperature。None = 尚未被效果模型算过，避免默认值冒充已计算结果。
+    perceived_temperature: float | None = None
+    security_coverage: float | None = None
 
 
 class EnvironmentState(BaseModel):

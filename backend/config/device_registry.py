@@ -16,7 +16,10 @@ from backend.engine.state import (
 )
 
 
-READ_ONLY_CAPABILITIES = {"read", "view"}
+# 注：本模块只描述"默认场景里有哪些设备、各自带哪些能力位"。能力的值契约与可写性
+# 归 backend/execution/capability_matrix.py（spec §3.2），校验归
+# backend/execution/validation.py（§3.3 六级 + §10.2 词表）——本模块不再自带校验函数，
+# 避免出现第二条与 executor 口径不一致的命令合法性判据。
 
 
 class DeviceRegistryEntry(BaseModel):
@@ -168,7 +171,7 @@ def get_default_device_registry() -> tuple[DeviceRegistryEntry, ...]:
             room_id="living_room",
             floor_id="F1",
             ui_group="security",
-            capabilities=["view"],
+            capabilities=["view", "online"],
             default_power=True,
             default_extra={
                 "online": True,
@@ -189,7 +192,7 @@ def get_default_device_registry() -> tuple[DeviceRegistryEntry, ...]:
             room_id="living_room",
             floor_id="F1",
             ui_group="security",
-            capabilities=["view"],
+            capabilities=["view", "online"],
             default_power=True,
             default_extra={
                 "online": True,
@@ -210,7 +213,7 @@ def get_default_device_registry() -> tuple[DeviceRegistryEntry, ...]:
             room_id="living_room",
             floor_id="F1",
             ui_group="environment",
-            capabilities=["read"],
+            capabilities=["value"],
             default_power=True,
             default_extra={"sensor_type": "temperature", "value": 24.5, "unit": "°C"},
         ),
@@ -300,7 +303,7 @@ def get_default_device_registry() -> tuple[DeviceRegistryEntry, ...]:
             room_id="bedroom",
             floor_id="F2",
             ui_group="security",
-            capabilities=["view"],
+            capabilities=["view", "online"],
             default_power=True,
             default_extra={
                 "online": True,
@@ -321,7 +324,7 @@ def get_default_device_registry() -> tuple[DeviceRegistryEntry, ...]:
             room_id="bedroom",
             floor_id="F2",
             ui_group="security",
-            capabilities=["view"],
+            capabilities=["view", "online"],
             default_power=True,
             default_extra={
                 "online": True,
@@ -342,7 +345,7 @@ def get_default_device_registry() -> tuple[DeviceRegistryEntry, ...]:
             room_id="bedroom",
             floor_id="F2",
             ui_group="environment",
-            capabilities=["read"],
+            capabilities=["value"],
             default_power=True,
             default_extra={"sensor_type": "temperature", "value": 23.0, "unit": "°C"},
         ),
@@ -404,7 +407,7 @@ def get_default_device_registry() -> tuple[DeviceRegistryEntry, ...]:
             room_id="loft",
             floor_id="F3",
             ui_group="security",
-            capabilities=["view"],
+            capabilities=["view", "online"],
             default_power=True,
             default_extra={
                 "online": False,
@@ -425,7 +428,7 @@ def get_default_device_registry() -> tuple[DeviceRegistryEntry, ...]:
             room_id="loft",
             floor_id="F3",
             ui_group="security",
-            capabilities=["view"],
+            capabilities=["view", "online"],
             default_power=True,
             default_extra={
                 "online": True,
@@ -446,7 +449,7 @@ def get_default_device_registry() -> tuple[DeviceRegistryEntry, ...]:
             room_id="utility",
             floor_id="F3",
             ui_group="environment",
-            capabilities=["read"],
+            capabilities=["value"],
             default_power=True,
             default_extra={"sensor_type": "air_quality", "value": 42, "unit": "AQI"},
         ),
@@ -465,55 +468,3 @@ def get_registry_entry(device_id: str) -> DeviceRegistryEntry | None:
         if entry.id == device_id:
             return entry
     return None
-
-
-def get_writable_fields(device: DeviceState) -> set[str]:
-    return {
-        capability
-        for capability in device.capabilities
-        if capability not in READ_ONLY_CAPABILITIES and capability != "power"
-    }
-
-
-def validate_device_command(
-    device: DeviceState,
-    *,
-    action: str,
-    params: dict[str, Any] | None = None,
-    property_path: str | None = None,
-) -> tuple[str | None, str]:
-    """校验设备控制命令，返回错误码和可读说明。"""
-
-    if action in {"turn_on", "turn_off"}:
-        if "power" not in device.capabilities:
-            return (
-                "DEVICE_NOT_CONTROLLABLE",
-                f"{device.display_name or device.id} 当前不支持电源控制",
-            )
-        return (None, "")
-
-    if action == "set_state":
-        if not params:
-            return ("INVALID_DEVICE_COMMAND", "set_state 需要至少一个参数")
-
-        allowed_fields = get_writable_fields(device)
-        invalid_fields = sorted(set(params) - allowed_fields)
-        if invalid_fields:
-            return (
-                "DEVICE_NOT_CONTROLLABLE",
-                f"{device.display_name or device.id} 不支持修改: {', '.join(invalid_fields)}",
-            )
-        return (None, "")
-
-    if property_path:
-        normalized = property_path.removeprefix("extra.")
-        if normalized == "power":
-            return validate_device_command(device, action="turn_on")
-        if normalized not in get_writable_fields(device):
-            return (
-                "DEVICE_NOT_CONTROLLABLE",
-                f"{device.display_name or device.id} 不支持修改: {normalized}",
-            )
-        return (None, "")
-
-    return ("INVALID_DEVICE_COMMAND", f"未知动作: {action}")

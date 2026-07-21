@@ -1,6 +1,26 @@
 import pytest
+from backend.engine.event_bus import SimEvent
 from backend.engine.state import WorldState, DeviceState, DeviceStateValues, Location3D, RoomState, UserState
-from backend.engine.state_manager import StateManager, DeltaChange
+from backend.engine.state_manager import (
+    InvariantViolation,
+    StateManager,
+    DeltaChange,
+    verify_world_invariants,
+)
+from backend.execution.command import (
+    LIFECYCLE_EVENT_TYPE,
+    CommandSource,
+    CommandStatus,
+    DeviceCommand,
+)
+from backend.execution.executor import (
+    ACTION_EVENT_TYPE,
+    COMMAND_FAILED_EVENT_TYPE,
+    FEEDBACK_EVENT_TYPE,
+    INVARIANT_VIOLATION_ERROR_CODE,
+    INVARIANT_VIOLATION_EVENT_TYPE,
+    CommandExecutor,
+)
 from backend.models.schemas import WSMessage, SimCommand
 
 
@@ -186,3 +206,363 @@ def test_sim_command_literal():
 
     cmd2 = SimCommand(command="set_speed", params={"speed": 2.0})
     assert cmd2.params["speed"] == 2.0
+
+
+# -------------------------------------------------------------------
+# S1-T6 §2.2 状态不变式
+# -------------------------------------------------------------------
+
+
+def _make_invariant_world() -> WorldState:
+    """living_room 一致（persons↔user.location↔occupancy），另带离线风扇与只读传感器。"""
+
+    world = WorldState()
+    world.rooms = {"living_room": RoomState(id="living_room", light_level=300.0)}
+    world.users = {
+        "user_01": UserState(
+            id="user_01", name="User", location=Location3D(room="living_room")
+        )
+    }
+    world.rooms["living_room"].persons = ["user_01"]
+    world.rooms["living_room"].occupancy = True
+    world.devices = {
+        "light_living": DeviceState(
+            id="light_living",
+            type="light",
+            location=Location3D(room="living_room"),
+            capabilities=["power", "brightness"],
+            state=DeviceStateValues(power=False, extra={"brightness": 60}),
+        ),
+        "fan_living": DeviceState(
+            id="fan_living",
+            type="fan",
+            location=Location3D(room="living_room"),
+            capabilities=["power", "speed"],
+            state=DeviceStateValues(power=False, extra={"online": False, "speed": "low"}),
+        ),
+        "sensor_living": DeviceState(
+            id="sensor_living",
+            type="sensor",
+            location=Location3D(room="living_room"),
+            capabilities=["value"],
+            state=DeviceStateValues(extra={"value": 21.5}),
+        ),
+    }
+    return world
+
+
+def _collector():
+    events: list[SimEvent] = []
+
+    async def publish(event: SimEvent) -> SimEvent:
+        events.append(event)
+        return event
+
+    return events, publish
+
+
+@pytest.mark.anyio
+async def test_offline_device_writable_command_rejected_via_executor():
+    """§2.2：online=false 的设备不接受可写命令——状态层守卫抛不变式，命令路径世界零变更。"""
+
+    mgr = StateManager(_make_invariant_world())
+    fan = mgr.world.devices["fan_living"]
+
+    # 状态层守卫：即便调用方绕过入口校验，apply 前这一关也拦得住。
+    with pytest.raises(InvariantViolation) as excinfo:
+        mgr.check_command_invariants(fan, "power", caused_by="agent")
+    assert excinfo.value.invariant == "offline_device_write"
+
+    events, publish = _collector()
+    executor = CommandExecutor(mgr, publish)
+    record = await executor.submit(
+        DeviceCommand(
+            source=CommandSource.UI,
+            device_id="fan_living",
+            capability="power",
+            value=True,
+        )
+    )
+
+    assert record.status is CommandStatus.FAILED
+    assert mgr.world.devices["fan_living"].state.power is False
+    assert not [e for e in events if e.event_type == FEEDBACK_EVENT_TYPE]
+
+
+def test_agent_write_to_sensor_value_rejected_but_simulator_write_allowed():
+    """§2.2 第6条：只读能力只允许仿真源写入，agent/UI 一律拒。"""
+
+    mgr = StateManager(_make_invariant_world())
+    sensor = mgr.world.devices["sensor_living"]
+
+    for caused_by in ("agent", "user_ui", "ui", "scenario"):
+        with pytest.raises(InvariantViolation) as excinfo:
+            mgr.check_command_invariants(sensor, "value", caused_by=caused_by)
+        assert excinfo.value.invariant == "read_only_capability_write"
+
+    # 仿真引擎写只读能力是合法的（传感器读数本就由仿真产生）。
+    for caused_by in ("environment_sim", "user_behavior_sim", "simulator_timer", "system"):
+        mgr.check_command_invariants(sensor, "value", caused_by=caused_by)
+
+
+@pytest.mark.anyio
+async def test_invariant_violation_emits_structured_failure_event_and_fails_command():
+    """世界级不变式被破坏 → 回滚已落地 delta + system.invariant_violation + 命令 failed。"""
+
+    mgr = StateManager(_make_invariant_world())
+
+    def corrupting_effect(state_manager, command, deltas):
+        # 模拟一个把世界改坏的派生 effect：占用位与 persons 脱钩（§2.2 occupancy 可推导）。
+        return state_manager.apply_path_update(
+            caused_by="broken_effect",
+            path="rooms[living_room].persons",
+            new_value=[],
+            reason="corrupt world on purpose",
+        )
+
+    events, publish = _collector()
+    executor = CommandExecutor(mgr, publish, effects=corrupting_effect)
+    record = await executor.submit(
+        DeviceCommand(
+            source=CommandSource.UI,
+            device_id="light_living",
+            capability="power",
+            value=True,
+            correlation_id="corr-inv",
+            causal_parent="root-inv",
+        )
+    )
+
+    assert record.status is CommandStatus.FAILED
+    assert record.failure_code == INVARIANT_VIOLATION_ERROR_CODE
+
+    violations = [e for e in events if e.event_type == INVARIANT_VIOLATION_EVENT_TYPE]
+    assert len(violations) == 1
+    violation = violations[0]
+    assert violation.data["invariant"] == "occupancy_derivable_from_persons"
+    assert violation.data["device_id"] == "light_living"
+    assert violation.data["command_id"] == record.command.command_id
+    assert violation.correlation_id == "corr-inv"
+    action_event = next(e for e in events if e.event_type == ACTION_EVENT_TYPE)
+    assert violation.causal_parent == action_event.event_id
+    # 纠正（回滚）必须留痕，不允许静默纠正。
+    assert "rooms[living_room].persons" in violation.data["reverted_paths"]
+    assert f"devices[light_living].state.power" in violation.data["reverted_paths"]
+
+    failed = [e for e in events if e.event_type == COMMAND_FAILED_EVENT_TYPE]
+    assert len(failed) == 1
+    assert failed[0].data["error_code"] == INVARIANT_VIOLATION_ERROR_CODE
+
+    # 归因：这条违规确实是本命令造成的（apply 前世界干净），所以由本命令背锅。
+    assert violation.data["pre_existing"] is False
+    assert violation.data["attributed_to"] == "ui"
+    assert violation.data["command_failed"] is True
+
+    # 世界回到命令之前：既不落地半成品，也不留下被改坏的状态。
+    assert mgr.world.devices["light_living"].state.power is False
+    assert mgr.world.rooms["living_room"].persons == ["user_01"]
+    assert mgr.world.rooms["living_room"].occupancy is True
+    verify_world_invariants(mgr.world)
+    # 违规命令不产生反馈事件（评估器不会把它当成生效变更）。
+    assert not [e for e in events if e.event_type == FEEDBACK_EVENT_TYPE]
+
+
+@pytest.mark.anyio
+async def test_pre_existing_violation_blames_simulation_not_the_next_command():
+    """审计 finding 3：仿真写坏的世界不能让下一条无辜命令背锅，更不能把世界卡死。
+
+    检测与归因必须解耦——违规在 apply 之前就成立，说明责任在仿真写入方；命令照常执行，
+    只补发一条 pre_existing 的系统级违规事件。
+    """
+
+    mgr = StateManager(_make_invariant_world())
+    # 仿真直接写世界（S2 场景时间线 / §13 故障注入的真实写法）：user_01 同时出现在两个房间。
+    mgr.world.rooms["bedroom"] = RoomState(id="bedroom")
+    mgr.apply_updates(
+        caused_by="user_behavior_sim",
+        updates=[
+            ("rooms[bedroom].persons", ["user_01"]),
+            ("rooms[bedroom].occupancy", True),
+        ],
+        reason="simulator corrupts the world",
+    )
+
+    events, publish = _collector()
+    executor = CommandExecutor(mgr, publish)
+    record = await executor.submit(
+        DeviceCommand(
+            source=CommandSource.UI,
+            device_id="light_living",
+            capability="brightness",
+            value=80,
+        )
+    )
+
+    assert record.status is CommandStatus.SUCCEEDED
+    assert mgr.world.devices["light_living"].state.extra["brightness"] == 80
+
+    violations = [e for e in events if e.event_type == INVARIANT_VIOLATION_EVENT_TYPE]
+    assert len(violations) == 1
+    assert violations[0].data["invariant"] == "user_single_location"
+    assert violations[0].data["pre_existing"] is True
+    assert violations[0].data["attributed_to"] == "simulation"
+    assert violations[0].data["command_failed"] is False
+    # 无辜命令什么都没被回滚，也不产生 command_failed。
+    assert violations[0].data["reverted_paths"] == []
+    assert not [e for e in events if e.event_type == COMMAND_FAILED_EVENT_TYPE]
+    assert [e for e in events if e.event_type == FEEDBACK_EVENT_TYPE]
+
+    # 世界没有被卡死：不一致仍在，但后续命令依然可执行（否则每条命令都会连锁失败）。
+    events2, publish2 = _collector()
+    executor2 = CommandExecutor(mgr, publish2)
+    record2 = await executor2.submit(
+        DeviceCommand(
+            source=CommandSource.UI,
+            device_id="light_living",
+            capability="power",
+            value=True,
+        )
+    )
+    assert record2.status is CommandStatus.SUCCEEDED
+    assert mgr.world.devices["light_living"].state.power is True
+
+
+@pytest.mark.anyio
+async def test_pre_existing_violation_is_reported_once_per_signature_not_per_command():
+    """review2 finding-3：世界持续不一致时，每条命令补一条违规事件 = 可观测性面板洪水。
+
+    仿真写入路径早就按违规签名去抖了；命令路径必须同口径——同一条未修复的违规只报一次，
+    世界恢复一致后再坏才重新上报（去抖不是永久静音）。
+    """
+
+    mgr = StateManager(_make_invariant_world())
+    mgr.world.rooms["bedroom"] = RoomState(id="bedroom")
+
+    def corrupt() -> None:
+        mgr.apply_updates(
+            caused_by="user_behavior_sim",
+            updates=[
+                ("rooms[bedroom].persons", ["user_01"]),
+                ("rooms[bedroom].occupancy", True),
+            ],
+            reason="simulator corrupts the world",
+        )
+
+    def repair() -> None:
+        mgr.apply_updates(
+            caused_by="user_behavior_sim",
+            updates=[
+                ("rooms[bedroom].persons", []),
+                ("rooms[bedroom].occupancy", False),
+            ],
+            reason="simulator repairs the world",
+        )
+
+    corrupt()
+
+    events, publish = _collector()
+    # 生产里 UI 腿与 agent 腿共用引擎持有的那台 executor，所以去抖状态也必须是同一份。
+    executor = CommandExecutor(mgr, publish)
+
+    async def submit(value: int) -> None:
+        record = await executor.submit(
+            DeviceCommand(
+                source=CommandSource.UI,
+                device_id="light_living",
+                capability="brightness",
+                value=value,
+            )
+        )
+        assert record.status is CommandStatus.SUCCEEDED
+
+    def violations() -> list:
+        return [e for e in events if e.event_type == INVARIANT_VIOLATION_EVENT_TYPE]
+
+    def violation_count() -> int:
+        return len(violations())
+
+    for value in (80, 70, 60):
+        await submit(value)
+    assert violation_count() == 1
+    assert violations()[0].data["pre_existing"] is True
+
+    repair()
+    await submit(50)
+    assert violation_count() == 1
+
+    corrupt()
+    await submit(40)
+    assert violation_count() == 2
+
+
+@pytest.mark.anyio
+async def test_delta_carries_caused_by_event_id():
+    """§2.2 第7条：所有 mutation 可归因到 SimEvent——delta 带 action 事件 id。"""
+
+    mgr = StateManager(_make_invariant_world())
+    events, publish = _collector()
+    executor = CommandExecutor(mgr, publish)
+
+    record = await executor.submit(
+        DeviceCommand(
+            source=CommandSource.UI,
+            device_id="light_living",
+            capability="power",
+            value=True,
+        )
+    )
+
+    assert record.status is CommandStatus.SUCCEEDED
+    action_event = next(e for e in events if e.event_type == ACTION_EVENT_TYPE)
+    feedbacks = [e for e in events if e.event_type == FEEDBACK_EVENT_TYPE]
+    assert feedbacks
+    # 直控 delta 与派生 effect delta（房间光照）都必须可归因。
+    assert {e.data["path"] for e in feedbacks} >= {
+        "devices[light_living].state.power",
+        "rooms[living_room].light_level",
+    }
+    for feedback in feedbacks:
+        assert feedback.data["caused_by_event_id"] == action_event.event_id
+
+
+def test_verify_world_invariants_detects_user_in_two_rooms():
+    world = _make_invariant_world()
+    world.rooms["kitchen"] = RoomState(id="kitchen", persons=["user_01"], occupancy=True)
+
+    with pytest.raises(InvariantViolation) as excinfo:
+        verify_world_invariants(world)
+    assert excinfo.value.invariant == "user_single_location"
+
+
+def test_verify_world_invariants_detects_person_location_mismatch():
+    world = _make_invariant_world()
+    world.users["user_01"].location = Location3D(room="kitchen")
+
+    with pytest.raises(InvariantViolation) as excinfo:
+        verify_world_invariants(world)
+    assert excinfo.value.invariant == "person_location_matches_room"
+
+
+def test_verify_world_invariants_detects_device_in_unregistered_room():
+    world = _make_invariant_world()
+    world.devices["light_living"].location = Location3D(room="ghost_room")
+
+    with pytest.raises(InvariantViolation) as excinfo:
+        verify_world_invariants(world)
+    assert excinfo.value.invariant == "device_single_room"
+
+
+def test_revert_restores_state_in_reverse_order():
+    mgr = StateManager(_make_invariant_world())
+    deltas = mgr.apply_action(
+        agent_id="agent-1",
+        device_id="light_living",
+        property_path="power",
+        new_value=True,
+    )
+
+    reverted = mgr.revert(deltas)
+
+    assert mgr.world.devices["light_living"].state.power is False
+    assert mgr.world.devices["light_living"].state.last_changed_by == "system"
+    assert reverted == [delta.path for delta in deltas]
