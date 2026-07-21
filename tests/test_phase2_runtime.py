@@ -19,6 +19,7 @@ from backend.engine.state import (
     WorldState,
 )
 from backend.engine.state_manager import StateManager
+from backend.agents.lighting import LightingAgent
 from backend.agents.llm import LLMProvider, LLMProviderError
 from backend.agents.types import AgentLLMDecision, AgentCommandProposal, LLMDecisionRequest
 
@@ -313,3 +314,187 @@ async def test_runtime_caps_slow_provider_and_falls_back_quickly():
 
     assert elapsed < 0.2
     assert fallback_event["data"]["reason"] == "timeout"
+
+
+# ---------------------------------------------------------------------------
+# S1-T5：agent 胜出命令经 CommandExecutor（根治缺陷① 静默吞失败 / 仲裁 loser 生命周期）
+# ---------------------------------------------------------------------------
+
+
+class _ScriptedProvider(LLMProvider):
+    """按 agent_id 返回固定 proposals，让指定坏/冲突命令穿过 agent 层抵达 executor。"""
+
+    def __init__(self, commands_by_agent: dict[str, list[AgentCommandProposal]]) -> None:
+        self.commands_by_agent = commands_by_agent
+
+    async def generate_decision(self, request: LLMDecisionRequest) -> AgentLLMDecision:
+        return AgentLLMDecision(
+            intent="scripted intent",
+            confidence=0.9,
+            task_steps=["scripted step"],
+            proposed_commands=list(self.commands_by_agent.get(request.agent_id, [])),
+            explanation="scripted decision",
+            needs_coordination=True,
+        )
+
+
+class _PermissiveLightingAgent(LightingAgent):
+    """固定 agent_id 且放行任意 allowed-spec，使坏/冲突命令进入 runtime 胜出循环。"""
+
+    def __init__(self, agent_id: str, name: str, allowed_specs: list[dict[str, str]]) -> None:
+        super().__init__()
+        self.agent_id = agent_id
+        self.name = name
+        self._allowed_specs = allowed_specs
+
+    def get_allowed_command_specs(self, world_state, root_event):  # type: ignore[override]
+        return [dict(spec) for spec in self._allowed_specs]
+
+
+def _make_engine_with_agents(provider: LLMProvider, agents: list) -> SimulationEngine:
+    engine = SimulationEngine(
+        event_bus=EventBus(),
+        state_manager=StateManager(_make_world()),
+        connection_manager=ConnectionManager(),
+        llm_provider=provider,
+    )
+    engine.conn.broadcast = AsyncMock()  # type: ignore[method-assign]
+    engine.agent_runtime.agents.clear()
+    for agent in agents:
+        engine.agent_runtime.register(agent)
+    return engine
+
+
+def _activity_root(suffix: str) -> SimEvent:
+    return SimEvent(
+        event_id=f"root-{suffix}",
+        event_type="user.activity_change",
+        source="user_behavior_sim",
+        timestamp=9.0,
+        wall_time=9.0,
+        correlation_id=f"corr-{suffix}",
+        priority=2,
+        data={
+            "user_id": "user_01",
+            "from_room": "entry",
+            "to_room": "living_room",
+            "activity": "watching_tv",
+        },
+    )
+
+
+async def _run_until_idle(engine: SimulationEngine) -> None:
+    for _ in range(300):
+        pending = [task for task in engine.agent_runtime._background_tasks if not task.done()]
+        if not pending:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("agent episode did not finish in time")
+
+
+@pytest.mark.anyio
+async def test_agent_invalid_command_emits_failed_lifecycle_not_silent():
+    # 缺陷①回归钉：越界值经 executor 六级校验 → command.lifecycle failed + device.command_failed，
+    # 绝不静默吞、绝不下发 action/feedback、绝不动世界。
+    provider = _ScriptedProvider(
+        {
+            "lighting_agent": [
+                AgentCommandProposal(
+                    device_id="light_living_01",
+                    property="extra.brightness",
+                    value=999,  # 越界（0-100）
+                    reason="over range",
+                )
+            ]
+        }
+    )
+    engine = _make_engine_with_agents(
+        provider,
+        [
+            _PermissiveLightingAgent(
+                "lighting_agent",
+                "Lighting Agent",
+                [{"device_id": "light_living_01", "property": "extra.brightness"}],
+            )
+        ],
+    )
+
+    await engine._publish_sim_event(_activity_root("invalid"))
+    await _run_until_idle(engine)
+
+    events = _sim_events_from(engine)
+    event_types = [event["event_type"] for event in events]
+
+    lifecycle_failed = [
+        event
+        for event in events
+        if event["event_type"] == "command.lifecycle" and event["data"]["to_status"] == "failed"
+    ]
+    assert len(lifecycle_failed) == 1
+    assert lifecycle_failed[0]["data"]["failure_code"] == "invalid_value_range"
+
+    command_failed = [event for event in events if event["event_type"] == "device.command_failed"]
+    assert len(command_failed) == 1
+    assert command_failed[0]["data"]["error_code"] == "invalid_value_range"
+    assert command_failed[0]["data"]["device_id"] == "light_living_01"
+
+    assert "action.device_control" not in event_types
+    assert "feedback.state_delta" not in event_types
+    assert engine.state_manager.world.devices["light_living_01"].state.extra["brightness"] == 0
+
+
+@pytest.mark.anyio
+async def test_arbiter_loser_commands_emit_rejected_lifecycle():
+    # 仲裁 loser 命令进入 proposed→rejected 生命周期（带 conflict 详情），winner 落地。
+    provider = _ScriptedProvider(
+        {
+            "lighting_agent": [
+                AgentCommandProposal(
+                    device_id="light_living_01",
+                    property="extra.brightness",
+                    value=70,
+                    reason="winner",
+                )
+            ],
+            "lighting_agent_2": [
+                AgentCommandProposal(
+                    device_id="light_living_01",
+                    property="extra.brightness",
+                    value=40,
+                    reason="loser",
+                )
+            ],
+        }
+    )
+    engine = _make_engine_with_agents(
+        provider,
+        [
+            _PermissiveLightingAgent(
+                "lighting_agent",
+                "Lighting Agent",
+                [{"device_id": "light_living_01", "property": "extra.brightness"}],
+            ),
+            _PermissiveLightingAgent(
+                "lighting_agent_2",
+                "Lighting Agent 2",
+                [{"device_id": "light_living_01", "property": "extra.brightness"}],
+            ),
+        ],
+    )
+
+    await engine._publish_sim_event(_activity_root("conflict"))
+    await _run_until_idle(engine)
+
+    events = _sim_events_from(engine)
+    rejected = [
+        event
+        for event in events
+        if event["event_type"] == "command.lifecycle" and event["data"]["to_status"] == "rejected"
+    ]
+    assert len(rejected) == 1
+    assert rejected[0]["data"]["source"] == "agent"
+    assert rejected[0]["data"]["capability"] == "brightness"
+    assert rejected[0]["data"]["from_status"] == "proposed"
+
+    # 胜出命令真正落地
+    assert engine.state_manager.world.devices["light_living_01"].state.extra["brightness"] == 70

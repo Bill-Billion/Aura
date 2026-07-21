@@ -5,6 +5,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from backend.config.capability_matrix import read_only_capability_names
 from backend.engine.state import (
     DeviceCapability,
     DeviceState,
@@ -16,7 +17,9 @@ from backend.engine.state import (
 )
 
 
-READ_ONLY_CAPABILITIES = {"read", "view"}
+# 只读能力集合以能力矩阵（spec §3.2）为单一来源，避免校验分支里散落魔法常量。
+# 当前解析为 {"read", "view", "online"}；online 尚未进注册表能力位，故不影响现有设备。
+READ_ONLY_CAPABILITIES = read_only_capability_names()
 
 
 class DeviceRegistryEntry(BaseModel):
@@ -482,7 +485,15 @@ def validate_device_command(
     params: dict[str, Any] | None = None,
     property_path: str | None = None,
 ) -> tuple[str | None, str]:
-    """校验设备控制命令，返回错误码和可读说明。"""
+    """遗留兼容 shim：按实例 capabilities 查存在性+writable，返回旧词表错误码。
+
+    §3.3 六级顺序校验与 §10.2 十类失败码的唯一权威已迁至
+    ``backend.config.validation.validate_command``（按 §3.2 类型矩阵、含 online/类型/值域/
+    策略级）。本 shim 仅保留旧行为（仅存在性+writable、旧码 UNKNOWN_DEVICE/
+    DEVICE_NOT_CONTROLLABLE/INVALID_DEVICE_COMMAND、按 device.capabilities 实例判定且不接收
+    value），供 main.py WS 直控与 runtime.py agent 路径当前调用点使用——两条路径共用本 shim
+    是审计必修①奇偶校验的承重前提。S1-T5 迁移这两个调用点走 executor→validate_command 后，
+    本 shim 连同旧词表一并退役。"""
 
     if action in {"turn_on", "turn_off"}:
         if "power" not in device.capabilities:

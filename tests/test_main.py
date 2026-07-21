@@ -21,7 +21,7 @@ def _connect(client):
 def _receive_until_types(
     ws,
     expected: set[str],
-    max_messages: int = 8,
+    max_messages: int = 24,
     min_sim_events: int = 1,
 ) -> list[dict]:
     messages: list[dict] = []
@@ -192,7 +192,8 @@ def test_ws_cmd_device_control_turn_off(client):
             "type": "CMD_DEVICE_CONTROL",
             "payload": {"device_id": "light_living_01", "action": "turn_off"},
         })
-        data = ws.receive_json()
+        # 命令经 executor 后先发根事件与生命周期 SIM_EVENT，STATE_DELTA 在其后广播
+        data = _receive_until_message_type(ws, "STATE_DELTA")
         assert data["type"] == "STATE_DELTA"
         assert len(data["payload"]["deltas"]) > 0
 
@@ -209,7 +210,7 @@ def test_ws_cmd_device_control_set_state(client):
                 "params": {"brightness": 50},
             },
         })
-        data = ws.receive_json()
+        data = _receive_until_message_type(ws, "STATE_DELTA")
         assert data["type"] == "STATE_DELTA"
 
 
@@ -221,7 +222,8 @@ def test_ws_light_control_updates_room_light_feedback_immediately(client):
             "payload": {"device_id": "light_loft_01", "action": "turn_on"},
         })
 
-        data = ws.receive_json()
+        # 单条命令的所有 delta（设备功率 + 房间光照重算）聚合在同一条 STATE_DELTA 中
+        data = _receive_until_message_type(ws, "STATE_DELTA")
 
         assert data["type"] == "STATE_DELTA"
         paths = {delta["path"] for delta in data["payload"]["deltas"]}
@@ -241,9 +243,14 @@ def test_ws_cmd_device_control_updates_fan_state(client):
             },
         })
 
-        data = ws.receive_json()
-        assert data["type"] == "STATE_DELTA"
-        paths = {delta["path"] for delta in data["payload"]["deltas"]}
+        # set_state 多参数归一为多条 DeviceCommand，其 delta 聚合在同一 STATE_DELTA
+        messages = _receive_until_types(ws, {"STATE_DELTA"})
+        paths = {
+            delta["path"]
+            for message in messages
+            if message["type"] == "STATE_DELTA"
+            for delta in message["payload"]["deltas"]
+        }
         assert "devices[fan_living_01].state.extra.speed" in paths
         assert "devices[fan_living_01].state.extra.shake" in paths
 
@@ -260,7 +267,7 @@ def test_ws_cmd_device_control_legacy_property(client):
                 "value": False,
             },
         })
-        data = ws.receive_json()
+        data = _receive_until_message_type(ws, "STATE_DELTA")
         assert data["type"] == "STATE_DELTA"
 
 
@@ -272,13 +279,13 @@ def test_ws_cmd_device_control_no_delta(client):
             "type": "CMD_DEVICE_CONTROL",
             "payload": {"device_id": "light_living_01", "action": "turn_off"},
         })
-        ws.receive_json()  # STATE_DELTA (turn off)
+        _receive_until_message_type(ws, "STATE_DELTA")  # STATE_DELTA (turn off)
         ws.send_json({
             "type": "CMD_DEVICE_CONTROL",
             "payload": {"device_id": "light_living_01", "action": "turn_off"},
         })
-        # turning off an already-off device produces no delta, so no broadcast
-        # the connection stays open, close it to end the test
+        # turning off an already-off device produces no delta, so no STATE_DELTA broadcast
+        # (生命周期事件仍会外发)；连接保持打开，关闭以结束测试
         ws.close()
 
 
@@ -323,9 +330,137 @@ def test_ws_cmd_device_control_rejects_sensor_write(client):
             },
         })
 
-        data = ws.receive_json()
+        # 经 executor 六级校验：sensor 无 value 能力 → §10.2 capability_not_supported
+        data = _receive_until_message_type(ws, "ERROR")
         assert data["type"] == "ERROR"
-        assert data["payload"]["code"] == "DEVICE_NOT_CONTROLLABLE"
+        assert data["payload"]["code"] == "capability_not_supported"
         assert data["payload"]["message"]
         assert isinstance(data["payload"]["details"], dict)
         assert data["payload"]["details"]["device_id"] == "sensor_living_temp_01"
+
+
+# ---------------------------------------------------------------------------
+# S1-T5: UI 直控经 CommandExecutor（根事件先于 STATE_DELTA、完整生命周期、
+# 坏消息回结构化 ERROR 不杀连接）
+# ---------------------------------------------------------------------------
+
+
+def test_ui_command_emits_root_event_before_state_delta(client):
+    # 修审计§六⑤：根 user.command SIM_EVENT 必须先于 STATE_DELTA（旧实现顺序倒置）
+    with _connect(client) as ws:
+        ws.receive_json()  # initial STATE_FULL
+        ws.send_json({
+            "type": "CMD_DEVICE_CONTROL",
+            "payload": {"device_id": "light_living_01", "action": "turn_off"},
+        })
+        messages = _receive_until_types(ws, {"STATE_DELTA"})
+        types = [message["type"] for message in messages]
+        state_delta_index = types.index("STATE_DELTA")
+        root_index = next(
+            i
+            for i, message in enumerate(messages)
+            if message["type"] == "SIM_EVENT"
+            and message["payload"]["event_type"] == "user.command"
+        )
+        assert root_index < state_delta_index
+
+
+def test_ui_command_full_lifecycle_visible_over_ws(client):
+    # spec §15 验收：一条 UI 命令的完整生命周期 proposed→…→succeeded 经 SIM_EVENT 外发
+    with _connect(client) as ws:
+        ws.receive_json()  # initial STATE_FULL
+        ws.send_json({
+            "type": "CMD_DEVICE_CONTROL",
+            "payload": {"device_id": "light_living_01", "action": "turn_off"},
+        })
+        messages = _receive_until_types(ws, {"STATE_DELTA"})
+        statuses = [
+            message["payload"]["data"]["to_status"]
+            for message in messages
+            if message["type"] == "SIM_EVENT"
+            and message["payload"]["event_type"] == "command.lifecycle"
+        ]
+        for expected in ("proposed", "approved", "validated", "executing", "succeeded"):
+            assert expected in statuses
+        # 生命周期事件来源固定为 command_executor
+        lifecycle_sources = {
+            message["payload"]["source"]
+            for message in messages
+            if message["type"] == "SIM_EVENT"
+            and message["payload"]["event_type"] == "command.lifecycle"
+        }
+        assert lifecycle_sources == {"command_executor"}
+
+
+def test_invalid_ui_command_returns_error_with_spec_code_and_connection_survives(client):
+    # 治『一条坏消息杀连接』：非法命令回 §10.2 码 ERROR 后，同一连接继续发合法命令仍成功
+    with _connect(client) as ws:
+        ws.receive_json()  # initial STATE_FULL
+        ws.send_json({
+            "type": "CMD_DEVICE_CONTROL",
+            "payload": {"device_id": "ghost_device", "action": "turn_on"},
+        })
+        err = _receive_until_message_type(ws, "ERROR")
+        assert err["type"] == "ERROR"
+        assert err["payload"]["code"] == "unknown_device"
+        assert err["payload"]["details"]["device_id"] == "ghost_device"
+
+        ws.send_json({
+            "type": "CMD_DEVICE_CONTROL",
+            "payload": {"device_id": "light_living_01", "action": "turn_off"},
+        })
+        delta = _receive_until_message_type(ws, "STATE_DELTA")
+        assert delta["type"] == "STATE_DELTA"
+        assert len(delta["payload"]["deltas"]) > 0
+
+
+def test_malformed_json_message_gets_error_not_disconnect(client):
+    # 逐消息 try/except：非法 JSON 回结构化 ERROR，不落入外层 except 杀连接
+    with _connect(client) as ws:
+        ws.receive_json()  # initial STATE_FULL
+        ws.send_text("this is not json {{{")
+        err = _receive_until_message_type(ws, "ERROR")
+        assert err["type"] == "ERROR"
+        assert err["payload"]["code"]
+
+        # 坏消息后连接仍在：合法命令继续成功
+        ws.send_json({
+            "type": "CMD_DEVICE_CONTROL",
+            "payload": {"device_id": "light_living_01", "action": "turn_off"},
+        })
+        delta = _receive_until_message_type(ws, "STATE_DELTA")
+        assert delta["type"] == "STATE_DELTA"
+
+
+def test_structurally_invalid_device_payload_returns_invalid_payload(client):
+    # CmdDeviceControlPayload 结构守卫：device_id 缺失是消息层问题，不是 §10.2 命令失败
+    with _connect(client) as ws:
+        ws.receive_json()  # initial STATE_FULL
+        ws.send_json({"type": "CMD_DEVICE_CONTROL", "payload": {"action": "turn_on"}})
+        err = _receive_until_message_type(ws, "ERROR")
+        assert err["payload"]["code"] == "invalid_payload"
+        assert err["payload"]["details"]["issues"]
+
+
+def test_unsupported_message_type_returns_error_and_connection_survives(client):
+    with _connect(client) as ws:
+        ws.receive_json()  # initial STATE_FULL
+        ws.send_json({"type": "CMD_NOT_A_THING", "payload": {}})
+        err = _receive_until_message_type(ws, "ERROR")
+        assert err["payload"]["code"] == "unsupported_message_type"
+        assert err["payload"]["details"]["type"] == "CMD_NOT_A_THING"
+
+        ws.send_json({"type": "CMD_SIM_SPEED", "payload": {"speed": 2.0}})
+        status = _receive_until_message_type(ws, "SIMULATION_STATUS")
+        assert status["payload"]["speed"] == 2.0
+
+
+def test_heartbeat_pong_is_accepted_without_error(client):
+    # 前端心跳应答不是未知类型：收到后必须静默，否则前端会被自己的心跳刷屏
+    with _connect(client) as ws:
+        ws.receive_json()  # initial STATE_FULL
+        ws.send_json({"type": "HEARTBEAT_PONG", "payload": {"timestamp": 1}})
+        ws.send_json({"type": "CMD_SIM_SPEED", "payload": {"speed": 1.5}})
+        data = ws.receive_json()
+        assert data["type"] == "SIMULATION_STATUS"
+        assert data["payload"]["speed"] == 1.5

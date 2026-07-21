@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 
 from backend.engine.state import WorldState
+from backend.simulators.effects import derive_observable_updates
 
 
 TEMP_OUTDOOR_DIFFUSION_RATE = 0.002
@@ -104,6 +105,7 @@ class EnvironmentSimulator:
         }
 
         # 设计意图：天气和室外温度先走确定性日变化曲线，方便对照调试和截图回归。
+        room_overrides: dict[str, dict[str, float]] = {}
         for room_id, room in state.rooms.items():
             next_temperature = room.temperature
             diffusion = TEMP_OUTDOOR_DIFFUSION_RATE * dt * (outdoor_temp - next_temperature)
@@ -120,5 +122,12 @@ class EnvironmentSimulator:
 
             updates[f"rooms[{room_id}].temperature"] = round(next_temperature, 2)
             updates[f"rooms[{room_id}].light_level"] = calculate_room_light_level(state, room_id)
+            room_overrides[room_id] = {
+                "temperature": round(next_temperature, 2),
+                "light_level": updates[f"rooms[{room_id}].light_level"],
+            }
 
+        # §3.4 派生量随物理量同批刷新：体感温度 / 安防覆盖 / 传感器读数都读本 tick 的
+        # 新 ground truth（而非上一 tick 的世界），避免观测值恒慢一拍。
+        updates.update(derive_observable_updates(state, room_overrides))
         return updates

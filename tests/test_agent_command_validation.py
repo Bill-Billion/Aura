@@ -22,7 +22,6 @@ from backend.agents.types import (
     LLMDecisionRequest,
 )
 from backend.api.ws import ConnectionManager
-from backend.config.device_registry import validate_device_command
 from backend.engine.event_bus import EventBus, SimEvent
 from backend.engine.simulation import SimulationEngine
 from backend.engine.state import (
@@ -203,10 +202,11 @@ async def test_unknown_device_command_emits_failure_not_silence():
     assert len(failures) == 1
     failure = failures[0]
     assert failure["correlation_id"] == root_event.correlation_id
-    assert failure["data"]["agent_id"] == "lighting_agent"
+    # executor 的 device.command_failed 词表（S1-T4）：source/capability 取代旧 agent_id/property
+    assert failure["data"]["source"] == "agent"
     assert failure["data"]["device_id"] == "ghost_device"
-    assert failure["data"]["property"] == "extra.brightness"
-    assert failure["data"]["error_code"]
+    assert failure["data"]["capability"] == "brightness"
+    assert failure["data"]["error_code"] == "unknown_device"  # §10.2
     assert failure["data"]["reason"]
 
     execution_plan = next(
@@ -245,13 +245,9 @@ async def test_read_only_capability_rejected():
     failure = failures[0]
 
     sensor = engine.state_manager.world.devices["sensor_living_temp_01"]
-    expected_code, _ = validate_device_command(
-        sensor,
-        action="",
-        property_path="extra.value",
-    )
-    assert expected_code  # sanity: the shared validator rejects this command
-    assert failure["data"]["error_code"] == expected_code
+    # §10.2 词表：sensor 未声明 value 能力（只有 read），经 executor 六级校验 →
+    # capability_not_supported。命令被拒、传感器 ground truth 不被改写。
+    assert failure["data"]["error_code"] == "capability_not_supported"
 
     assert sensor.state.extra["value"] == 26.5
     assert _mutation_snapshot(engine) == before
@@ -388,5 +384,9 @@ def test_agent_and_ui_paths_reject_identically():
         _agent_failure_code("sensor_living_temp_01", "extra.value", 18)
     )
 
+    # 承重断言：两条路径对同一坏命令产出完全相同的错误码。
     assert agent_unknown_code == ui_unknown_code
     assert agent_read_only_code == ui_read_only_code
+    # 并且已迁移到 §10.2 十码词表（S1-T2）。
+    assert ui_unknown_code == "unknown_device"
+    assert ui_read_only_code == "capability_not_supported"

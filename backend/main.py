@@ -3,17 +3,17 @@ from __future__ import annotations
 import asyncio
 import time
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
+from typing import Any, AsyncGenerator
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import ValidationError
 
 from backend.api.routes import configure_health_provider, router as api_router
 from backend.api.ws import ConnectionManager
 from backend.config.device_registry import (
     build_default_devices,
     build_default_rooms,
-    validate_device_command,
 )
 from backend.core.logging import log
 from backend.core.local_env import load_local_env
@@ -25,9 +25,10 @@ from backend.engine.state import (
 )
 from backend.engine.event_bus import EventBus, SimEvent
 from backend.engine.simulation import SimulationEngine
-from backend.engine.state_manager import StateManager
-from backend.models.schemas import ErrorMessage, WSMessage
-from backend.simulators.environment import calculate_room_light_level
+from backend.engine.state_manager import DeltaChange, StateManager
+from backend.execution.command import CommandSource, DeviceCommand, PublishEvent
+from backend.execution.executor import CommandExecutor, FEEDBACK_EVENT_TYPE
+from backend.models.schemas import CmdDeviceControlPayload, ErrorMessage, WSMessage
 
 
 # ---------------------------------------------------------------------------
@@ -39,6 +40,15 @@ event_bus = EventBus()
 state_manager: StateManager | None = None
 simulation_engine: SimulationEngine | None = None
 load_local_env()
+
+
+# WS 层结构性错误码，与 §10.2 命令失败码正交：这些描述"消息本身不合法"，
+# 一旦命令成形，错误码一律取 CommandErrorCode（executor 拥有）。S5 可观测性 UI 直接消费。
+WS_ERROR_MALFORMED_MESSAGE = "malformed_message"
+WS_ERROR_INVALID_PAYLOAD = "invalid_payload"
+WS_ERROR_INVALID_DEVICE_COMMAND = "invalid_device_command"
+WS_ERROR_UNSUPPORTED_MESSAGE_TYPE = "unsupported_message_type"
+WS_ERROR_INTERNAL = "internal_error"
 
 
 async def _broadcast_sim_event(event: SimEvent) -> SimEvent:
@@ -106,42 +116,36 @@ def _runtime_health() -> dict[str, object]:
     }
 
 
-def _command_affects_room_light(
-    device,
-    *,
-    action: str,
-    params: dict[str, object],
-    property_path: str,
-) -> bool:
-    normalized_property = property_path.removeprefix("extra.")
+def _collecting_publish(collected: list[DeltaChange]) -> PublishEvent:
+    """给 executor 的 publish 包装：照常外发事件，顺手把反馈里的 delta 攒起来。
 
-    if device.type == "light":
-        return (
-            action in {"turn_on", "turn_off"}
-            or "brightness" in params
-            or normalized_property in {"power", "brightness"}
-        )
+    房间光照重算已随 executor 的 room_light_effect 统一（main.py 那份重复判定随之退役），
+    收集在这里做是为了把一条 WS 消息的所有命令的 delta 聚合成单条 STATE_DELTA 广播，
+    保持前端"一条命令一次状态刷新"的既有口径。
+    """
 
-    if device.type == "curtain":
-        return "open_percent" in params or normalized_property == "open_percent"
+    async def publish(event: SimEvent) -> SimEvent:
+        published = await _broadcast_sim_event(event)
+        if published.event_type == FEEDBACK_EVENT_TYPE:
+            collected.append(DeltaChange.model_validate(published.data))
+        return published
 
-    return False
+    return publish
 
 
-def _append_room_light_feedback(device, deltas: list) -> None:
-    assert state_manager is not None
-    room_id = device.location.room
-    if room_id not in state_manager.world.rooms:
-        return
+def _ui_command_targets(payload: CmdDeviceControlPayload) -> list[tuple[str, Any]]:
+    """四种入站格式（turn_on / turn_off / set_state / 旧 property-value）归一为 (能力, 值) 对。"""
 
-    deltas.extend(
-        state_manager.apply_path_update(
-            caused_by="user",
-            path=f"rooms[{room_id}].light_level",
-            new_value=calculate_room_light_level(state_manager.world, room_id),
-            reason="apply device light feedback",
-        )
-    )
+    if payload.action == "turn_on":
+        return [("power", True)]
+    if payload.action == "turn_off":
+        return [("power", False)]
+    if payload.action == "set_state":
+        return list(payload.params.items())
+    if payload.property:
+        # 旧格式 property 是点路径（power / extra.brightness），能力名去掉 extra. 前缀。
+        return [(payload.property.removeprefix("extra."), payload.value)]
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -235,9 +239,205 @@ configure_health_provider(_runtime_health)
 # ---------------------------------------------------------------------------
 
 
+async def _handle_device_control(ws: WebSocket, raw_payload: dict) -> None:
+    """CMD_DEVICE_CONTROL：入站结构守卫 → 根事件 → CommandExecutor（spec §10 步骤 4-8）。
+
+    审计必修①：UI 直控不再自己 apply_action/自己拼校验分支，与 agent 路径共用同一台
+    executor（同一六级校验、同一十态生命周期、同一失败词表）。
+    审计§六⑤：根 user.command 事件先于任何 STATE_DELTA 外发，前端拿到状态变更时因果头已在手。
+    """
+
+    assert state_manager is not None
+
+    try:
+        payload = CmdDeviceControlPayload.model_validate(raw_payload)
+    except ValidationError as exc:
+        await _send_ws_error(
+            ws,
+            WS_ERROR_INVALID_PAYLOAD,
+            "设备控制载荷结构非法",
+            details={
+                "issues": [
+                    f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}"
+                    for error in exc.errors()
+                ]
+            },
+        )
+        return
+
+    targets = _ui_command_targets(payload)
+    if not targets:
+        await _send_ws_error(
+            ws,
+            WS_ERROR_INVALID_DEVICE_COMMAND,
+            "设备控制命令缺少可执行的 action 或 property",
+            details={"device_id": payload.device_id, "action": payload.action},
+        )
+        return
+
+    tick = int(state_manager.world.simulation_tick)
+    root_event = event_bus.coerce_event(
+        SimEvent(
+            event_type="user.command",
+            source="user_ui",
+            timestamp=float(tick),
+            wall_time=time.time(),
+            priority=2,
+            data={
+                "message_type": "CMD_DEVICE_CONTROL",
+                "device_id": payload.device_id,
+                "action": payload.action or payload.property or "",
+                "params": payload.params if payload.params else {"value": payload.value},
+            },
+        )
+    )
+    # 先广播再入总线：根事件必须是这条命令外发的第一条 WS 消息（修顺序倒置）。
+    await manager.broadcast(WSMessage(type="SIM_EVENT", payload=root_event.model_dump()))
+    await event_bus.publish(root_event)
+
+    collected: list[DeltaChange] = []
+    # executor 按条构造：state_manager 会在 CMD_SIM_RESET 时被换新，绑定当前世界最安全。
+    executor = CommandExecutor(state_manager, _collecting_publish(collected))
+    commands = [
+        DeviceCommand(
+            source=CommandSource.UI,
+            device_id=payload.device_id,
+            capability=capability,
+            value=value,
+            reason=f"ui {payload.action or payload.property or 'command'}",
+            correlation_id=root_event.correlation_id,
+            causal_parent=root_event.event_id,
+            issued_tick=tick,
+            priority=2,
+        )
+        for capability, value in targets
+    ]
+    records = await executor.submit_batch(commands, tick=tick)
+
+    if collected:
+        await manager.broadcast(
+            WSMessage(
+                type="STATE_DELTA",
+                payload={"deltas": [delta.model_dump() for delta in collected]},
+            )
+        )
+
+    for record in records:
+        if record.failure_code is None:
+            continue
+        # 失败码直接取 §10.2 词表，和 agent 路径同码（审计必修①奇偶校验）。
+        await _send_ws_error(
+            ws,
+            record.failure_code,
+            record.detail or "设备命令未能执行",
+            details={
+                "device_id": record.command.device_id,
+                "capability": record.command.capability,
+                "command_id": record.command.command_id,
+                "status": record.status.value,
+            },
+        )
+
+
+async def _handle_ws_message(ws: WebSocket, raw: Any) -> None:
+    """处理单条入站消息；结构问题一律回 ERROR，不抛异常杀连接。"""
+
+    global state_manager
+
+    if not isinstance(raw, dict):
+        await _send_ws_error(ws, WS_ERROR_MALFORMED_MESSAGE, "消息必须是 JSON 对象")
+        return
+
+    msg_type = raw.get("type", "")
+    payload = raw.get("payload") or {}
+    if not isinstance(payload, dict):
+        await _send_ws_error(
+            ws,
+            WS_ERROR_INVALID_PAYLOAD,
+            "payload 必须是 JSON 对象",
+            details={"type": str(msg_type)},
+        )
+        return
+
+    if msg_type == "CMD_DEVICE_CONTROL":
+        await _handle_device_control(ws, payload)
+
+    elif msg_type == "CMD_SIM_START":
+        if simulation_engine is not None:
+            await simulation_engine.start()
+            await manager.broadcast(
+                WSMessage(
+                    type="SIMULATION_STATUS",
+                    payload=simulation_engine.build_simulation_status_payload(),
+                )
+            )
+
+    elif msg_type == "CMD_SIM_PAUSE":
+        if simulation_engine is not None:
+            await simulation_engine.pause()
+            await manager.broadcast(
+                WSMessage(
+                    type="SIMULATION_STATUS",
+                    payload=simulation_engine.build_simulation_status_payload(),
+                )
+            )
+
+    elif msg_type == "CMD_SIM_RESET":
+        state_manager = _init_default_state()
+        if simulation_engine is not None:
+            await simulation_engine.reset(new_state_manager=state_manager)
+        full = state_manager.get_full_snapshot()
+        await manager.broadcast(WSMessage(type="STATE_FULL", payload=full))
+        if simulation_engine is not None:
+            await manager.broadcast(
+                WSMessage(
+                    type="SIMULATION_STATUS",
+                    payload=simulation_engine.build_simulation_status_payload(),
+                )
+            )
+
+    elif msg_type == "CMD_SIM_SPEED":
+        speed = payload.get("speed", 1.0)
+        if simulation_engine is not None:
+            simulation_engine.apply_legacy_speed(float(speed))
+        await manager.broadcast(
+            WSMessage(
+                type="SIMULATION_STATUS",
+                payload=(
+                    simulation_engine.build_simulation_status_payload()
+                    if simulation_engine is not None
+                    else {"speed": float(speed)}
+                ),
+            )
+        )
+
+    elif msg_type == "CMD_SIM_MODE":
+        mode = str(payload.get("mode", "observe"))
+        if simulation_engine is not None:
+            simulation_engine.mode = mode
+            await manager.broadcast(
+                WSMessage(
+                    type="SIMULATION_STATUS",
+                    payload=simulation_engine.build_simulation_status_payload(),
+                )
+            )
+
+    elif msg_type == "HEARTBEAT_PONG":
+        # 前端心跳应答（useWebSocket.ts 收到 PING 才发）。后端当前不发 PING，
+        # 收到也只作保活，不能当未知类型回 ERROR，否则前端会被自己的心跳刷屏。
+        return
+
+    else:
+        await _send_ws_error(
+            ws,
+            WS_ERROR_UNSUPPORTED_MESSAGE_TYPE,
+            f"不支持的消息类型 {msg_type}",
+            details={"type": str(msg_type)},
+        )
+
+
 @app.websocket("/ws/simulation")
 async def ws_simulation(ws: WebSocket) -> None:
-    global state_manager, simulation_engine
     assert state_manager is not None
 
     full_state = state_manager.get_full_snapshot()
@@ -245,209 +445,32 @@ async def ws_simulation(ws: WebSocket) -> None:
 
     try:
         while True:
-            raw = await ws.receive_json()
-
-            msg_type = raw.get("type", "")
-            payload = raw.get("payload", {})
-
-            if msg_type == "CMD_DEVICE_CONTROL":
-                device_id = payload.get("device_id", "")
-                action = payload.get("action", "")
-                params = payload.get("params", {})
-                # Legacy format support
-                prop = payload.get("property", "")
-                value = payload.get("value")
-
-                deltas: list = []
-                device = state_manager.world.devices.get(device_id) if device_id else None
-                if device_id and device is None:
-                    await _send_ws_error(
-                        ws,
-                        "UNKNOWN_DEVICE",
-                        f"设备 {device_id} 不存在",
-                        details={"device_id": device_id},
-                    )
-                    continue
-
-                if device and action:
-                    error_code, error_message = validate_device_command(
-                        device,
-                        action=action,
-                        params=params,
-                    )
-                    if error_code:
-                        await _send_ws_error(
-                            ws,
-                            error_code,
-                            error_message,
-                            details={"device_id": device_id, "action": action},
-                        )
-                        continue
-
-                    # action/params format (from frontend UI)
-                    if action == "turn_on":
-                        deltas = state_manager.apply_action(
-                            "user", device_id, "power", True
-                        )
-                    elif action == "turn_off":
-                        deltas = state_manager.apply_action(
-                            "user", device_id, "power", False
-                        )
-                    elif action == "set_state" and params:
-                        for k, v in params.items():
-                            deltas.extend(
-                                state_manager.apply_action(
-                                    "user", device_id, f"extra.{k}", v
-                                )
-                            )
-                    if _command_affects_room_light(
-                        device,
-                        action=action,
-                        params=params,
-                        property_path="",
-                    ):
-                        _append_room_light_feedback(device, deltas)
-                elif device and prop and value is not None:
-                    error_code, error_message = validate_device_command(
-                        device,
-                        action="",
-                        property_path=prop,
-                    )
-                    if error_code:
-                        await _send_ws_error(
-                            ws,
-                            error_code,
-                            error_message,
-                            details={"device_id": device_id, "action": prop},
-                        )
-                        continue
-
-                    # property/value format (legacy)
-                    deltas = state_manager.apply_action(
-                        "user", device_id, prop, value
-                    )
-                    if _command_affects_room_light(
-                        device,
-                        action="",
-                        params={},
-                        property_path=prop,
-                    ):
-                        _append_room_light_feedback(device, deltas)
-                else:
-                    await _send_ws_error(
-                        ws,
-                        "INVALID_DEVICE_COMMAND",
-                        "设备控制命令缺少 action 或 property",
-                        details={"device_id": device_id},
-                    )
-                    continue
-
-                root_event = event_bus.coerce_event(
-                    SimEvent(
-                        event_type="user.command",
-                        source="user_ui",
-                        timestamp=float(state_manager.world.simulation_tick),
-                        wall_time=time.time(),
-                        priority=2,
-                        data={
-                            "message_type": msg_type,
-                            "device_id": device_id,
-                            "action": action or prop,
-                            "params": params if params else {"value": value},
-                        },
-                    )
+            # 逐消息 try/except：一条坏消息（非法 JSON / 结构错 / 处理时内部异常）只换来一条
+            # ERROR，绝不落入外层 except 把整条连接拆掉——观察者会话不该被单条坏帧终结。
+            try:
+                raw = await ws.receive_json()
+            except WebSocketDisconnect:
+                raise
+            except (ValueError, TypeError, KeyError):
+                await _send_ws_error(
+                    ws,
+                    WS_ERROR_MALFORMED_MESSAGE,
+                    "消息不是合法的 JSON 文本",
                 )
-                await event_bus.publish(root_event)
+                continue
 
-                if deltas:
-                    delta_payload = {
-                        "deltas": [d.model_dump() for d in deltas],
-                    }
-                    await manager.broadcast(
-                        WSMessage(type="STATE_DELTA", payload=delta_payload)
-                    )
-                    await manager.broadcast(
-                        WSMessage(type="SIM_EVENT", payload=root_event.model_dump())
-                    )
-                    for delta in deltas:
-                        await _broadcast_sim_event(
-                            SimEvent(
-                                event_type="feedback.state_delta",
-                                source="state_manager",
-                                timestamp=float(state_manager.world.simulation_tick),
-                                wall_time=time.time(),
-                                correlation_id=root_event.correlation_id,
-                                causal_parent=root_event.event_id,
-                                priority=1,
-                                data=delta.model_dump(),
-                            )
-                        )
-                else:
-                    await manager.broadcast(
-                        WSMessage(type="SIM_EVENT", payload=root_event.model_dump())
-                    )
-
-            elif msg_type == "CMD_SIM_START":
-                if simulation_engine is not None:
-                    await simulation_engine.start()
-                    await manager.broadcast(
-                        WSMessage(
-                            type="SIMULATION_STATUS",
-                            payload=simulation_engine.build_simulation_status_payload(),
-                        )
-                    )
-
-            elif msg_type == "CMD_SIM_PAUSE":
-                if simulation_engine is not None:
-                    await simulation_engine.pause()
-                    await manager.broadcast(
-                        WSMessage(
-                            type="SIMULATION_STATUS",
-                            payload=simulation_engine.build_simulation_status_payload(),
-                        )
-                    )
-
-            elif msg_type == "CMD_SIM_RESET":
-                state_manager = _init_default_state()
-                if simulation_engine is not None:
-                    await simulation_engine.reset(new_state_manager=state_manager)
-                full = state_manager.get_full_snapshot()
-                await manager.broadcast(
-                    WSMessage(type="STATE_FULL", payload=full)
+            try:
+                await _handle_ws_message(ws, raw)
+            except WebSocketDisconnect:
+                raise
+            except Exception:
+                log.exception("ws_message_error")
+                await _send_ws_error(
+                    ws,
+                    WS_ERROR_INTERNAL,
+                    "处理消息时发生内部错误",
+                    details={"type": str(raw.get("type", "")) if isinstance(raw, dict) else ""},
                 )
-                if simulation_engine is not None:
-                    await manager.broadcast(
-                        WSMessage(
-                            type="SIMULATION_STATUS",
-                            payload=simulation_engine.build_simulation_status_payload(),
-                        )
-                    )
-
-            elif msg_type == "CMD_SIM_SPEED":
-                speed = payload.get("speed", 1.0)
-                if simulation_engine is not None:
-                    simulation_engine.apply_legacy_speed(float(speed))
-                await manager.broadcast(
-                    WSMessage(
-                        type="SIMULATION_STATUS",
-                        payload=(
-                            simulation_engine.build_simulation_status_payload()
-                            if simulation_engine is not None
-                            else {"speed": float(speed)}
-                        ),
-                    )
-                )
-
-            elif msg_type == "CMD_SIM_MODE":
-                mode = str(payload.get("mode", "observe"))
-                if simulation_engine is not None:
-                    simulation_engine.mode = mode
-                    await manager.broadcast(
-                        WSMessage(
-                            type="SIMULATION_STATUS",
-                            payload=simulation_engine.build_simulation_status_payload(),
-                        )
-                    )
 
     except WebSocketDisconnect:
         manager.disconnect(ws)
