@@ -1,0 +1,175 @@
+"""§4.1 事件分类学的**单一来源**（S2-T6）。
+
+在 S2 之前，仿真只会发三种根事件（``user.activity_change`` / ``user.command`` /
+``environment.state_refresh``）。它们能跑，但表达不了"发生了什么"——"用户活动变了"
+既可能是下班到家，也可能是半夜去洗手间，agent 只能从房间 id 反推语义。§4.1 给出的
+十四个富根事件把语义搬回事件名上，场景 YAML 从此可以直接声明"用户到家了"。
+
+三条边界：
+
+1. **单一来源**：``backend/scenarios/spec.py`` 的 ``ROOT_EVENT_TYPES`` 直接 re-export
+   本模块的常量（同一个 frozenset 对象，不是内容相同的第二份）。两份分类学 = 两套真相，
+   场景校验放行的事件类型和运行期识别的事件类型迟早会分叉。
+2. **本模块零依赖**：只放字符串常量与纯函数，不 import 任何 engine/scenarios 模块，
+   因此 agent 层、场景层、执行层都能安全引用它。
+3. **兼容期不砍旧名**：§4.1 明确"current event names may remain during migration"。
+   :data:`COMPAT_ALIAS` 给出富事件 → 旧兼容事件的回落映射，只订阅了旧名的消费者
+   （老前端过滤器、旧测试）据此仍能理解富事件属于哪一类。
+"""
+
+from __future__ import annotations
+
+__all__ = [
+    "USER_ARRIVES_HOME",
+    "USER_LEAVES_HOME",
+    "USER_ENTERS_ROOM",
+    "USER_EXITS_ROOM",
+    "USER_STARTS_ACTIVITY",
+    "USER_ENDS_ACTIVITY",
+    "ENVIRONMENT_WEATHER_CHANGE",
+    "ENVIRONMENT_TEMPERATURE_THRESHOLD",
+    "ENVIRONMENT_LIGHT_LEVEL_THRESHOLD",
+    "SECURITY_PRESENCE_DETECTED",
+    "SECURITY_DOOR_OPENED",
+    "SAFETY_SMOKE_DETECTED",
+    "DEVICE_OFFLINE",
+    "DEVICE_RECOVERED",
+    "USER_ACTIVITY_CHANGE",
+    "USER_COMMAND",
+    "ENVIRONMENT_STATE_REFRESH",
+    "TIMER_TICK_EVENT_TYPE",
+    "ENGINE_ERROR_EVENT_TYPE",
+    "ROOT_EVENT_TYPES",
+    "COMPAT_ROOT_EVENT_TYPES",
+    "ALLOWED_TIMELINE_EVENT_TYPES",
+    "ALL_ROOT_EVENT_TYPES",
+    "USER_MOVEMENT_EVENT_TYPES",
+    "ENVIRONMENT_ROOT_EVENT_TYPES",
+    "DEVICE_AVAILABILITY_EVENT_TYPES",
+    "COMPAT_ALIAS",
+    "compat_event_type",
+    "is_root_event",
+    "OUTSIDE_ROOM_ID",
+]
+
+
+# —— §4.1 十四个富根事件 ——
+USER_ARRIVES_HOME = "user.arrives_home"
+USER_LEAVES_HOME = "user.leaves_home"
+USER_ENTERS_ROOM = "user.enters_room"
+USER_EXITS_ROOM = "user.exits_room"
+USER_STARTS_ACTIVITY = "user.starts_activity"
+USER_ENDS_ACTIVITY = "user.ends_activity"
+ENVIRONMENT_WEATHER_CHANGE = "environment.weather_change"
+ENVIRONMENT_TEMPERATURE_THRESHOLD = "environment.temperature_threshold"
+ENVIRONMENT_LIGHT_LEVEL_THRESHOLD = "environment.light_level_threshold"
+SECURITY_PRESENCE_DETECTED = "security.presence_detected"
+SECURITY_DOOR_OPENED = "security.door_opened"
+SAFETY_SMOKE_DETECTED = "safety.smoke_detected"
+DEVICE_OFFLINE = "device.offline"
+DEVICE_RECOVERED = "device.recovered"
+
+# —— §4.1 "current compatibility namespace"（迁移期保留，新场景不应再用）——
+USER_ACTIVITY_CHANGE = "user.activity_change"
+USER_COMMAND = "user.command"
+ENVIRONMENT_STATE_REFRESH = "environment.state_refresh"
+
+# —— 非根事件里被跨模块引用的两个系统事件 ——
+TIMER_TICK_EVENT_TYPE = "system.timer_tick"
+# 引擎主循环因未捕获异常而停摆（critic 修正③"假活"的可观测化落点）。
+# 刻意不叫 system.error：它专指"仿真主循环已经不再推进"，前端要能与普通错误区分。
+ENGINE_ERROR_EVENT_TYPE = "system.engine_error"
+
+# 用户"不在任何房间"的语义房间 id。世界模型里没有这个房间，因此它只出现在事件 data 里
+# （与 backend/scenarios/apply.py::OUTSIDE_LOCATION_ALIASES 同义，那边落到 location=None）。
+OUTSIDE_ROOM_ID = "outside"
+
+
+ROOT_EVENT_TYPES: frozenset[str] = frozenset(
+    {
+        USER_ARRIVES_HOME,
+        USER_LEAVES_HOME,
+        USER_ENTERS_ROOM,
+        USER_EXITS_ROOM,
+        USER_STARTS_ACTIVITY,
+        USER_ENDS_ACTIVITY,
+        ENVIRONMENT_WEATHER_CHANGE,
+        ENVIRONMENT_TEMPERATURE_THRESHOLD,
+        ENVIRONMENT_LIGHT_LEVEL_THRESHOLD,
+        SECURITY_PRESENCE_DETECTED,
+        SECURITY_DOOR_OPENED,
+        SAFETY_SMOKE_DETECTED,
+        DEVICE_OFFLINE,
+        DEVICE_RECOVERED,
+    }
+)
+
+COMPAT_ROOT_EVENT_TYPES: frozenset[str] = frozenset(
+    {
+        USER_ACTIVITY_CHANGE,
+        USER_COMMAND,
+        ENVIRONMENT_STATE_REFRESH,
+    }
+)
+
+ALL_ROOT_EVENT_TYPES: frozenset[str] = ROOT_EVENT_TYPES | COMPAT_ROOT_EVENT_TYPES
+# 场景 timeline 允许声明的事件类型（spec.py re-export 同一个对象）。
+ALLOWED_TIMELINE_EVENT_TYPES: frozenset[str] = ALL_ROOT_EVENT_TYPES
+
+# 会改变 ``user.location`` / ``user.activity`` 的富用户事件。SimulationEngine 用同一个
+# 处理器把它们写回世界（data 键与 user.activity_change 同名：user_id/from_room/to_room/activity）。
+USER_MOVEMENT_EVENT_TYPES: frozenset[str] = frozenset(
+    {
+        USER_ARRIVES_HOME,
+        USER_LEAVES_HOME,
+        USER_ENTERS_ROOM,
+        USER_EXITS_ROOM,
+        USER_STARTS_ACTIVITY,
+        USER_ENDS_ACTIVITY,
+    }
+)
+
+ENVIRONMENT_ROOT_EVENT_TYPES: frozenset[str] = frozenset(
+    {
+        ENVIRONMENT_WEATHER_CHANGE,
+        ENVIRONMENT_TEMPERATURE_THRESHOLD,
+        ENVIRONMENT_LIGHT_LEVEL_THRESHOLD,
+        ENVIRONMENT_STATE_REFRESH,
+    }
+)
+
+DEVICE_AVAILABILITY_EVENT_TYPES: frozenset[str] = frozenset({DEVICE_OFFLINE, DEVICE_RECOVERED})
+
+
+# 富事件 → 旧兼容事件（迁移期别名）。安防/安全/设备可用性事件没有旧对应物，
+# 它们在旧命名空间里根本不存在，故一律回落到 environment.state_refresh 之外的最近类别：
+#   - security.* / safety.* 是"世界状态变了"，回落 environment.state_refresh；
+#   - device.offline/recovered 同理（设备可用性也是世界状态）。
+COMPAT_ALIAS: dict[str, str] = {
+    USER_ARRIVES_HOME: USER_ACTIVITY_CHANGE,
+    USER_LEAVES_HOME: USER_ACTIVITY_CHANGE,
+    USER_ENTERS_ROOM: USER_ACTIVITY_CHANGE,
+    USER_EXITS_ROOM: USER_ACTIVITY_CHANGE,
+    USER_STARTS_ACTIVITY: USER_ACTIVITY_CHANGE,
+    USER_ENDS_ACTIVITY: USER_ACTIVITY_CHANGE,
+    ENVIRONMENT_WEATHER_CHANGE: ENVIRONMENT_STATE_REFRESH,
+    ENVIRONMENT_TEMPERATURE_THRESHOLD: ENVIRONMENT_STATE_REFRESH,
+    ENVIRONMENT_LIGHT_LEVEL_THRESHOLD: ENVIRONMENT_STATE_REFRESH,
+    SECURITY_PRESENCE_DETECTED: ENVIRONMENT_STATE_REFRESH,
+    SECURITY_DOOR_OPENED: ENVIRONMENT_STATE_REFRESH,
+    SAFETY_SMOKE_DETECTED: ENVIRONMENT_STATE_REFRESH,
+    DEVICE_OFFLINE: ENVIRONMENT_STATE_REFRESH,
+    DEVICE_RECOVERED: ENVIRONMENT_STATE_REFRESH,
+}
+
+
+def compat_event_type(event_type: str) -> str:
+    """富事件的迁移期别名；本身就是旧名（或未知类型）时原样返回。"""
+
+    return COMPAT_ALIAS.get(event_type, event_type)
+
+
+def is_root_event(event_type: str) -> bool:
+    """是否是一条会开启新因果链的根事件（§4.4）。"""
+
+    return event_type in ALL_ROOT_EVENT_TYPES

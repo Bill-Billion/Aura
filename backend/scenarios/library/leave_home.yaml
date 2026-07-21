@@ -1,0 +1,133 @@
+# §6.2 User Leaves Home —— 早上出门，家从"有人"切到"无人"。
+#
+# 场景要考察的不是"关了几盏灯"，而是 agent 能否在同一条因果链里同时完成两件相反的事：
+# 关掉无人区域的能耗设备（照明/风扇/空调），并把安防留在开启状态。§6.2 末句
+# "leave sensors read-only" 落在 ground_truth.forbidden_device_ids 上——传感器被写就是
+# 一次不必要命令（§12 unnecessary_command_count）。
+scenario_schema_version: "1.0"
+id: user_leaves_home_morning
+name: 早晨离家
+description: 用户早晨从客厅出门上班，全屋转入无人节能模式，安防保持在线。
+seed: 1002
+duration_seconds: 120
+mode: observe
+
+initial_state:
+  time_of_day: "08:15"
+  weather: clear
+  outdoor_temp: 21.0
+  outdoor_humidity: 0.55
+  users:
+    user_01:
+      location: living_room
+      activity: breakfast
+      presence_state: home
+  rooms:
+    living_room:
+      occupancy: true
+      light_level: 260
+      temperature: 24.5
+    kitchen:
+      occupancy: false
+      light_level: 180
+      temperature: 25.0
+  devices:
+    light_living_01:
+      state:
+        power: true
+        extra:
+          brightness: 85
+    light_kitchen_01:
+      state:
+        power: true
+        extra:
+          brightness: 60
+    fan_living_01:
+      state:
+        power: true
+        extra:
+          speed: medium
+    ac_living_01:
+      state:
+        power: true
+        extra:
+          target_temp: 23
+          mode: cool
+    camera_entry_01:
+      state:
+        extra:
+          online: true
+
+timeline:
+  - at: 0
+    type: user.starts_activity
+    user_id: user_01
+    room_id: living_room
+    activity: leaving
+  # exits_room 的 room_id 指"被离开的房间"，to_room 留空（世界模型没有"在途"状态）。
+  - at: 30
+    type: user.exits_room
+    user_id: user_01
+    room_id: living_room
+  - at: 40
+    type: user.leaves_home
+    user_id: user_01
+    room_id: living_room
+    activity: away
+
+expected_device_effects:
+  - device_id: light_living_01
+    within_seconds: 15
+    expected:
+      power: false
+  - device_id: light_kitchen_01
+    within_seconds: 15
+    expected:
+      power: false
+  - device_id: fan_living_01
+    within_seconds: 15
+    expected:
+      power: false
+  - device_id: ac_living_01
+    within_seconds: 20
+    expected:
+      power: false
+  # 安防不许被"节能"顺手关掉：离家恰恰是它最该在线的时刻。
+  - device_id: camera_entry_01
+    within_seconds: 20
+    expected:
+      extra.online: true
+
+involved_agents:
+  - lighting_agent
+  - hvac_agent
+
+success_criteria:
+  require_complete_episode: true
+  max_first_action_latency_ms: 5000
+  max_command_failures: 0
+  allow_fallback: true
+
+metrics:
+  - first_action_latency_ms
+  - command_failure_count
+  - unnecessary_command_count
+  - device_state_match_rate
+
+ground_truth:
+  user_goal: "离家后关闭无人区域的能耗设备，同时保持安防在线"
+  primary_room_ids: ["living_room", "kitchen"]
+  relevant_device_ids:
+    - light_living_01
+    - light_kitchen_01
+    - fan_living_01
+    - ac_living_01
+    - camera_entry_01
+  # §6.2 "leave sensors read-only"：传感器只读，任何写入都是不必要命令。
+  forbidden_device_ids: ["sensor_living_temp_01"]
+  required_agent_roles: ["lighting", "hvac", "security"]
+  acceptable_noop: false
+  expected_intent: "away_energy_saving"
+  safety_constraints:
+    - "keep_security_monitoring_enabled_when_home_is_empty"
+    - "do_not_write_read_only_sensors"

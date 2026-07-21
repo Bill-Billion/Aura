@@ -323,17 +323,31 @@ class CommandExecutor:
 
         return dict(self._pending)
 
-    def bind_state_manager(self, state_manager: StateManager) -> None:
-        """换绑世界（reset）：注册表随之清空。
+    async def bind_state_manager(
+        self,
+        state_manager: StateManager,
+        *,
+        reason: str = "state_manager_rebound",
+        tick: int | None = None,
+    ) -> list[CommandRecord]:
+        """换绑世界（reset / run 切换）：先把在飞命令**带事件地**取消，再换世界。
 
-        调用方应先 ``cancel_pending`` 把在飞命令落账成 cancelled；此处的清空是兜底——
-        上一个 run 的残留记录绝不能跨到新世界里被后来的命令"取代"或被误当在飞。
+        S1 时这里是一句 ``self._pending.clear()``——一次无事件的静默丢弃。当时那条路
+        走不到（注册表只在同步调用内瞬态存在），但 S2 的 run 模型让它可达：reset 换世界、
+        runtime 发现世界被换过都会调它。静默丢弃正是 S1 到处根治的缺陷类：命令消失、
+        生命周期停在非终态、可观测性面板永远等一个不会来的收尾。
+
+        取消发生在换世界**之前**（cancel-before-swap）：这些记录属于旧世界，
+        它们的终态迁移不该记在新世界头上。
         """
 
+        cancelled = await self.cancel_pending(reason, tick=tick)
         self.state_manager = state_manager
+        # cancel_pending 已逐条注销；这里兜底清掉不可合法取消的残留（终态记录）。
         self._pending.clear()
         # 换了世界，旧世界的违规不再成立：去抖签名必须跟着复位，否则新世界的同名违规会被吞掉。
         self.invariant_debounce.reset()
+        return cancelled
 
     # ------------------------------------------------------------------
     # 公共入口

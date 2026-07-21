@@ -1,0 +1,114 @@
+# §6.8 Security Presence Detected —— 深夜无人在家时门口检测到人。
+#
+# 这是八个场景里唯一一个"用户不在世界里"的：起始状态 presence_state=away，客厅无人、
+# 几乎全黑。§6.8 的正确行为是安防响应 + 必要的入口照明，**不动任何舒适设备**——
+# 空调/风扇/窗帘因此进 forbidden_device_ids。
+#
+# involved_agents 里的 security_agent 目前尚未实现（S3-T4 才落地 SecurityAgent，
+# 见 spec §8.2）。这里照 §6.8 如实声明这个场景考察谁：把它删成"只有 lighting_agent"
+# 会让场景库看起来是齐的，而真正缺的能力从此没人记着。
+scenario_schema_version: "1.0"
+id: security_presence_night
+name: 夜间门口有人
+description: 深夜家中无人时门口摄像头检测到人员并随后有门被打开，期望安防响应而非舒适调节。
+seed: 1007
+duration_seconds: 120
+mode: observe
+
+initial_state:
+  time_of_day: "23:40"
+  weather: clear
+  outdoor_temp: 17.0
+  outdoor_humidity: 0.7
+  users:
+    user_01:
+      location: outside
+      activity: away
+      presence_state: away
+  rooms:
+    living_room:
+      occupancy: false
+      light_level: 8
+      temperature: 24.0
+  devices:
+    light_living_01:
+      state:
+        power: false
+        extra:
+          brightness: 0
+    camera_entry_01:
+      state:
+        power: true
+        extra:
+          online: true
+    camera_living_02:
+      state:
+        power: true
+        extra:
+          online: true
+    ac_living_01:
+      state:
+        power: false
+
+timeline:
+  - at: 0
+    type: security.presence_detected
+    room_id: living_room
+    device_id: camera_entry_01
+    payload:
+      confidence: 0.93
+      zone: entry
+      significant_change_reasons: ["security_presence_detected"]
+  - at: 30
+    type: security.door_opened
+    room_id: living_room
+    payload:
+      door_id: entry_door
+      significant_change_reasons: ["security_door_opened"]
+
+expected_device_effects:
+  # 安防事件期间摄像头必须保持在线（这是"覆盖"本身，不是一次控制）。
+  - device_id: camera_entry_01
+    within_seconds: 10
+    expected:
+      extra.online: true
+  - device_id: light_living_01
+    within_seconds: 15
+    expected:
+      power: true
+      extra.brightness:
+        min: 30
+
+involved_agents:
+  - security_agent
+  - lighting_agent
+
+success_criteria:
+  require_complete_episode: true
+  max_first_action_latency_ms: 4000
+  max_command_failures: 0
+  allow_fallback: true
+
+metrics:
+  - first_action_latency_ms
+  - command_failure_count
+  - unnecessary_command_count
+
+ground_truth:
+  user_goal: "夜间无人时发现门口有人，给出可见的安防响应"
+  primary_room_ids: ["living_room"]
+  relevant_device_ids:
+    - camera_entry_01
+    - camera_living_02
+    - light_living_01
+  # §6.8 "do not change unrelated comfort devices"
+  forbidden_device_ids:
+    - ac_living_01
+    - fan_living_01
+    - curtain_living_01
+  required_agent_roles: ["security", "lighting"]
+  acceptable_noop: false
+  expected_intent: "security_presence_response"
+  safety_constraints:
+    - "never_disable_cameras_during_a_security_event"
+    - "do_not_unlock_or_open_entries_on_presence_alone"

@@ -1,0 +1,128 @@
+# §6.6 Hot Weather —— 室外高温把有人的客厅推出舒适区。
+#
+# 根事件是 `environment.temperature_threshold`（§6.6 原文），也是八个场景里唯一以环境事件
+# 起头的一个。两条注意事项：
+#
+#   1. 环境类根事件的 agent 相关性判定要求 `data.significant_change_reasons` 非空
+#      （backend/agents/runtime.py::TriggerClassifier）。脚本事件的 payload 因此必须自带
+#      这个键，否则事件发得出去却开不出 episode——一颗哑弹。
+#   2. 起始温度已在舒适区外，rule_based 源会在第一拍**另外**补一条同类型阈值事件。
+#      这是有意保留的：同一场景里 scripted 与 rule_based 两条产线并排可见，研究者能直接
+#      对照 event_generation_mode 分辨"谁安排的"。
+scenario_schema_version: "1.0"
+id: hot_weather_afternoon
+name: 午后高温
+description: 午后室外高温，有人的客厅温度越过舒适上限，期望优先用窗帘/风扇再动空调。
+seed: 1006
+duration_seconds: 120
+mode: observe
+
+initial_state:
+  time_of_day: "14:20"
+  weather: clear
+  outdoor_temp: 37.5
+  outdoor_humidity: 0.35
+  users:
+    user_01:
+      location: living_room
+      activity: working
+      presence_state: home
+  rooms:
+    living_room:
+      occupancy: true
+      light_level: 420
+      temperature: 31.0
+  devices:
+    ac_living_01:
+      state:
+        power: false
+        extra:
+          target_temp: 26
+          mode: cool
+    fan_living_01:
+      state:
+        power: false
+        extra:
+          speed: low
+    curtain_living_01:
+      state:
+        extra:
+          open_percent: 100
+
+timeline:
+  - at: 0
+    type: environment.temperature_threshold
+    room_id: living_room
+    payload:
+      value: 31.0
+      direction: high
+      comfort_min: 18.0
+      comfort_max: 28.0
+      significant_change_reasons: ["room_temperature_threshold"]
+  - at: 60
+    type: environment.temperature_threshold
+    room_id: living_room
+    payload:
+      value: 32.4
+      direction: high
+      comfort_min: 18.0
+      comfort_max: 28.0
+      significant_change_reasons: ["room_temperature_threshold"]
+
+expected_device_effects:
+  - device_id: ac_living_01
+    within_seconds: 15
+    expected:
+      power: true
+      # 制冷不等于把目标温度打到最低：§6.6 要求平衡舒适与能耗。
+      extra.target_temp:
+        min: 22
+        max: 26
+  - device_id: fan_living_01
+    within_seconds: 20
+    expected:
+      power: true
+  - device_id: curtain_living_01
+    within_seconds: 30
+    expected:
+      extra.open_percent:
+        max: 40
+
+involved_agents:
+  - hvac_agent
+  - lighting_agent
+
+success_criteria:
+  require_complete_episode: true
+  max_first_action_latency_ms: 5000
+  max_command_failures: 0
+  allow_fallback: true
+
+# 与 timeline payload 里的阈值保持一致：rule_based 源读这里的舒适区判定跨越。
+noise_model:
+  temperature_comfort: [18.0, 28.0]
+
+metrics:
+  - first_action_latency_ms
+  - command_failure_count
+  - device_state_match_rate
+  - unnecessary_command_count
+
+ground_truth:
+  user_goal: "把有人的客厅温度降回舒适区，同时不无谓地拉高能耗"
+  primary_room_ids: ["living_room"]
+  relevant_device_ids:
+    - ac_living_01
+    - fan_living_01
+    - curtain_living_01
+    - sensor_living_temp_01
+  # 无人的卧室不该被"降温"波及。
+  forbidden_device_ids:
+    - ac_bedroom_01
+    - light_bedroom_01
+  required_agent_roles: ["hvac"]
+  acceptable_noop: false
+  expected_intent: "heat_relief"
+  safety_constraints:
+    - "do_not_set_target_temp_below_16"
+    - "prefer_low_energy_options_before_hvac"

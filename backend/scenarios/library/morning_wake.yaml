@@ -1,0 +1,132 @@
+# §6.4 Morning Wake Up —— 用户在卧室醒来。
+#
+# 与 §6.3 互为镜像：起始世界是"窗帘全闭、灯全灭、人在睡"，考察的是 agent 会不会把
+# "唤醒"做成一次全屋动作。§6.4 只点名卧室灯、窗帘、HVAC 三类设备，因此客厅灯落在
+# forbidden_device_ids 里——动它就是一次不必要命令。
+scenario_schema_version: "1.0"
+id: morning_wake_up
+name: 清晨唤醒
+description: 用户清晨在卧室醒来，卧室照明渐亮、窗帘打开、空调退出睡眠温区。
+seed: 1004
+duration_seconds: 120
+mode: observe
+
+initial_state:
+  time_of_day: "06:40"
+  weather: clear
+  outdoor_temp: 16.0
+  outdoor_humidity: 0.65
+  users:
+    user_01:
+      location: bedroom
+      activity: sleeping
+      presence_state: sleeping
+  rooms:
+    bedroom:
+      occupancy: true
+      light_level: 25
+      temperature: 22.5
+    living_room:
+      occupancy: false
+      light_level: 60
+      temperature: 21.5
+  devices:
+    light_bedroom_01:
+      state:
+        power: false
+        extra:
+          brightness: 10
+          color_temp: 2700
+    curtain_bedroom_01:
+      state:
+        extra:
+          open_percent: 0
+    curtain_bedroom_02:
+      state:
+        extra:
+          open_percent: 0
+    ac_bedroom_01:
+      state:
+        power: true
+        extra:
+          target_temp: 22
+          mode: heat
+    light_living_01:
+      state:
+        power: false
+        extra:
+          brightness: 0
+
+timeline:
+  - at: 0
+    type: user.starts_activity
+    user_id: user_01
+    room_id: bedroom
+    activity: waking_up
+  - at: 60
+    type: user.ends_activity
+    user_id: user_01
+    room_id: bedroom
+    activity: waking_up
+  - at: 80
+    type: user.exits_room
+    user_id: user_01
+    room_id: bedroom
+  - at: 90
+    type: user.enters_room
+    user_id: user_01
+    room_id: bathroom
+
+expected_device_effects:
+  - device_id: light_bedroom_01
+    within_seconds: 15
+    expected:
+      power: true
+      # §6.4 "gradually increase light"：醒来这一刻不该直接拉满亮度。
+      extra.brightness:
+        min: 20
+        max: 80
+  - device_id: curtain_bedroom_01
+    within_seconds: 30
+    expected:
+      extra.open_percent:
+        min: 50
+  - device_id: ac_bedroom_01
+    within_seconds: 30
+    expected:
+      power: true
+      extra.target_temp:
+        min: 20
+        max: 26
+
+involved_agents:
+  - lighting_agent
+  - hvac_agent
+
+success_criteria:
+  require_complete_episode: true
+  max_first_action_latency_ms: 6000
+  max_command_failures: 0
+  allow_fallback: true
+
+metrics:
+  - first_action_latency_ms
+  - command_failure_count
+  - unnecessary_command_count
+  - device_state_match_rate
+
+ground_truth:
+  user_goal: "顺利起床：卧室由暗转亮、引入自然光、温度退出睡眠区间"
+  primary_room_ids: ["bedroom"]
+  relevant_device_ids:
+    - light_bedroom_01
+    - curtain_bedroom_01
+    - curtain_bedroom_02
+    - ac_bedroom_01
+  # §6.4 的设备清单只有卧室三类；把唤醒扩散成全屋动作即为多余。
+  forbidden_device_ids: ["light_living_01"]
+  required_agent_roles: ["lighting", "hvac"]
+  acceptable_noop: false
+  expected_intent: "morning_wake_routine"
+  safety_constraints:
+    - "no_abrupt_full_brightness_at_wake_up"

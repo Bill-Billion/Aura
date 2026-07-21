@@ -11,6 +11,12 @@ from backend.simulators.effects import derive_observable_updates
 TEMP_OUTDOOR_DIFFUSION_RATE = 0.002
 HVAC_COOL_RATE = 0.05
 HVAC_HEAT_RATE = 0.03
+# 【审计发现①修复】房间湿度向室外湿度扩散。此前 RoomState.humidity 自注册表默认值起
+# 整个 run 恒定不变：场景写得进、湿度传感器读得到，却没有任何仿真器演化它——于是
+# §6.7「雨天/阴天」场景里"室外下雨 → 室内变潮"这条依赖在数据上根本不成立。
+# 扩散率比温度低一个量级：湿度的传导比热传导慢，且这里只建模最粗的一条通路
+#（室外 ↔ 室内），不含烹饪/淋浴等室内湿源（那属于 §3.4 的设备效果，未来另加）。
+HUMIDITY_OUTDOOR_DIFFUSION_RATE = 0.0008
 
 LIGHT_LUX_PER_BRIGHTNESS = 8.0
 NATURAL_LIGHT_MAX_LUX = 500.0
@@ -120,10 +126,19 @@ class EnvironmentSimulator:
                 elif mode == "heat" and next_temperature < target:
                     next_temperature += HVAC_HEAT_RATE * dt * (target - next_temperature)
 
+            next_humidity = room.humidity + HUMIDITY_OUTDOOR_DIFFUSION_RATE * dt * (
+                outdoor_humidity - room.humidity
+            )
+            # 湿度是 [0,1] 的比例量：夹紧不是"静默纠正"，是值域本身的定义
+            # （越界只可能来自参数配错，不该被物理模型放大成负湿度）。
+            next_humidity = round(min(1.0, max(0.0, next_humidity)), 4)
+
             updates[f"rooms[{room_id}].temperature"] = round(next_temperature, 2)
+            updates[f"rooms[{room_id}].humidity"] = next_humidity
             updates[f"rooms[{room_id}].light_level"] = calculate_room_light_level(state, room_id)
             room_overrides[room_id] = {
                 "temperature": round(next_temperature, 2),
+                "humidity": next_humidity,
                 "light_level": updates[f"rooms[{room_id}].light_level"],
             }
 

@@ -418,3 +418,31 @@ class TestSimulatorWriteInvariants:
             assert record.status is CommandStatus.SUCCEEDED
 
         assert violation_count() == 1
+
+
+@pytest.mark.anyio
+async def test_engine_path_sim_events_are_stamped_before_broadcast():
+    """回归钉：引擎路径外发的 SIM_EVENT 必须已带 seq。
+
+    _publish_sim_event 刻意"先广播后 publish"（根事件要先于派生的 STATE_DELTA 到达
+    前端），而盖章原本只发生在 publish 里——于是 WS 上每条引擎事件都是 seq=null
+    （复核时实测 98/98），events.jsonl 副本却有号。S5 的因果树按 seq 排序，无号事件
+    排不进自己的子节点之前。现由 event_bus.stamp() 在广播前盖章；stamp 只分配一次号，
+    随后的 publish 不重编，所以两份副本必须是同一个 seq。
+    """
+    engine = _make_engine()
+    engine.conn.broadcast = AsyncMock()
+
+    published = await engine._publish_sim_event(
+        SimEvent(event_type="system.seq_probe", source="test", timestamp=1.0)
+    )
+
+    broadcast_payloads = [
+        call.args[0].payload
+        for call in engine.conn.broadcast.await_args_list
+        if call.args[0].type == "SIM_EVENT"
+    ]
+    assert broadcast_payloads, "本用例要求至少广播一条 SIM_EVENT，否则断言空过"
+    assert broadcast_payloads[0]["seq"] is not None, "广播出去的引擎事件没有 seq"
+    # 广播副本与总线里的那条必须同号，不能一份有号一份没号、更不能两个号
+    assert broadcast_payloads[0]["seq"] == published.seq
