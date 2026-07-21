@@ -16,7 +16,7 @@ import random
 
 import pytest
 
-from backend.config.capability_matrix import EffectClass
+from backend.execution.capability_matrix import EffectClass
 from backend.engine.state import (
     DeviceState,
     DeviceStateValues,
@@ -66,7 +66,7 @@ def _sensor(device_id: str, room: str, *, sensor_type: str = "temperature", valu
         id=device_id,
         type="sensor",
         location=Location3D(room=room),
-        capabilities=["read"],
+        capabilities=["value"],
         state=DeviceStateValues(
             power=True, extra={"sensor_type": sensor_type, "value": value, "unit": "°C"}
         ),

@@ -16,7 +16,12 @@ DeviceCapability = Literal[
     "shake",
     "timeout",
     "view",
-    "read",
+    # §3.2：camera.online 是只读能力语义位；设备侧同时保留 state.extra.online 镜像，
+    # 前端 CameraPanel/deviceFloorMap 读的是那个镜像，两者必须同时存在。
+    "online",
+    # §3.2：sensor 的只读读数位。名字必须与 state.extra.value 一致——effects.py 写它、
+    # 前端 SensorPanel 读它；叫 "read" 时能力名指向了一个并不存在的字段。
+    "value",
 ]
 
 

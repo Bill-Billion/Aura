@@ -76,12 +76,16 @@ class AgentRuntime:
         arbiter: Arbiter | None = None,
         trigger_classifier: TriggerClassifier | None = None,
         episode_timeout_ms: int | None = None,
+        command_executor: CommandExecutor | None = None,
     ) -> None:
         self.agents: list[BaseAgent] = []
         self.event_bus = event_bus
         self.state_manager = state_manager
         self.conn = connection_manager
         self.publish_event = publish_event
+        # 引擎注入的那台唯一 executor；未注入时首次用到才自建一台并长期持有
+        # （S1 review finding-8：绝不再每个 agent 每条 episode 造一台）。
+        self.command_executor = command_executor
         self.llm_provider = llm_provider or self._build_default_provider()
         self.memory_store = memory_store or AgentMemoryStore()
         self.arbiter = arbiter or Arbiter()
@@ -153,15 +157,34 @@ class AgentRuntime:
         state_manager: StateManager,
         connection_manager: ConnectionManager,
         publish_event: PublishEvent,
+        command_executor: CommandExecutor | None = None,
     ) -> None:
         self.event_bus = event_bus
         self.state_manager = state_manager
         self.conn = connection_manager
         self.publish_event = publish_event
+        if command_executor is not None:
+            self.command_executor = command_executor
         self._refresh_subscriptions()
 
     def update_state_manager(self, state_manager: StateManager) -> None:
         self.state_manager = state_manager
+
+    def _resolve_executor(self) -> CommandExecutor:
+        """本 runtime 使用的唯一 executor（引擎注入优先）。
+
+        没有注入方（独立构造的 runtime / 单测）时自建一台并缓存：注册表照样要有寿命，
+        否则 cancel_pending 与跨调用取代在这条腿上依旧是空转。
+        """
+
+        if self.state_manager is None:
+            raise RuntimeError("AgentRuntime is not bound")
+        if self.command_executor is None:
+            self.command_executor = CommandExecutor(self.state_manager)
+        elif self.command_executor.state_manager is not self.state_manager:
+            # 世界被换过（reset）而 executor 没跟上：换绑并清空上一个 run 的残留。
+            self.command_executor.bind_state_manager(self.state_manager)
+        return self.command_executor
 
     def reset(self) -> None:
         self.memory_store.clear()
@@ -337,6 +360,19 @@ class AgentRuntime:
             for agent_id in agent_ids:
                 if self._active_tasks.get(agent_id) is done_task:
                     self._active_tasks.pop(agent_id, None)
+            # episode 崩了必须当场取回异常并落成日志：不取回只会得到解释器那条
+            # "Task exception was never retrieved"，agent 却已经停在半路——正是 S1 要
+            # 根治的静默失败类（review2 finding-1 的 agent 腿症状）。
+            if not done_task.cancelled():
+                error = done_task.exception()
+                if error is not None:
+                    log.error(
+                        "agent_episode_failed",
+                        agent_ids=agent_ids,
+                        error=repr(error),
+                    )
+                    for agent_id in agent_ids:
+                        self._set_agent_idle(agent_id)
 
         task.add_done_callback(lambda done_task, agent_ids=[agent.agent_id for agent in agents_to_run]: _cleanup(done_task, agent_ids))
 
@@ -421,10 +457,10 @@ class AgentRuntime:
                 if envelope.mode == "fallback_rule_based"
                 else CommandSource.AGENT
             )
-            executor = CommandExecutor(
-                self.state_manager,
-                self._agent_publish_event(agent_id, pending_deltas),
-            )
+            # 唯一 executor 由引擎注入；per-agent 的 publish 包装按次传给 submit，
+            # 这样 _pending 注册表跨 agent、跨 episode 只有一份（S1 review finding-8）。
+            executor = self._resolve_executor()
+            agent_publish = self._agent_publish_event(agent_id, pending_deltas)
 
             # 仲裁 loser 不再凭空消失：走 proposed→rejected，带上冲突详情。
             for proposal in envelope.candidate_commands:
@@ -433,6 +469,7 @@ class AgentRuntime:
                 await self._reject_losing_command(
                     root_event=root_event,
                     agent_id=agent_id,
+                    agent_name=envelope.agent_name,
                     source=command_source,
                     proposal=proposal,
                     causal_parent=coordination_event.event_id,
@@ -447,8 +484,11 @@ class AgentRuntime:
                         source=command_source,
                         root_event=root_event,
                         causal_parent=execution_event.event_id,
+                        actor=agent_id,
+                        actor_name=envelope.agent_name,
                     ),
                     tick=int(self.state_manager.world.simulation_tick),
+                    publish=agent_publish,
                 )
                 if record.status is CommandStatus.SUCCEEDED:
                     last_action = command.reason or last_action
@@ -650,14 +690,22 @@ class AgentRuntime:
         source: CommandSource,
         root_event: SimEvent,
         causal_parent: str,
+        actor: str | None = None,
+        actor_name: str | None = None,
     ) -> DeviceCommand:
-        """agent 提案 → executor 的 DeviceCommand（property 点路径归一为能力名）。"""
+        """agent 提案 → executor 的 DeviceCommand（property 点路径归一为能力名）。
+
+        ``actor``/``actor_name`` 承载执行者身份：source 只有四个值（agent/rule_fallback…），
+        丢了 agent_id 可观测性面板就分不清是哪个 agent 干的（S1 review finding-1）。
+        """
 
         if self.state_manager is None:
             raise RuntimeError("AgentRuntime is not bound")
 
         return DeviceCommand(
             source=source,
+            actor=actor,
+            actor_name=actor_name,
             device_id=proposal.device_id,
             capability=proposal.property.removeprefix("extra."),
             value=proposal.value,
@@ -695,6 +743,7 @@ class AgentRuntime:
         *,
         root_event: SimEvent,
         agent_id: str,
+        agent_name: str | None = None,
         source: CommandSource,
         proposal: AgentCommandProposal,
         causal_parent: str,
@@ -737,6 +786,8 @@ class AgentRuntime:
                 source=source,
                 root_event=root_event,
                 causal_parent=causal_parent,
+                actor=agent_id,
+                actor_name=agent_name,
             ),
             self._agent_publish_event(agent_id, []),
             tick=tick,

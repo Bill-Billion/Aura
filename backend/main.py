@@ -133,6 +133,20 @@ def _collecting_publish(collected: list[DeltaChange]) -> PublishEvent:
     return publish
 
 
+def _resolve_command_executor() -> CommandExecutor:
+    """取引擎持有的那台唯一 executor（S1 review finding-8）。
+
+    每条入站消息新造一台会让 ``_pending`` 注册表没有生产寿命：reset 取消不到在飞命令、
+    后一条命令也看不见前一条（跨消息取代不成立）。引擎在 CMD_SIM_RESET 时把它换绑到
+    新世界，因此这里每次现取、绝不缓存。引擎尚未起来（lifespan 之外）才临时兜底一台。
+    """
+
+    assert state_manager is not None
+    if simulation_engine is not None:
+        return simulation_engine.command_executor
+    return CommandExecutor(state_manager)
+
+
 def _ui_command_targets(payload: CmdDeviceControlPayload) -> list[tuple[str, Any]]:
     """四种入站格式（turn_on / turn_off / set_state / 旧 property-value）归一为 (能力, 值) 对。"""
 
@@ -296,8 +310,8 @@ async def _handle_device_control(ws: WebSocket, raw_payload: dict) -> None:
     await event_bus.publish(root_event)
 
     collected: list[DeltaChange] = []
-    # executor 按条构造：state_manager 会在 CMD_SIM_RESET 时被换新，绑定当前世界最安全。
-    executor = CommandExecutor(state_manager, _collecting_publish(collected))
+    # 共用引擎那台 executor；本次调用的 publish 包装按次传入（delta 聚合仍是每条消息一份）。
+    executor = _resolve_command_executor()
     commands = [
         DeviceCommand(
             source=CommandSource.UI,
@@ -312,7 +326,9 @@ async def _handle_device_control(ws: WebSocket, raw_payload: dict) -> None:
         )
         for capability, value in targets
     ]
-    records = await executor.submit_batch(commands, tick=tick)
+    records = await executor.submit_batch(
+        commands, tick=tick, publish=_collecting_publish(collected)
+    )
 
     if collected:
         await manager.broadcast(

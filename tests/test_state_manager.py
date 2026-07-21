@@ -244,8 +244,8 @@ def _make_invariant_world() -> WorldState:
             id="sensor_living",
             type="sensor",
             location=Location3D(room="living_room"),
-            capabilities=["read"],
-            state=DeviceStateValues(extra={"read": 21.5}),
+            capabilities=["value"],
+            state=DeviceStateValues(extra={"value": 21.5}),
         ),
     }
     return world
@@ -289,7 +289,7 @@ async def test_offline_device_writable_command_rejected_via_executor():
     assert not [e for e in events if e.event_type == FEEDBACK_EVENT_TYPE]
 
 
-def test_agent_write_to_sensor_read_rejected_but_simulator_write_allowed():
+def test_agent_write_to_sensor_value_rejected_but_simulator_write_allowed():
     """§2.2 第6条：只读能力只允许仿真源写入，agent/UI 一律拒。"""
 
     mgr = StateManager(_make_invariant_world())
@@ -297,12 +297,12 @@ def test_agent_write_to_sensor_read_rejected_but_simulator_write_allowed():
 
     for caused_by in ("agent", "user_ui", "ui", "scenario"):
         with pytest.raises(InvariantViolation) as excinfo:
-            mgr.check_command_invariants(sensor, "read", caused_by=caused_by)
+            mgr.check_command_invariants(sensor, "value", caused_by=caused_by)
         assert excinfo.value.invariant == "read_only_capability_write"
 
     # 仿真引擎写只读能力是合法的（传感器读数本就由仿真产生）。
     for caused_by in ("environment_sim", "user_behavior_sim", "simulator_timer", "system"):
-        mgr.check_command_invariants(sensor, "read", caused_by=caused_by)
+        mgr.check_command_invariants(sensor, "value", caused_by=caused_by)
 
 
 @pytest.mark.anyio
@@ -353,6 +353,11 @@ async def test_invariant_violation_emits_structured_failure_event_and_fails_comm
     assert len(failed) == 1
     assert failed[0].data["error_code"] == INVARIANT_VIOLATION_ERROR_CODE
 
+    # 归因：这条违规确实是本命令造成的（apply 前世界干净），所以由本命令背锅。
+    assert violation.data["pre_existing"] is False
+    assert violation.data["attributed_to"] == "ui"
+    assert violation.data["command_failed"] is True
+
     # 世界回到命令之前：既不落地半成品，也不留下被改坏的状态。
     assert mgr.world.devices["light_living"].state.power is False
     assert mgr.world.rooms["living_room"].persons == ["user_01"]
@@ -360,6 +365,134 @@ async def test_invariant_violation_emits_structured_failure_event_and_fails_comm
     verify_world_invariants(mgr.world)
     # 违规命令不产生反馈事件（评估器不会把它当成生效变更）。
     assert not [e for e in events if e.event_type == FEEDBACK_EVENT_TYPE]
+
+
+@pytest.mark.anyio
+async def test_pre_existing_violation_blames_simulation_not_the_next_command():
+    """审计 finding 3：仿真写坏的世界不能让下一条无辜命令背锅，更不能把世界卡死。
+
+    检测与归因必须解耦——违规在 apply 之前就成立，说明责任在仿真写入方；命令照常执行，
+    只补发一条 pre_existing 的系统级违规事件。
+    """
+
+    mgr = StateManager(_make_invariant_world())
+    # 仿真直接写世界（S2 场景时间线 / §13 故障注入的真实写法）：user_01 同时出现在两个房间。
+    mgr.world.rooms["bedroom"] = RoomState(id="bedroom")
+    mgr.apply_updates(
+        caused_by="user_behavior_sim",
+        updates=[
+            ("rooms[bedroom].persons", ["user_01"]),
+            ("rooms[bedroom].occupancy", True),
+        ],
+        reason="simulator corrupts the world",
+    )
+
+    events, publish = _collector()
+    executor = CommandExecutor(mgr, publish)
+    record = await executor.submit(
+        DeviceCommand(
+            source=CommandSource.UI,
+            device_id="light_living",
+            capability="brightness",
+            value=80,
+        )
+    )
+
+    assert record.status is CommandStatus.SUCCEEDED
+    assert mgr.world.devices["light_living"].state.extra["brightness"] == 80
+
+    violations = [e for e in events if e.event_type == INVARIANT_VIOLATION_EVENT_TYPE]
+    assert len(violations) == 1
+    assert violations[0].data["invariant"] == "user_single_location"
+    assert violations[0].data["pre_existing"] is True
+    assert violations[0].data["attributed_to"] == "simulation"
+    assert violations[0].data["command_failed"] is False
+    # 无辜命令什么都没被回滚，也不产生 command_failed。
+    assert violations[0].data["reverted_paths"] == []
+    assert not [e for e in events if e.event_type == COMMAND_FAILED_EVENT_TYPE]
+    assert [e for e in events if e.event_type == FEEDBACK_EVENT_TYPE]
+
+    # 世界没有被卡死：不一致仍在，但后续命令依然可执行（否则每条命令都会连锁失败）。
+    events2, publish2 = _collector()
+    executor2 = CommandExecutor(mgr, publish2)
+    record2 = await executor2.submit(
+        DeviceCommand(
+            source=CommandSource.UI,
+            device_id="light_living",
+            capability="power",
+            value=True,
+        )
+    )
+    assert record2.status is CommandStatus.SUCCEEDED
+    assert mgr.world.devices["light_living"].state.power is True
+
+
+@pytest.mark.anyio
+async def test_pre_existing_violation_is_reported_once_per_signature_not_per_command():
+    """review2 finding-3：世界持续不一致时，每条命令补一条违规事件 = 可观测性面板洪水。
+
+    仿真写入路径早就按违规签名去抖了；命令路径必须同口径——同一条未修复的违规只报一次，
+    世界恢复一致后再坏才重新上报（去抖不是永久静音）。
+    """
+
+    mgr = StateManager(_make_invariant_world())
+    mgr.world.rooms["bedroom"] = RoomState(id="bedroom")
+
+    def corrupt() -> None:
+        mgr.apply_updates(
+            caused_by="user_behavior_sim",
+            updates=[
+                ("rooms[bedroom].persons", ["user_01"]),
+                ("rooms[bedroom].occupancy", True),
+            ],
+            reason="simulator corrupts the world",
+        )
+
+    def repair() -> None:
+        mgr.apply_updates(
+            caused_by="user_behavior_sim",
+            updates=[
+                ("rooms[bedroom].persons", []),
+                ("rooms[bedroom].occupancy", False),
+            ],
+            reason="simulator repairs the world",
+        )
+
+    corrupt()
+
+    events, publish = _collector()
+    # 生产里 UI 腿与 agent 腿共用引擎持有的那台 executor，所以去抖状态也必须是同一份。
+    executor = CommandExecutor(mgr, publish)
+
+    async def submit(value: int) -> None:
+        record = await executor.submit(
+            DeviceCommand(
+                source=CommandSource.UI,
+                device_id="light_living",
+                capability="brightness",
+                value=value,
+            )
+        )
+        assert record.status is CommandStatus.SUCCEEDED
+
+    def violations() -> list:
+        return [e for e in events if e.event_type == INVARIANT_VIOLATION_EVENT_TYPE]
+
+    def violation_count() -> int:
+        return len(violations())
+
+    for value in (80, 70, 60):
+        await submit(value)
+    assert violation_count() == 1
+    assert violations()[0].data["pre_existing"] is True
+
+    repair()
+    await submit(50)
+    assert violation_count() == 1
+
+    corrupt()
+    await submit(40)
+    assert violation_count() == 2
 
 
 @pytest.mark.anyio

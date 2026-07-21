@@ -85,9 +85,24 @@ export function hasDeviceCapability(
   return device.capabilities.includes(capability)
 }
 
+// 白名单而非黑名单：后端新增能力时默认按"不可写"处理，宁可少给一个控件，
+// 也不能把只读设备（camera 的 view/online、sensor 的 value）渲染成可操控。
+// 权威来源是 backend/execution/capability_matrix.py 里 writable=True 的那几行。
+const WRITABLE_DEVICE_CAPABILITIES: ReadonlySet<DeviceCapability> = new Set<DeviceCapability>([
+  'power',
+  'brightness',
+  'color_temp',
+  'target_temp',
+  'mode',
+  'speed',
+  'open_percent',
+  'shake',
+  'timeout',
+])
+
 export function isDeviceWritable(device: DeviceState | null | undefined): boolean {
   if (!device) return false
-  return device.capabilities.some((capability) => capability !== 'read' && capability !== 'view')
+  return device.capabilities.some((capability) => WRITABLE_DEVICE_CAPABILITIES.has(capability))
 }
 
 export function isDeviceOnline(device: DeviceState | null | undefined): boolean {

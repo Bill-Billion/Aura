@@ -6,8 +6,8 @@ import re
 from pydantic import BaseModel, Field
 from typing import Any, Sequence
 
-from backend.config.capability_matrix import get_capability_spec
-from backend.config.validation import device_is_online
+from backend.execution.capability_matrix import get_capability_spec
+from backend.execution.validation import device_is_online
 from backend.engine.state import WorldState, DeviceState, DeviceStateValues, Location3D
 
 
@@ -17,6 +17,11 @@ from backend.engine.state import WorldState, DeviceState, DeviceStateValues, Loc
 SIMULATION_WRITE_SOURCES: frozenset[str] = frozenset(
     {"environment_sim", "user_behavior_sim", "simulator_timer", "system"}
 )
+
+# §2.2 不变式违规的结构化事件类型。命令路径（executor）与仿真写入路径（SimulationEngine）
+# 共用同一类型，靠 data.attributed_to / data.pre_existing 区分归因——定义放在状态层，
+# 避免 engine 反向依赖 execution 包。
+INVARIANT_VIOLATION_EVENT_TYPE = "system.invariant_violation"
 
 
 class InvariantViolation(RuntimeError):
@@ -54,7 +59,9 @@ def verify_world_invariants(world: WorldState) -> None:
 
     只覆盖可从 WorldState 判定的四条：用户单一位置、room.persons↔user.location 一致、
     occupancy 可由 persons 推导、设备属唯一（且已注册的）房间。run_id 相关两条由 S2 的
-    run 模型接管。开销 O(rooms + persons + devices)，只在命令路径与 reset 后跑。
+    run 模型接管。开销 O(rooms + persons + devices)：命令路径的 apply 前后各一次，仿真
+    写入路径（SimulationEngine tick 收尾 / 用户活动 / 环境刷新）经
+    :func:`find_world_invariant_violation` 各一次。
     """
 
     room_of_person: dict[str, str] = {}
@@ -94,6 +101,24 @@ def verify_world_invariants(world: WorldState) -> None:
                 f"设备 {device.id} 所属房间 {device.location.room!r} 未在世界中注册",
                 {"device_id": device.id, "room_id": device.location.room},
             )
+
+
+def find_world_invariant_violation(world: WorldState) -> InvariantViolation | None:
+    """不抛出版的不变式探测：返回首条违规，世界一致时返回 None。
+
+    仿真写入路径要的是「检测 + 归因」而不是「打断」——仿真产出的是 ground truth，回滚它
+    会撕裂物理演化，所以那里拿到违规对象后只上报；命令路径继续用
+    :func:`verify_world_invariants` 的抛出语义（回滚 + failed）。
+
+    另一处用途是归因：命令 apply 之前先探一次，apply 之后若仍违规且 apply 前就已违规，
+    说明责任不在这条命令（审计 finding 3：绝不让无辜命令替仿真背锅）。
+    """
+
+    try:
+        verify_world_invariants(world)
+    except InvariantViolation as violation:
+        return violation
+    return None
 
 
 class StateManager:

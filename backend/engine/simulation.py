@@ -14,7 +14,13 @@ from backend.core.logging import log
 from backend.engine.event_bus import EventBus, SimEvent, WorldEvent
 from backend.engine.simulator_timer import SimulatorTimer
 from backend.engine.state import Location3D, WorldState
-from backend.engine.state_manager import DeltaChange, StateManager
+from backend.engine.state_manager import (
+    INVARIANT_VIOLATION_EVENT_TYPE,
+    DeltaChange,
+    StateManager,
+    find_world_invariant_violation,
+)
+from backend.execution.executor import CommandExecutor, InvariantReportDebounce
 from backend.models.schemas import WSMessage
 from backend.simulators.environment import EnvironmentSimulator
 from backend.simulators.user_behavior import UserBehaviorSimulator
@@ -48,15 +54,29 @@ class SimulationEngine:
         )
 
         self._pending_deltas: list[DeltaChange] = []
+        # 已上报且尚未修复的不变式违规去抖：同一条违规每 tick 重报会淹没事件流，
+        # 世界恢复一致（或换成另一条违规）后自动复位重报。
+        # 这一份实例同时注入 CommandExecutor：仿真侧与命令侧共用一份签名，一次损坏只报一次
+        # （否则命令侧还会每条命令补一条 pre_existing 事件，review2 finding-3）。
+        self._invariant_report = InvariantReportDebounce()
         self._subscriptions_registered = False
         self._is_processing_timer_tick = False
         self._time_of_day_seconds = self._parse_time_of_day_to_seconds(
             self.state_manager.world.environment.time_of_day
         )
 
+        # 全系统唯一一台 CommandExecutor（S1 review finding-8）：UI 腿（main.py）与
+        # agent 腿（runtime.py）共用它，各自把 publish 包装按次传入。用完即弃的 executor
+        # 会让 _pending 注册表没有生产寿命——cancel_pending 无事可取消、跨调用取代不成立。
+        # 不在此处绑 publish：引擎自身不发命令，包装归各条腿所有。
+        self.command_executor = CommandExecutor(
+            self.state_manager, invariant_debounce=self._invariant_report
+        )
+
         self.agent_runtime = AgentRuntime(
             llm_provider=llm_provider,
             episode_timeout_ms=agent_episode_timeout_ms,
+            command_executor=self.command_executor,
         )
         self.agent_runtime.register(LightingAgent())
         self.agent_runtime.register(HVACAgent())
@@ -67,6 +87,7 @@ class SimulationEngine:
             state_manager=self.state_manager,
             connection_manager=self.conn,
             publish_event=self._publish_sim_event,
+            command_executor=self.command_executor,
         )
         self._sync_world_timing_state(reset_mode=True)
         self._sync_agent_diagnostics()
@@ -147,6 +168,10 @@ class SimulationEngine:
         # 审计必修②：cancel-before-swap——先取消并落账在飞 episode，
         # 再替换世界，否则旧任务可能在 swap 之后、cancel 之前写入新世界。
         await self.agent_runtime.cancel_active_episodes()
+        # 同一条 cancel-before-swap 纪律延伸到命令层：episode 被砍后仍挂在注册表里的
+        # 在飞命令必须先落账成 cancelled（§15「reset 取消在飞命令」），再换世界，
+        # 否则它们的终态迁移会记在重置后的新世界头上。
+        await self.command_executor.cancel_pending("simulation_reset")
         if new_state_manager is not None:
             self.state_manager = new_state_manager
         else:
@@ -158,9 +183,13 @@ class SimulationEngine:
         self.timer.set_mode(self.DEFAULT_MODE)
         self.user_sim = UserBehaviorSimulator()
         self._pending_deltas = []
+        # 换了世界（或清了世界）之后旧违规不再成立，去抖状态必须跟着复位。
+        self._invariant_report.reset()
         self._time_of_day_seconds = self._parse_time_of_day_to_seconds(
             self.state_manager.world.environment.time_of_day
         )
+        # executor 换绑新世界并清空注册表（cancel 已落账，这里是防残留的兜底）。
+        self.command_executor.bind_state_manager(self.state_manager)
         self.agent_runtime.update_state_manager(self.state_manager)
         self.agent_runtime.reset()
         self._sync_world_timing_state(reset_mode=True)
@@ -280,6 +309,10 @@ class SimulationEngine:
 
         self._is_processing_timer_tick = False
         await self._flush_pending_deltas()
+        # tick 收尾探测：本 tick 内的仿真写入（timer/user/env）是否把世界写成不一致。
+        await self._report_world_invariants(
+            phase="tick_end", attributed_to="simulator_timer", root_event=event
+        )
         await self._broadcast_agent_status(world)
 
     async def _handle_user_activity_change(self, event: SimEvent) -> None:
@@ -328,6 +361,12 @@ class SimulationEngine:
 
         if not self._is_processing_timer_tick:
             await self._flush_pending_deltas()
+            # tick 内的写入由 tick 收尾统一探测（中途状态可以是半成品）；tick 外的写入自查。
+            await self._report_world_invariants(
+                phase="user_activity_change",
+                attributed_to=event.source,
+                root_event=event,
+            )
 
     async def _handle_environment_refresh(self, event: SimEvent) -> None:
         updates = event.data.get("updates") or self.env_sim.step(
@@ -344,6 +383,61 @@ class SimulationEngine:
 
         if not self._is_processing_timer_tick:
             await self._flush_pending_deltas()
+            await self._report_world_invariants(
+                phase="environment_refresh",
+                attributed_to=event.source,
+                root_event=event,
+            )
+
+    async def _report_world_invariants(
+        self,
+        *,
+        phase: str,
+        attributed_to: str,
+        root_event: SimEvent | None = None,
+    ) -> None:
+        """§2.2 仿真写入后的不变式探测：检测 + 归因，绝不回滚、绝不静默纠正。
+
+        为什么不像命令路径那样回滚：仿真产出的是世界 ground truth，回滚它会撕裂物理演化；
+        为什么必须在这里探：不然仿真写坏的世界要等到下一条无辜命令执行时才被发现，责任被
+        错记在那条命令上，且世界永不修复 → 此后每条命令连锁失败（审计 finding 3）。
+        """
+
+        violation = find_world_invariant_violation(self.state_manager.world)
+        # 去抖对象与 CommandExecutor 共用：仿真侧报过的那条违规，命令侧不会再补一遍。
+        # 同 executor：should_report 需在 violation 为 None 时也被调用以复位签名，
+        # 且该情形自身返回 False，故无需再补 or-is-None。
+        if not self._invariant_report.should_report(violation):
+            return
+
+        world = self.state_manager.world
+        await self._publish_sim_event(
+            SimEvent(
+                event_type=INVARIANT_VIOLATION_EVENT_TYPE,
+                # source=检测方（状态层），data.attributed_to=写坏世界的仿真源。
+                source="state_manager",
+                timestamp=float(world.simulation_tick),
+                wall_time=time.time(),
+                correlation_id=root_event.correlation_id if root_event else None,
+                causal_parent=root_event.event_id if root_event else None,
+                priority=3,
+                data={
+                    "invariant": violation.invariant,
+                    "message": violation.message,
+                    "details": violation.details,
+                    "phase": phase,
+                    "attributed_to": attributed_to,
+                    "source": attributed_to,
+                    # 仿真侧违规按定义不是「某条命令造成的」，字段保持与命令路径同形。
+                    "pre_existing": False,
+                    "command_id": None,
+                    "device_id": None,
+                    "capability": None,
+                    "command_failed": False,
+                    "reverted_paths": [],
+                },
+            )
+        )
 
     async def _flush_pending_deltas(self) -> None:
         if not self._pending_deltas:

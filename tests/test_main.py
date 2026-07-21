@@ -109,7 +109,7 @@ def test_ws_full_state_exposes_registered_device_metadata(client):
 
         assert sensor["type"] == "sensor"
         assert sensor["ui_group"] == "environment"
-        assert "read" in sensor["capabilities"]
+        assert "value" in sensor["capabilities"]
 
 
 def test_ws_cmd_sim_start(client):
@@ -330,10 +330,10 @@ def test_ws_cmd_device_control_rejects_sensor_write(client):
             },
         })
 
-        # 经 executor 六级校验：sensor 无 value 能力 → §10.2 capability_not_supported
+        # 经 executor 六级校验：sensor.value 是只读能力位 → §10.2 read_only_capability
         data = _receive_until_message_type(ws, "ERROR")
         assert data["type"] == "ERROR"
-        assert data["payload"]["code"] == "capability_not_supported"
+        assert data["payload"]["code"] == "read_only_capability"
         assert data["payload"]["message"]
         assert isinstance(data["payload"]["details"], dict)
         assert data["payload"]["details"]["device_id"] == "sensor_living_temp_01"

@@ -83,7 +83,16 @@ LEGAL_TRANSITIONS: dict[CommandStatus, frozenset[CommandStatus]] = {
             CommandStatus.SUPERSEDED,
         }
     ),
-    CommandStatus.VALIDATED: frozenset({CommandStatus.EXECUTING}),
+    # validated 也必须能被取代/取消：共用一台 executor 之后，记录会真的停在 validated 上
+    # （下一次迁移的事件外发是 await 点），此时来一条同控制点的新命令或一次 reset，
+    # 若这里没有出边，取代/取消就只能把记录从注册表里静默丢掉——零可观测性（review2 finding-1）。
+    CommandStatus.VALIDATED: frozenset(
+        {
+            CommandStatus.EXECUTING,
+            CommandStatus.CANCELLED,
+            CommandStatus.SUPERSEDED,
+        }
+    ),
     CommandStatus.EXECUTING: frozenset(
         {
             CommandStatus.SUCCEEDED,
@@ -119,10 +128,17 @@ class DeviceCommand(BaseModel):
 
     correlation_id / causal_parent 继承命令所属根事件（§4.4），生命周期事件由此继承。
     ``capability`` 即被设置的设备属性（property），与 spec §3 能力矩阵同名。
+
+    ``source`` 是四值审计口径（谁这一类），``actor`` 是执行者身份（具体哪一个）——两者都必须
+    保留：可观测性产品要回答的是"哪个 agent 干的"，只留 source 就退化成 'agent' 一个值。
+    agent/rule_fallback 路径把 actor 置为 agent_id、actor_name 置为展示名；ui/scenario 留 None，
+    归因回落到 ``source.value``（绝不伪造 agent 身份字段）。
     """
 
     command_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
     source: CommandSource
+    actor: str | None = None
+    actor_name: str | None = None
     device_id: str
     capability: str
     value: Any = None
@@ -201,30 +217,34 @@ class CommandRecord:
         detail: str | None = None,
         tick: int | None = None,
     ) -> SimEvent | None:
-        """迁移到 *to*，先校验合法性再发事件、再改状态。
+        """迁移到 *to*：先校验合法性、再落状态、最后发事件。
 
         非法迁移抛 IllegalTransitionError（不发事件、不改状态）。
         *failure* 为 §10.2 失败码字符串（枚举归 validation.py 所有）。
+
+        **先落状态再发事件**是并发正确性要求（review2 finding-1）：事件外发是 await 点，
+        期间同一控制点的另一条命令可能对本记录发起合法迁移（取代）或 reset 取消它。
+        若等 emit 回来再赋值，那次迁移会被这里覆盖掉——一条已经 superseded 的记录会"复活"
+        成 executing 继续下发。校验与赋值之间没有 await，因此这一步对事件循环是原子的。
         """
         to_status = CommandStatus(to)
         if to_status not in LEGAL_TRANSITIONS[self.status]:
             raise IllegalTransitionError(self.status, to_status)
 
         from_status = self.status
-        event = await self._emit(
+        self.status = to_status
+        if failure is not None:
+            self.failure_code = failure
+        if detail is not None:
+            self.detail = detail
+
+        return await self._emit(
             from_status=from_status,
             to_status=to_status,
             failure=failure,
             detail=detail,
             tick=tick,
         )
-
-        self.status = to_status
-        if failure is not None:
-            self.failure_code = failure
-        if detail is not None:
-            self.detail = detail
-        return event
 
     def build_lifecycle_event(
         self,
@@ -248,6 +268,10 @@ class CommandRecord:
             "source": self.command.source.value,
             "detail": detail,
         }
+        # 执行者身份只在存在时出现：ui/scenario 命令不该带 agent_* 字段（前端按有无分组）。
+        if self.command.actor is not None:
+            data["agent_id"] = self.command.actor
+            data["agent_name"] = self.command.actor_name or self.command.actor
         if failure is not None:
             data["failure_code"] = failure
 

@@ -150,8 +150,9 @@ CAPABILITY_MATRIX: dict[DeviceType, tuple[CapabilitySpec, ...]] = {
             writable=False,
             effect_class="ui_observability",
         ),
-        # §3.2：online 默认不可写；能力语义在此声明，设备侧仍以 extra.online 镜像
-        # 防前端断链（DeviceCapability Literal + 注册表能力位补录留待后续任务）。
+        # §3.2：online 默认不可写。能力语义在此声明，注册表的 camera 条目同时写入
+        # capabilities=["view","online"] 与 default_extra["online"] 镜像——镜像不可删，
+        # 前端 CameraPanel/deviceFloorMap 读的正是 state.extra.online。
         CapabilitySpec(
             name="online",
             value_type="bool",
@@ -160,8 +161,14 @@ CAPABILITY_MATRIX: dict[DeviceType, tuple[CapabilitySpec, ...]] = {
         ),
     ),
     "sensor": (
+        # 【对 spec §3.2 表的一处有意偏离】表里这一行写作 `read`，实现统一改名为 `value`：
+        # 能力名必须与效果模型写入的状态字段同名——读数落在 state.extra.value
+        # （backend/simulators/effects.py），前端 SensorPanel 读的也是它。叫 `read` 时，
+        # 写真实传感器会被判成 capability_not_supported（"没这条能力"），§2.2 第6条的
+        # 只读语义永远触发不到，而 executor 的 extra.<capability> 路径也指向一个不存在的字段。
+        # 偏离已记在 docs/architecture/ws-protocol.md 的 §10.2 码表；改回 read 前先改这两处。
         CapabilitySpec(
-            name="read",
+            name="value",
             value_type="float",
             writable=False,
             effect_class="ui_observability",
@@ -209,7 +216,7 @@ def get_writable_capability_names(device_type: DeviceType) -> frozenset[str]:
 
 
 def read_only_capability_names() -> frozenset[str]:
-    """跨全部类型聚合的只读能力名集合（当前为 view/online/read）。"""
+    """跨全部类型聚合的只读能力名集合（当前为 view/online/value）。"""
 
     return frozenset(
         spec.name

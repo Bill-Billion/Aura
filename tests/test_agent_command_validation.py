@@ -1,8 +1,9 @@
 """Agent execution path must validate device commands exactly like the UI path.
 
-审计必修①：runtime 胜出命令循环曾绕过 validate_device_command 并静默吞掉
-KeyError。这里的奇偶校验（agent 路径与 UI 路径对同一坏命令返回同一错误码）
-是承重断言——S1 换错误码词表时两条路径必须一起换。
+审计必修①：runtime 胜出命令循环曾绕过校验并静默吞掉 KeyError。S1 后两条路径
+统一走 CommandExecutor → backend/execution/validation.validate_command（§10.2 词表）。
+这里的奇偶校验（agent 路径与 UI 路径对同一坏命令返回同一错误码）是承重断言——
+换错误码词表时两条路径必须一起换。
 """
 
 from __future__ import annotations
@@ -94,7 +95,7 @@ def _make_world() -> WorldState:
             id="sensor_living_temp_01",
             type="sensor",
             location=Location3D(room="living_room"),
-            capabilities=["read"],
+            capabilities=["value"],
             state=DeviceStateValues(
                 power=True,
                 extra={"sensor_type": "temperature", "value": 26.5, "unit": "°C"},
@@ -245,9 +246,9 @@ async def test_read_only_capability_rejected():
     failure = failures[0]
 
     sensor = engine.state_manager.world.devices["sensor_living_temp_01"]
-    # §10.2 词表：sensor 未声明 value 能力（只有 read），经 executor 六级校验 →
-    # capability_not_supported。命令被拒、传感器 ground truth 不被改写。
-    assert failure["data"]["error_code"] == "capability_not_supported"
+    # §10.2 词表：sensor.value 是只读能力（读数由效果模型产生），agent 写它 →
+    # read_only_capability。命令被拒、传感器 ground truth 不被改写。
+    assert failure["data"]["error_code"] == "read_only_capability"
 
     assert sensor.state.extra["value"] == 26.5
     assert _mutation_snapshot(engine) == before
@@ -288,6 +289,42 @@ async def test_valid_command_regression():
     light = engine.state_manager.world.devices["light_living_01"]
     assert light.state.extra["brightness"] == 70
     assert engine.state_manager.world.rooms["living_room"].light_level == 560.0
+
+
+@pytest.mark.anyio
+async def test_agent_path_preserves_agent_identity_in_events_and_world():
+    """finding-1 回归闸（runtime 侧）：executor 化之后执行者身份不得退化为 'agent'。
+
+    前端 observability/AgentActionLog 都按 event.source / data.agent_name / delta.caused_by
+    分组着色；这三处一旦收敛到四值来源枚举，可观测性面板就分不清是哪个 agent 干的。
+    """
+    engine = _make_engine(
+        proposals=[
+            AgentCommandProposal(
+                device_id="light_living_01",
+                property="extra.brightness",
+                value=70,
+                reason="occupied evening lighting",
+            )
+        ],
+        allowed_specs=[{"device_id": "light_living_01", "property": "extra.brightness"}],
+    )
+
+    await _run_episode_to_completion(engine, _root_event("identity"))
+
+    events = _sim_events_from(engine)
+    action = next(e for e in events if e["event_type"] == "action.device_control")
+    assert action["source"] == "lighting_agent"
+    assert action["data"]["agent_id"] == "lighting_agent"
+    assert action["data"]["agent_name"] == "Lighting Agent"
+    assert action["data"]["source"] == "agent"
+
+    feedbacks = [e for e in events if e["event_type"] == "feedback.state_delta"]
+    assert feedbacks
+    assert {e["data"]["caused_by"] for e in feedbacks} == {"lighting_agent"}
+
+    light = engine.state_manager.world.devices["light_living_01"]
+    assert light.state.last_changed_by == "lighting_agent"
 
 
 @pytest.mark.anyio
@@ -389,4 +426,4 @@ def test_agent_and_ui_paths_reject_identically():
     assert agent_read_only_code == ui_read_only_code
     # 并且已迁移到 §10.2 十码词表（S1-T2）。
     assert ui_unknown_code == "unknown_device"
-    assert ui_read_only_code == "capability_not_supported"
+    assert ui_read_only_code == "read_only_capability"

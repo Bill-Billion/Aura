@@ -79,8 +79,8 @@ def _acceptance_world() -> WorldState:
             id="sensor_living",
             type="sensor",
             location=Location3D(room="living_room"),
-            capabilities=["read"],
-            state=DeviceStateValues(extra={"read": 25.0}),
+            capabilities=["value"],
+            state=DeviceStateValues(extra={"value": 25.0}),
         ),
         "light_offline": DeviceState(
             id="light_offline",
@@ -171,7 +171,7 @@ async def test_commands_are_validated_by_capability_schema():
         ("light_living", "brightness", "很亮", "invalid_value_type"),
         ("light_living", "brightness", 999, "invalid_value_range"),
         ("hvac_living", "mode", "turbo", "invalid_value_range"),
-        ("sensor_living", "read", 18.0, "read_only_capability"),
+        ("sensor_living", "value", 18.0, "read_only_capability"),
         ("light_offline", "power", True, "device_offline"),
     ]
 

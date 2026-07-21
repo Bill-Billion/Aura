@@ -18,6 +18,7 @@ from backend.engine.state import (
 )
 from backend.engine.state_manager import StateManager
 from backend.execution.command import (
+    LIFECYCLE_EVENT_SOURCE,
     LIFECYCLE_EVENT_TYPE,
     CommandSource,
     CommandStatus,
@@ -290,13 +291,79 @@ async def test_feedback_timeout_with_injected_clock_yields_timed_out():
         "executing",
         "timed_out",
     ]
-    assert any(
-        e.event_type == COMMAND_FAILED_EVENT_TYPE
-        and e.data["error_code"] == "execution_timeout"
-        for e in events
-    )
+    failed_ev = next(e for e in events if e.event_type == COMMAND_FAILED_EVENT_TYPE)
+    assert failed_ev.data["error_code"] == "execution_timeout"
+    # §10.2「失败命令不得改动世界」：超时同不变式违规一样回滚，并把 reverted_paths 留痕。
+    assert failed_ev.data["reverted_paths"] == [
+        "devices[light_living].state.power",
+        "devices[light_living].state.last_changed_by",
+    ]
     # 反馈未在窗口内到达，不发 feedback 事件
     assert not any(e.event_type == FEEDBACK_EVENT_TYPE for e in events)
+    # 世界与事件流一致：既然没有任何 feedback 外发，世界也必须回到命令之前
+    assert sm.world.devices["light_living"].state.power is False
+    assert sm.world.devices["light_living"].state.last_changed_by == "system"
+    assert sm.world.rooms["living_room"].light_level == 300.0
+
+
+@pytest.mark.anyio
+async def test_agent_sourced_command_keeps_actor_identity_end_to_end():
+    """finding-1 回归闸：agent 命令的执行者身份（agent_id）必须贯穿事件、delta 与设备。
+
+    可观测性产品的卖点就是「哪个 agent 干的」；退化成四值 source 枚举（'agent'）即产品回归。
+    """
+    events, publish = _collector()
+    sm = StateManager(_make_world())
+    ex = CommandExecutor(sm, publish)
+
+    rec = await ex.submit(
+        _cmd(
+            source=CommandSource.AGENT,
+            actor="comfort_agent",
+            actor_name="Comfort Agent",
+            capability="power",
+            value=True,
+        )
+    )
+    assert rec.status == CommandStatus.SUCCEEDED
+
+    action_ev = next(e for e in events if e.event_type == ACTION_EVENT_TYPE)
+    # 前端 extractEventAgentId 依赖 source/agent_id，observability 面板依赖 agent_name
+    assert action_ev.source == "comfort_agent"
+    assert action_ev.data["agent_id"] == "comfort_agent"
+    assert action_ev.data["agent_name"] == "Comfort Agent"
+    # 四值来源不丢：source 字段仍是审计口径的 'agent'
+    assert action_ev.data["source"] == "agent"
+
+    feedbacks = [e for e in events if e.event_type == FEEDBACK_EVENT_TYPE]
+    assert feedbacks
+    # 直接 delta 与 effect 派生 delta（房间光照）都归因到 agent 本人
+    assert {e.data["caused_by"] for e in feedbacks} == {"comfort_agent"}
+    assert sm.world.devices["light_living"].state.last_changed_by == "comfort_agent"
+
+    lifecycle = [e for e in events if e.event_type == LIFECYCLE_EVENT_TYPE]
+    assert all(e.data["agent_id"] == "comfort_agent" for e in lifecycle)
+
+
+@pytest.mark.anyio
+async def test_ui_command_without_actor_attributes_to_source():
+    """无 actor 的 UI 命令：归因回落到四值来源，且不伪造 agent 身份字段。"""
+    events, publish = _collector()
+    sm = StateManager(_make_world())
+    ex = CommandExecutor(sm, publish)
+
+    rec = await ex.submit(_cmd(source=CommandSource.UI, capability="power", value=True))
+    assert rec.status == CommandStatus.SUCCEEDED
+
+    action_ev = next(e for e in events if e.event_type == ACTION_EVENT_TYPE)
+    assert action_ev.source == LIFECYCLE_EVENT_SOURCE
+    assert action_ev.data["source"] == "ui"
+    assert "agent_id" not in action_ev.data
+    assert "agent_name" not in action_ev.data
+
+    feedbacks = [e for e in events if e.event_type == FEEDBACK_EVENT_TYPE]
+    assert {e.data["caused_by"] for e in feedbacks} == {"ui"}
+    assert sm.world.devices["light_living"].state.last_changed_by == "ui"
 
 
 @pytest.mark.anyio

@@ -460,7 +460,7 @@ export function buildEventDetailView(event: SimEvent): EventDetailView {
         kind: 'action',
         summary: data.reason,
         fields: [
-          createField('执行 Agent', data.agent_name, 'accent'),
+          createActionActorField(data),
           createField('设备', data.device_id),
           createField('属性', data.property),
           createField('目标值', formatInlineValue(data.value)),
@@ -615,6 +615,28 @@ function buildReasoningSteps(currentType: string): ReasoningStepView[] {
 
 function createField(label: string, value: string, tone: EventDetailField['tone'] = 'default'): EventDetailField {
   return { label, value, tone }
+}
+
+const COMMAND_SOURCE_LABELS: Record<string, string> = {
+  ui: '用户操作',
+  agent: 'Agent',
+  scenario: '场景脚本',
+  rule_fallback: '规则降级',
+}
+
+// S1 之后 UI / 场景脚本来源的命令也会外发 action.device_control，而后端对这些来源
+// 刻意不写 agent_id / agent_name（backend/execution/command.py::_actor_fields），
+// 所以这里不能无条件渲染"执行 Agent"，否则详情面板会出现一行空值。
+function createActionActorField(data: ActionDeviceControlData): EventDetailField {
+  if (typeof data.agent_name === 'string' && data.agent_name.length > 0) {
+    return createField('执行 Agent', data.agent_name, 'accent')
+  }
+  if (typeof data.agent_id === 'string' && data.agent_id.length > 0) {
+    return createField('执行 Agent', data.agent_id, 'accent')
+  }
+  const source = typeof data.source === 'string' ? data.source : ''
+  // 空串必须兜住：createField 不做 falsy 过滤，ReasoningDetail.vue 也不带 v-if。
+  return createField('执行来源', COMMAND_SOURCE_LABELS[source] || source || '未知来源', 'accent')
 }
 
 function mapCommandView(command: CommandProposalData): EventDetailCommand {

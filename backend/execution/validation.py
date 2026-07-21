@@ -8,7 +8,7 @@
 校验顺序（前者先于后者，多问题并存时报靠前的级）:
   1. device exists            → unknown_device            §3.3
   2. device online            → device_offline            §2.2 不变式（online=false 不可执行可写命令）
-  3. capability exists        → capability_not_supported  §3.3
+  3. capability exists        → capability_not_supported  §3.3（先类型级矩阵，再设备实例能力位）
   4. capability writable      → read_only_capability      §3.3
   5. value type               → invalid_value_type        §3.3
   6. value range / enum       → invalid_value_range       §3.3
@@ -22,7 +22,7 @@ from typing import Any, Iterable, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from backend.config.capability_matrix import CapabilitySpec, ValueType, get_capability_spec
+from backend.execution.capability_matrix import CapabilitySpec, ValueType, get_capability_spec
 from backend.engine.state import DeviceState, WorldState
 
 
@@ -39,6 +39,10 @@ class CommandErrorCode(str, Enum):
     POLICY_DENIED = "policy_denied"
     # —— 执行期（executor 层 S1-T3/T4；列于此以保 §10.2 词表单一来源）——
     EXECUTION_TIMEOUT = "execution_timeout"
+    # 【保留位，S1 无产出方】§10.2 词表完整性要求它在枚举里，但当前同步 StateManager 下
+    # apply 立即返回，唯一的反馈失败路径（executor 超预算）报 execution_timeout。
+    # 研究者不要等这个码：S2/S3 引入异步 episode、反馈与下发解耦后才会有真实产出方
+    # （"apply 成功但没拿到任何 delta"）。改动时必须同步 docs/architecture/ws-protocol.md。
     STATE_FEEDBACK_MISSING = "state_feedback_missing"
     SUPERSEDED_BY_NEWER_COMMAND = "superseded_by_newer_command"
 
@@ -166,12 +170,23 @@ def validate_command(
             details={"device_id": device_id, "capability": capability},
         )
 
-    # 3. capability exists（§3.3）
+    # 3. capability exists（§3.3）——先看类型级矩阵（值契约的唯一来源）
     spec = get_capability_spec(device.type, capability)
     if spec is None:
         return CommandFailure(
             code=CommandErrorCode.CAPABILITY_NOT_SUPPORTED,
             message=f"{device.type} 设备不支持能力 {capability}",
+            details={"device_id": device_id, "capability": capability},
+        )
+
+    # 3b. 实例级能力位（§3.2/§3.3）：类型矩阵只是上界，设备自己声明的 capabilities 才是
+    # 这台设备的实际契约——一盏没登记 color_temp 的灯不该因为"light 类型有这条"而被放行。
+    # S2 场景会大量生成能力位裁剪过的设备，这一级是它们唯一的兜底。
+    # 能力位为空视为"未枚举"，回退到类型级声明（最小构造的设备/旧夹具不填这个字段）。
+    if device.capabilities and capability not in device.capabilities:
+        return CommandFailure(
+            code=CommandErrorCode.CAPABILITY_NOT_SUPPORTED,
+            message=f"设备 {device_id} 未声明能力 {capability}",
             details={"device_id": device_id, "capability": capability},
         )
 

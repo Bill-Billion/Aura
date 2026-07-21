@@ -67,12 +67,21 @@ export interface UserActivityChangeData {
   activity: string
 }
 
+// 命令四来源（spec §10 / ws-protocol.md「S1 命令生命周期 payload」）。
+export type CommandSource = 'ui' | 'agent' | 'scenario' | 'rule_fallback'
+
 export interface ActionDeviceControlData {
-  agent_name: string
+  // agent_id / agent_name 只在有具体执行者时出现：backend/execution/command.py::_actor_fields
+  // 对 ui / scenario 来源刻意不伪造 agent 身份，所以这两个字段是可选的。
+  agent_id?: string
+  agent_name?: string
+  command_id?: string
   device_id: string
+  capability?: string
   property: string
   value: unknown
   reason: string
+  source?: CommandSource | string
 }
 
 export interface CommandProposalData {

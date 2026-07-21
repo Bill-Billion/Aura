@@ -8,13 +8,13 @@ from __future__ import annotations
 
 import pytest
 
-from backend.config.capability_matrix import (
+from backend.execution.capability_matrix import (
     all_device_types,
     get_capability_specs,
     get_writable_capability_names,
 )
 from backend.config.device_registry import build_default_devices
-from backend.config.validation import (
+from backend.execution.validation import (
     CommandErrorCode,
     CommandFailure,
     ForbiddenDevicePolicy,
@@ -130,10 +130,28 @@ def test_nonexistent_capability_returns_capability_not_supported():
     assert failure.code is CommandErrorCode.CAPABILITY_NOT_SUPPORTED
 
 
-def test_writing_sensor_read_returns_read_only_capability():
-    failure = validate_command(_world(), "sensor_living_temp_01", "read", 18.0)
+def test_writing_sensor_value_returns_read_only_capability():
+    # 能力名必须是 value（effects 写的、前端读的都是 state.extra.value）：写真实
+    # 注册表传感器要报"只读"，而不是"能力不存在"。
+    failure = validate_command(_world(), "sensor_living_temp_01", "value", 18.0)
     assert failure is not None
     assert failure.code is CommandErrorCode.READ_ONLY_CAPABILITY
+
+
+def test_sensor_capability_name_matches_effect_model_field():
+    """矩阵里的 sensor 能力名 = 效果模型写入的 state.extra 字段名。
+
+    §3.4 的 sensor 读数落在 ``state.extra.value``（backend/simulators/effects.py），
+    前端 SensorPanel 读的也是它。矩阵若声明成别的名字，只读拦截就会落空——写 value
+    变成 capability_not_supported，真正的只读语义永远触发不到。
+    """
+
+    names = {spec.name for spec in get_capability_specs("sensor")}
+    assert names == {"value"}
+
+    device = build_default_devices()["sensor_living_temp_01"]
+    assert "value" in device.capabilities, "注册表能力位必须与矩阵同名"
+    assert "value" in device.state.extra, "extra 镜像（effects/前端读的字段）不可删"
 
 
 def test_writing_camera_view_returns_read_only_capability():
@@ -200,9 +218,86 @@ def test_validation_order_capability_precedes_value_type():
 
 def test_validation_order_writable_precedes_value_range():
     # 只读能力 + 越界值：writable 是第 4 级，值域是第 6 级 → 先报只读。
-    failure = validate_command(_world(), "sensor_living_temp_01", "read", 10**9)
+    failure = validate_command(_world(), "sensor_living_temp_01", "value", 10**9)
     assert failure is not None
     assert failure.code is CommandErrorCode.READ_ONLY_CAPABILITY
+
+
+# --------------------------------------------------------------------------- #
+# 实例级能力位：类型矩阵是上界，设备自己声明的能力位才是实际契约（§3.2/§3.3）
+# --------------------------------------------------------------------------- #
+
+
+def _world_with_reduced_devices() -> WorldState:
+    """默认世界 + 两台"能力位少于其类型声明"的设备（S2 场景会大量生成这种设备）。"""
+
+    world = _world()
+    world.devices["light_no_ct_01"] = DeviceState(
+        id="light_no_ct_01",
+        type="light",
+        location=Location3D(room="bedroom"),
+        capabilities=["power", "brightness"],  # 有意不含 color_temp
+        state=DeviceStateValues(power=True, extra={"brightness": 40}),
+    )
+    world.devices["hvac_no_speed_01"] = DeviceState(
+        id="hvac_no_speed_01",
+        type="hvac",
+        location=Location3D(room="bedroom"),
+        capabilities=["power", "target_temp", "mode"],  # 有意不含 speed
+        state=DeviceStateValues(power=True, extra={"target_temp": 24.0, "mode": "cool"}),
+    )
+    return world
+
+
+def test_instance_without_capability_returns_capability_not_supported():
+    world = _world_with_reduced_devices()
+
+    failure = validate_command(world, "light_no_ct_01", "color_temp", 4000)
+    assert failure is not None
+    assert failure.code is CommandErrorCode.CAPABILITY_NOT_SUPPORTED
+    assert failure.details["capability"] == "color_temp"
+
+    failure = validate_command(world, "hvac_no_speed_01", "speed", "low")
+    assert failure is not None
+    assert failure.code is CommandErrorCode.CAPABILITY_NOT_SUPPORTED
+
+
+def test_instance_declared_capabilities_still_pass():
+    # 实例级收紧只影响没声明的能力位，声明了的照常放行。
+    world = _world_with_reduced_devices()
+    assert validate_command(world, "light_no_ct_01", "brightness", 60) is None
+    assert validate_command(world, "light_no_ct_01", "power", True) is None
+    assert validate_command(world, "hvac_no_speed_01", "mode", "heat") is None
+
+
+def test_instance_capability_gate_precedes_value_type():
+    # 实例无该能力 + 值类型也不对：能力级是第 3 级，类型是第 5 级 → 先报能力不支持。
+    world = _world_with_reduced_devices()
+    failure = validate_command(world, "light_no_ct_01", "color_temp", "暖光")
+    assert failure is not None
+    assert failure.code is CommandErrorCode.CAPABILITY_NOT_SUPPORTED
+
+
+def test_empty_instance_capability_list_falls_back_to_type_level():
+    """能力位为空的设备回退到类型级声明，不因"没声明"被整体拒绝。
+
+    最小构造的设备（脚本/旧夹具）常不填 capabilities，若一律拒绝会把合法命令全打死。
+    """
+
+    world = _world()
+    world.devices["light_bare_01"] = DeviceState(
+        id="light_bare_01",
+        type="light",
+        location=Location3D(room="loft"),
+        capabilities=[],
+        state=DeviceStateValues(power=True, extra={"brightness": 30}),
+    )
+    assert validate_command(world, "light_bare_01", "brightness", 60) is None
+    assert validate_command(world, "light_bare_01", "color_temp", 4000) is None
+    # 类型级矩阵之外的能力仍然被拒
+    failure = validate_command(world, "light_bare_01", "open_percent", 50)
+    assert failure is not None
+    assert failure.code is CommandErrorCode.CAPABILITY_NOT_SUPPORTED
 
 
 # --------------------------------------------------------------------------- #

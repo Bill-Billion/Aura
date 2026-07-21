@@ -198,14 +198,16 @@ WebSocket 入口固定为 `/ws/simulation`。
 | --- | --- |
 | `unknown_device` | 设备不存在（含校验通过后设备并发消失） |
 | `device_offline` | 设备离线，不接受可写命令 |
-| `capability_not_supported` | 该设备类型没有这条能力 |
-| `read_only_capability` | 能力存在但只读（如 `sensor.read` / `camera.view`） |
+| `capability_not_supported` | 该设备类型没有这条能力，或这台设备没声明这条能力位 |
+| `read_only_capability` | 能力存在但只读（如 `sensor.value` / `camera.view`） |
 | `invalid_value_type` | 值类型与能力矩阵声明不符 |
 | `invalid_value_range` | 数值越界或枚举取值非法 |
 | `policy_denied` | 场景策略禁止操作该设备 |
 | `execution_timeout` | 动作已下发但状态反馈超出预算窗口 |
-| `state_feedback_missing` | 执行后没有拿到状态反馈 |
+| `state_feedback_missing` | 执行后没有拿到状态反馈 —— **保留码，当前版本不会出现在线上**（见下） |
 | `superseded_by_newer_command` | 同一控制点被更新的命令取代，本命令不执行 |
+
+> `state_feedback_missing` 目前**没有产出方**：同步 StateManager 下 `apply_action` 立即返回，唯一的反馈类失败路径（超出预算窗口）报 `execution_timeout`。该码列在这里只为保持 §10.2 十类词表完整——客户端应认得它，但不要等它出现。引入异步 episode（S2/S3）后才会有真实产出方。
 
 此外 `system.invariant_violation` 使用独立错误码 `invariant_violation`：它描述"世界差点被改坏"（系统级故障），不属于上面十类"命令为什么没被执行"。
 
@@ -420,7 +422,8 @@ spec §2.2 不变式被破坏时发出，`priority` 恒为 `3`（最高），且
 - `shake`
 - `timeout`
 - `view`
-- `read`
+- `online`（只读，camera）
+- `value`（只读，sensor；spec §3.2 表里旧名为 `read`，S1 已统一改名，见该节实现说明）
 
 ## 连接生命周期
 

@@ -22,7 +22,7 @@ from __future__ import annotations
 import random
 from typing import Any, Callable, Mapping, TypeVar
 
-from backend.config.capability_matrix import EffectClass
+from backend.execution.capability_matrix import EffectClass
 from backend.engine.state import DeviceState, RoomState, WorldState
 
 
