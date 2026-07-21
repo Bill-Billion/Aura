@@ -480,3 +480,48 @@ async def test_cancel_pending_cancels_inflight_and_clears_after_normal_submit():
     assert [r.command.command_id for r in cancelled] == ["cmd-pending"]
     assert rec.status == CommandStatus.CANCELLED
     assert ex.pending == {}
+
+
+@pytest.mark.anyio
+async def test_bind_state_manager_cancels_pending_with_lifecycle_events():
+    """S1 遗留缺陷（S2-T3 修）：换绑世界时 ``_pending.clear()`` 是一次无事件的静默丢弃。
+
+    S1 时这条路走不到（注册表只在同步调用内瞬态存在），但 S2 的 run 模型让它可达：
+    reset 换世界、runtime 发现世界被换过都会调它。静默丢弃正是 S1 到处根治的那一类
+    缺陷——命令消失、生命周期停在非终态、可观测性面板永远等一个不会来的收尾。
+    """
+
+    events, publish = _collector()
+    sm = StateManager(_make_world())
+    ex = CommandExecutor(sm, publish)
+
+    record = await ex._propose(_cmd(command_id="cmd-inflight"), None, publish=publish)
+    events.clear()
+
+    new_sm = StateManager(_make_world())
+    cancelled = await ex.bind_state_manager(new_sm, reason="simulation_reset")
+
+    assert [rec.command.command_id for rec in cancelled] == ["cmd-inflight"]
+    assert record.status == CommandStatus.CANCELLED
+    assert record.detail == "simulation_reset"
+    assert ex.pending == {}
+    assert ex.state_manager is new_sm
+
+    lifecycle = [
+        event
+        for event in events
+        if event.event_type == LIFECYCLE_EVENT_TYPE
+        and event.data["to_status"] == CommandStatus.CANCELLED.value
+    ]
+    assert len(lifecycle) == 1
+    assert lifecycle[0].data["command_id"] == "cmd-inflight"
+    assert lifecycle[0].data["detail"] == "simulation_reset"
+
+
+@pytest.mark.anyio
+async def test_bind_state_manager_without_pending_emits_nothing():
+    events, publish = _collector()
+    ex = CommandExecutor(StateManager(_make_world()), publish)
+
+    assert await ex.bind_state_manager(StateManager(_make_world())) == []
+    assert events == []

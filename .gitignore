@@ -11,6 +11,10 @@ dist/
 .env.*
 *.log
 .vite/
+# run 工件（data/runs/{run_id}/events.jsonl + run.json + S3 的 llm_recordings.jsonl）：
+# 实验产物，按 run 无限增长，绝不入库。
+data/
+
 .serena/
 output/
 .playwright-cli/

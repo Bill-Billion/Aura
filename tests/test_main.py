@@ -365,6 +365,63 @@ def test_ui_command_emits_root_event_before_state_delta(client):
         assert root_index < state_delta_index
 
 
+def test_ui_command_root_event_carries_seq_ahead_of_its_children(client):
+    """修 S2 review：WS 上的根事件此前 seq=null，而它的子事件带 1..N。
+
+    根事件在广播前先经 event_bus.stamp() 盖章，因此 WS 副本与 events.jsonl 副本同号，
+    S5 的因果树按 seq 排序时根节点排在自己的子节点之前。
+    """
+    with _connect(client) as ws:
+        ws.receive_json()  # initial STATE_FULL
+        ws.send_json({
+            "type": "CMD_DEVICE_CONTROL",
+            "payload": {"device_id": "light_living_01", "action": "turn_off"},
+        })
+        messages = _receive_until_types(ws, {"STATE_DELTA"})
+        sim_events = [
+            message["payload"] for message in messages if message["type"] == "SIM_EVENT"
+        ]
+        root = next(event for event in sim_events if event["event_type"] == "user.command")
+
+        assert root["seq"] is not None
+        assert root["run_id"] is not None
+
+        children = [
+            event
+            for event in sim_events
+            if event["correlation_id"] == root["correlation_id"]
+            and event["event_id"] != root["event_id"]
+        ]
+        assert children, "根事件必须有子事件（生命周期/动作/反馈）"
+        assert all(child["seq"] is not None for child in children)
+        assert all(child["seq"] > root["seq"] for child in children)
+
+
+def test_ui_command_events_carry_no_generation_mode(client):
+    """生成模式只描述"根事件怎么被生成的"，UI 命令与其派生事件都不带。
+
+    与 docs/architecture/sim-event-schema.md §11.1 的表述对账：用户直发的命令不是
+    平台生成的，agent/executor 的派生事件靠 causal_parent + source 表达来源。
+    """
+    with _connect(client) as ws:
+        ws.receive_json()  # initial STATE_FULL
+        ws.send_json({
+            "type": "CMD_DEVICE_CONTROL",
+            "payload": {"device_id": "light_living_01", "action": "turn_off"},
+        })
+        messages = _receive_until_types(ws, {"STATE_DELTA"})
+        sim_events = [
+            message["payload"] for message in messages if message["type"] == "SIM_EVENT"
+        ]
+        root = next(event for event in sim_events if event["event_type"] == "user.command")
+        family = [
+            event
+            for event in sim_events
+            if event["correlation_id"] == root["correlation_id"]
+        ]
+        assert {event["event_generation_mode"] for event in family} == {None}
+
+
 def test_ui_command_full_lifecycle_visible_over_ws(client):
     # spec §15 验收：一条 UI 命令的完整生命周期 proposed→…→succeeded 经 SIM_EVENT 外发
     with _connect(client) as ws:
@@ -464,3 +521,4 @@ def test_heartbeat_pong_is_accepted_without_error(client):
         data = ws.receive_json()
         assert data["type"] == "SIMULATION_STATUS"
         assert data["payload"]["speed"] == 1.5
+

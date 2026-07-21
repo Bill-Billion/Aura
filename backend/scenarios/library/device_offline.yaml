@@ -1,0 +1,142 @@
+# §6.9 Device Offline —— 主空调在需要它之前就已经掉线。
+#
+# 【schema 1.1 声明】本文件顶层带 `expected_failures`，那是 §13 恢复要求的落点。该字段
+# 是 schema 1.1 的 §14 MINOR 增量（"Minor versions may add optional fields"），后端已支持
+# 1.1：loader 走严格分支把它校验成 ScenarioSpec.expected_failures，S4 评估器直接消费。
+# 不要把它退回 1.0 —— 那会让高 MINOR 容忍分支把整块声明丢掉，S4 读到的是空。
+#
+# 【为什么本文件刻意不含 timeline 设备直控项】
+# tests/test_s1_acceptance.py::_library_scenario_with_device_command 按 **id 升序** 取库里
+# 第一个带 `payload.capability/value` 的场景，并断言它在整个 run 里只有一条场景来源命令
+# 且必须成功。本场景 id（device_offline_fallback）排在 user_arrives_home_evening 之前，
+# 在这里加一条注定失败的直控项，会把 §15-2 的被测对象换成它并让那条验收挂掉。
+# 掉线设备的失败路径由 S4-T3 的 scenarios/failures/fail_device_offline_mid_execution.yaml
+# 专门覆盖；本场景负责的是"掉线**在先**"这一类。
+scenario_schema_version: "1.1"
+id: device_offline_fallback
+name: 设备掉线降级
+description: 客厅主空调在高温前已掉线，期望 agent 避开不可用设备、改用备用空调与风扇。
+seed: 1008
+duration_seconds: 120
+mode: observe
+
+initial_state:
+  time_of_day: "19:30"
+  weather: clear
+  outdoor_temp: 30.0
+  outdoor_humidity: 0.55
+  users:
+    user_01:
+      location: living_room
+      activity: relaxing
+      presence_state: home
+  rooms:
+    living_room:
+      occupancy: true
+      light_level: 210
+      temperature: 29.5
+  devices:
+    # online=false 是这个场景的全部前提：§2.2 的不变式让 CommandExecutor 在校验第 2 级
+    # 就以 device_offline 拒绝任何写命令（backend/execution/validation.py）。
+    ac_living_01:
+      state:
+        power: false
+        extra:
+          online: false
+          target_temp: 24
+          mode: cool
+    ac_living_02:
+      state:
+        power: false
+        extra:
+          online: true
+          target_temp: 25
+          mode: cool
+    fan_living_01:
+      state:
+        power: false
+        extra:
+          speed: low
+
+timeline:
+  - at: 0
+    type: device.offline
+    room_id: living_room
+    device_id: ac_living_01
+    payload:
+      device_type: hvac
+      online: false
+      reason: "网关心跳丢失"
+      significant_change_reasons: ["device_availability"]
+  # 掉线之后才出现真正需要制冷的理由：这一拍决定 agent 是绕开不可用设备，
+  # 还是对着一台掉线空调反复下命令。
+  - at: 60
+    type: environment.temperature_threshold
+    room_id: living_room
+    payload:
+      value: 29.5
+      direction: high
+      comfort_min: 18.0
+      comfort_max: 28.0
+      significant_change_reasons: ["room_temperature_threshold"]
+
+expected_device_effects:
+  - device_id: ac_living_02
+    within_seconds: 20
+    expected:
+      power: true
+  - device_id: fan_living_01
+    within_seconds: 20
+    expected:
+      power: true
+
+involved_agents:
+  - hvac_agent
+
+success_criteria:
+  require_complete_episode: true
+  max_first_action_latency_ms: 6000
+  # 掉线设备上的失败是**预期内**的（见 expected_failures），不计入回归；这里的上限
+  # 约束的是预期之外的失败。
+  max_command_failures: 2
+  allow_fallback: true
+
+# §4.5 stochastic 变体：seed 化的随机掉线/恢复只打在与主线无关的第二台摄像头上，
+# 主空调的掉线始终由 initial_state 确定性给出——否则"掉线在先"这个前提会随 seed 漂移。
+# 这条声明同时是 S2-T9 阴性对照（换 seed 后 stochastic trace 必须不同）的唯一来源。
+failure_injection:
+  device_offline:
+    device_ids: ["camera_living_02"]
+    probability: 0.3
+    recovery_probability: 0.5
+
+# §13 恢复要求：本场景**预期**会出现哪一类失败。S4-T2 的评估器据此把"预期内失败"
+# 与"回归"分开——没有这条声明，一次正确处理掉线的 run 会被记成命令失败率上升。
+expected_failures:
+  - category: device_offline_before_command
+    device_id: ac_living_01
+    error_code: device_offline
+    description: "主空调在任何命令下发之前已离线，针对它的写命令必须以 device_offline 失败"
+    expected_recovery: fallback_to_alternative_device
+
+metrics:
+  - first_action_latency_ms
+  - command_failure_count
+  - fallback_count
+  - device_state_match_rate
+
+ground_truth:
+  user_goal: "主空调不可用时仍把客厅降到舒适温度"
+  primary_room_ids: ["living_room"]
+  relevant_device_ids:
+    - ac_living_02
+    - fan_living_01
+    - curtain_living_01
+  # §6.9 "avoid issuing commands to unavailable devices"：掉线设备是禁区，不是候选。
+  forbidden_device_ids:
+    - ac_living_01
+  required_agent_roles: ["hvac"]
+  acceptable_noop: false
+  expected_intent: "degraded_mode_comfort"
+  safety_constraints:
+    - "do_not_retry_commands_to_a_device_known_offline"

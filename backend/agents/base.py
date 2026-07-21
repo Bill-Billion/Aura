@@ -8,6 +8,10 @@ from typing import Any
 
 from backend.agents.llm import LLMProvider, LLMProviderError
 from backend.agents.memory import AgentMemoryStore
+from backend.agents.relevance import (
+    actionable_device_types,
+    is_device_availability_event,
+)
 from backend.agents.types import (
     AgentCommandProposal,
     AgentDecisionEnvelope,
@@ -16,17 +20,22 @@ from backend.agents.types import (
     PriorityLabel,
 )
 from backend.engine.event_bus import SimEvent
+from backend.engine.event_types import ALL_ROOT_EVENT_TYPES, ENVIRONMENT_ROOT_EVENT_TYPES
 from backend.engine.state import DeviceState, WorldState
 
 
 class BaseAgent(ABC):
     """Abstract base class for all smart home agents."""
 
-    subscribed_event_types = (
-        "user.command",
-        "user.activity_change",
-        "environment.state_refresh",
-    )
+    # §4.1 全部根事件（十四个富事件 + 三个迁移期兼容事件）。
+    # 只订旧三个的年代，场景 timeline 声明的 user.arrives_home 会一路走到 AgentRuntime
+    # 却在 is_relevant 里被判不相关——根事件发出去了，episode 一条也没有。
+    # 排序是为了让订阅注册顺序确定（S2-T9 的确定性门要求没有集合迭代序泄漏）。
+    #
+    # 订阅面宽 ≠ episode 面宽：真正决定"开不开一轮推理"的是 :meth:`is_relevant`，它按
+    # spec §7 的事件→设备相关面（backend/agents/relevance.py）与本 agent 控的设备类型
+    # 求交。两者分开，才能既不丢事件（订阅全收）又不炸 episode（相关性收紧）。
+    subscribed_event_types = tuple(sorted(ALL_ROOT_EVENT_TYPES))
 
     def __init__(self, agent_id: str, name: str) -> None:
         self.agent_id = agent_id
@@ -68,19 +77,50 @@ class BaseAgent(ABC):
         controlled = set(self.get_controlled_device_types())
         return [d for d in world_state.devices.values() if d.type in controlled]
 
+    def _affected_device_type(self, world_state: WorldState, root_event: SimEvent) -> str | None:
+        """事件指向的那台设备是什么类型；说不清就返回 None。
+
+        先查世界（权威），查不到再退回事件自带的 ``device_type``——随机故障注入与场景
+        timeline 都会带这个键，而被注入的设备可能压根不在当前世界里。
+        """
+
+        device_id = str(root_event.data.get("device_id") or "")
+        device = world_state.devices.get(device_id) if device_id else None
+        if device is not None:
+            return device.type
+
+        declared = root_event.data.get("device_type")
+        return str(declared) if declared else None
+
     def is_relevant(self, world_state: WorldState, root_event: SimEvent) -> bool:
         if root_event.event_type not in self.subscribed_event_types:
             return False
 
-        if root_event.event_type == "environment.state_refresh":
-            return bool(root_event.data.get("significant_change_reasons"))
+        # 环境类根事件（含 §4.1 的温度/光照阈值）只有带"显著变化理由"时才值得跑一轮，
+        # 否则每 tick 的例行刷新都会开 episode。
+        if root_event.event_type in ENVIRONMENT_ROOT_EVENT_TYPES:
+            if not root_event.data.get("significant_change_reasons"):
+                return False
+
+        controlled = set(self.get_controlled_device_types())
+
+        # §7「device.offline → affected device | alternatives」：可用性事件是**设备族**
+        # 事件，只有控着这台设备（或它的同类替代品）的 agent 能做出动作。少了这一条，
+        # 照明 agent 会为一台摄像头掉线跑一轮完整推理。
+        if is_device_availability_event(root_event.event_type):
+            affected = self._affected_device_type(world_state, root_event)
+            # 连是哪台设备都说不出 → 没有任何 agent 能定位替代品，开 episode 只是噪声。
+            return affected is not None and affected in controlled
 
         device_id = str(root_event.data.get("device_id") or "")
         if root_event.event_type == "user.command" and device_id:
             device = world_state.devices.get(device_id)
-            return device is None or device.type in self.get_controlled_device_types()
+            return device is None or device.type in controlled
 
-        return True
+        # 兜底不再是 ``return True``：§7 给每个根事件类型声明了默认设备相关面，agent 只在
+        # "自己控的设备类型"与之有交集时才开 episode。判定读的是 §7 那张表（数据），
+        # 因此 S3 新增的 domain agent 只要声明它控什么设备，就自动落到正确的事件面上。
+        return bool(controlled & actionable_device_types(root_event.event_type))
 
     def get_relevant_devices(self, world_state: WorldState, root_event: SimEvent) -> list[DeviceState]:
         return self._get_my_devices(world_state)

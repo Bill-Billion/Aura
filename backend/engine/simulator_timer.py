@@ -5,10 +5,15 @@ import time
 from dataclasses import dataclass
 from collections.abc import Awaitable, Callable
 
+from backend.core.logging import log
 from backend.engine.event_bus import SimEvent
+from backend.engine.event_types import TIMER_TICK_EVENT_TYPE
 
 
 PublishEvent = Callable[[SimEvent], Awaitable[SimEvent]]
+# tick 体抛异常时的上报回调（SimulationEngine 注入）。返回后循环即停止：
+# "循环死了但 is_running 还是 True" 是 S2 之前的假活形态，绝不保留。
+TickErrorHandler = Callable[[BaseException], Awaitable[None]]
 
 
 @dataclass(frozen=True)
@@ -29,8 +34,10 @@ class SimulatorTimer:
         *,
         default_mode: str = "observe",
         mode_specs: dict[str, SimulationModeSpec] | None = None,
+        on_error: TickErrorHandler | None = None,
     ) -> None:
         self._publish_event = publish_event
+        self._on_error = on_error
         self.tick_interval = tick_interval
         self._mode_specs = mode_specs or {
             "observe": SimulationModeSpec(mode="observe", speed=1.0, simulated_dt=simulated_dt),
@@ -50,6 +57,9 @@ class SimulatorTimer:
 
         self.is_running = True
         self._task = asyncio.create_task(self._run_loop())
+        # 主循环非取消式退出必须留痕：不加这条回调，一个逃逸的异常只会变成解释器那句
+        # "Task exception was never retrieved"，而仿真已经停了（critic 修正③）。
+        self._task.add_done_callback(self._log_termination)
 
     async def pause(self) -> None:
         if not self.is_running:
@@ -78,6 +88,64 @@ class SimulatorTimer:
         self.set_mode("demo" if speed >= 2.0 else "observe")
         self.speed = float(speed)
 
+    async def tick_once(self) -> SimEvent:
+        """手动步进一拍（headless 驱动），绕开墙钟 sleep。
+
+        存在的理由：S2-T9 的确定性门要 8 个场景各跑两遍，live 模式下那是 10 分钟的墙钟；
+        S4 的 suite runner 同理。tick 体与 :meth:`_run_loop` **逐字共用** :meth:`_emit_tick`，
+        因此两种驱动方式产出同一条事件序列——否则 headless 跑绿、live 跑挂就没人能发现。
+
+        异常照样经 ``on_error`` 上报（与 live 模式同一条归因路径），随后**原样抛出**：
+        headless 的调用方是 ScenarioRunner，它必须能 fail fast，而不是拿到一份被悄悄
+        截断的 trace。
+        """
+
+        try:
+            return await self._emit_tick()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.is_running = False
+            await self._report_tick_error(exc)
+            raise
+
+    async def _emit_tick(self) -> SimEvent:
+        self.current_tick += 1
+        return await self._publish_event(
+            SimEvent(
+                event_type=TIMER_TICK_EVENT_TYPE,
+                source="simulator_timer",
+                timestamp=float(self.current_tick),
+                priority=1,
+                # timer/reset 这类事件不是"被生成的世界事件"，标 system 以便与
+                # scripted/rule_based/stochastic 三种 §4.5 生成模式区分。
+                event_generation_mode="system",
+                data={
+                    "tick": self.current_tick,
+                    "simulated_dt": self.simulated_dt,
+                    "simulation_speed": self.speed,
+                    "mode": self.mode,
+                    "wall_tick_ms": int(self.tick_interval * 1000),
+                },
+            )
+        )
+
+    async def _report_tick_error(self, error: BaseException) -> None:
+        log.error("simulator_tick_failed", tick=self.current_tick, error=repr(error))
+        if self._on_error is None:
+            return
+        try:
+            await self._on_error(error)
+        except Exception as handler_error:  # noqa: BLE001 - 上报失败也不能再吞
+            log.error("simulator_tick_error_handler_failed", error=repr(handler_error))
+
+    def _log_termination(self, task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            log.error("simulator_loop_terminated", tick=self.current_tick, error=repr(error))
+
     async def _run_loop(self) -> None:
         try:
             while self.is_running:
@@ -86,21 +154,16 @@ class SimulatorTimer:
                 if not self.is_running:
                     break
 
-                self.current_tick += 1
-                await self._publish_event(
-                    SimEvent(
-                        event_type="system.timer_tick",
-                        source="simulator_timer",
-                        timestamp=float(self.current_tick),
-                        priority=1,
-                        data={
-                            "tick": self.current_tick,
-                            "simulated_dt": self.simulated_dt,
-                            "simulation_speed": self.speed,
-                            "mode": self.mode,
-                            "wall_tick_ms": int(self.tick_interval * 1000),
-                        },
-                    )
-                )
+                try:
+                    await self._emit_tick()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    # critic 修正③：旧实现只捕 CancelledError，任何 tick 异常都会静默
+                    # 杀死循环而 is_running 仍是 True——引擎"假活"，start() 还拒绝重启。
+                    # 现在：停机 + 上报 + 退出循环，让调用方看得见故障。
+                    self.is_running = False
+                    await self._report_tick_error(exc)
+                    break
         except asyncio.CancelledError:
             pass

@@ -8,8 +8,10 @@
   3. lifecycle exposes success / failure / cancellation / superseded —— 四种终态各自
      可达且经 SIM_EVENT 事件流可见。
 
-边界声明：ScenarioSpec（S2）尚不存在，第 2 条的 scenario 腿以「脚本式直接 submit
-source='scenario'」代表真实场景来源；S2-T6 落地 YAML 场景后把真场景接进同一条测试。
+【S2-T6 已闭环】第 2 条的 scenario 腿曾以「脚本式直接 submit source='scenario'」代表
+真实场景来源（S1 时 ScenarioSpec 还不存在）。现在它加载**真实的库 YAML**，经
+ScenarioRunner 跑起来，命令由 ScriptedEventSource 从 timeline 构造后交给同一台
+CommandExecutor——§15-2 不再是对着替身验收。
 """
 
 import queue
@@ -18,6 +20,10 @@ import threading
 import anyio
 import pytest
 from fastapi.testclient import TestClient
+
+from backend.scenarios.generator import scenario_timeline_device_entries
+from backend.scenarios.loader import load_library
+from backend.scenarios.runner import ScenarioRunner
 
 from backend.engine.event_bus import SimEvent
 from backend.engine.state import (
@@ -40,7 +46,7 @@ from backend.execution.executor import (
     FEEDBACK_EVENT_TYPE,
     CommandExecutor,
 )
-from backend.main import _init_default_state, app
+from backend.main import app
 
 ALL_SOURCES = (
     CommandSource.UI,
@@ -49,10 +55,8 @@ ALL_SOURCES = (
     CommandSource.RULE_FALLBACK,
 )
 
-# UI 腿与 scenario 腿使用同一控制点，两条链路才可逐字段对照。
-SHARED_DEVICE_ID = "light_living_01"
-SHARED_CAPABILITY = "power"
-SHARED_VALUE = False
+# UI 腿与 scenario 腿打同一个控制点（取自库场景的 timeline 直控项，见
+# _library_scenario_with_device_command），两条链路才可逐字段对照。
 
 
 def _acceptance_world() -> WorldState:
@@ -247,11 +251,30 @@ def _lifecycle_projection(payloads: list[dict]) -> list[dict]:
     ]
 
 
-def test_ui_and_scenario_commands_use_same_executor(monkeypatch):
-    """UI（真实 WS）与 scenario（脚本式 submit）走同一台 executor：逐字段一致的生命周期 + 唯一落点。
+def _library_scenario_with_device_command():
+    """场景库里第一个带 timeline 设备命令的场景（按 id 排序，取值确定）。
 
-    S2 边界：ScenarioSpec 未落地，scenario 腿以直接 submit(source='scenario') 代表；
-    S2-T6 会把真 YAML 场景接进这条测试而不改断言形状。
+    刻意不写死某个文件名：S2-T8 会重排/扩充场景库，只要**至少还有一个**场景保留了脚本
+    直控项，这条 §15-2 验收就仍然是对着真实 YAML 跑的。一个都没有时直接失败并说明原因，
+    绝不静默退回到替身。
+    """
+
+    for scenario_id, spec in load_library().items():
+        entries = scenario_timeline_device_entries(spec)
+        if entries:
+            return spec, entries[0]
+    raise AssertionError(
+        "场景库里没有任何带设备命令的 timeline 项：§15-2「UI 与场景命令同一台 executor」"
+        "将退化为替身验收。请在某个库场景里保留一条 payload.capability/value 的直控项。"
+    )
+
+
+def test_ui_and_scenario_commands_use_same_executor(monkeypatch):
+    """UI（真实 WS）与 scenario（真实库 YAML 经 ScenarioRunner）走同一台 executor。
+
+    两腿产出逐字段一致的生命周期序列，且世界只有 CommandExecutor 一个落点。
+    S2-T6 起 scenario 腿不再是脚本替身：命令由 ScriptedEventSource 从 timeline 构造
+    （source=scenario），随 run 一起跑。
     """
 
     # 唯一落点探针：apply_action 只允许在 CommandExecutor._run 内被调用。
@@ -275,7 +298,12 @@ def test_ui_and_scenario_commands_use_same_executor(monkeypatch):
     monkeypatch.setattr(CommandExecutor, "_run", spy_run)
     monkeypatch.setattr(StateManager, "apply_action", spy_apply)
 
-    # —— UI 腿：真实 WS TestClient ——
+    spec, scripted_entry = _library_scenario_with_device_command()
+
+    # —— UI 腿：真实 WS TestClient。刻意打同一个控制点（场景脚本要写的那个），
+    #    两条链路才能逐字段对照。——
+    ui_capability = str(scripted_entry.payload["capability"])
+    ui_value = scripted_entry.payload["value"]
     with TestClient(app) as client:
         with client.websocket_connect("/ws/simulation") as ws:
             _receive_json(ws)  # initial STATE_FULL
@@ -283,7 +311,11 @@ def test_ui_and_scenario_commands_use_same_executor(monkeypatch):
             ws.send_json(
                 {
                     "type": "CMD_DEVICE_CONTROL",
-                    "payload": {"device_id": SHARED_DEVICE_ID, "action": "turn_off"},
+                    "payload": {
+                        "device_id": scripted_entry.device_id,
+                        "action": "set_state",
+                        "params": {ui_capability: ui_value},
+                    },
                 }
             )
             messages = _receive_until(ws, lambda m: m["type"] == "STATE_DELTA")
@@ -293,27 +325,19 @@ def test_ui_and_scenario_commands_use_same_executor(monkeypatch):
             ]
     ui_applied = list(applied)
 
-    # —— scenario 腿：脚本式直接 submit（S2 ScenarioSpec 的替身）——
+    # —— scenario 腿：真实库 YAML → ScenarioRunner → 同一台 CommandExecutor ——
     applied.clear()
-    events, publish = _collector()
-    sm = _init_default_state()
-    executor = CommandExecutor(sm, publish)
-    record = anyio.run(
-        lambda: executor.submit(
-            DeviceCommand(
-                source=CommandSource.SCENARIO,
-                device_id=SHARED_DEVICE_ID,
-                capability=SHARED_CAPABILITY,
-                value=SHARED_VALUE,
-                reason="scenario script step",
-            )
-        )
-    )
-    scenario_applied = list(applied)
-    scenario_lifecycle = [e.data for e in _lifecycle_events(events)]
+    result = anyio.run(lambda: ScenarioRunner(spec).run())
+    scenario_lifecycle = [
+        event.data
+        for event in result.events
+        if event.event_type == LIFECYCLE_EVENT_TYPE and event.data["source"] == "scenario"
+    ]
+    scenario_applied = [
+        device_id for device_id in applied if device_id == scripted_entry.device_id
+    ]
 
     # 生命周期序列逐字段一致（仅 command_id / source 天然不同）
-    assert record.status == CommandStatus.SUCCEEDED
     assert _lifecycle_projection(ui_lifecycle) == _lifecycle_projection(scenario_lifecycle)
     assert [p["to_status"] for p in ui_lifecycle] == [
         "proposed",
@@ -326,11 +350,27 @@ def test_ui_and_scenario_commands_use_same_executor(monkeypatch):
     assert {p["source"] for p in ui_lifecycle} == {"ui"}
     assert {p["source"] for p in scenario_lifecycle} == {"scenario"}
     # 唯一落点：两腿都恰好经 executor 触达 apply_action 一次，同一设备
-    assert ui_applied == [SHARED_DEVICE_ID]
-    assert scenario_applied == [SHARED_DEVICE_ID]
-    # 校验结果一致：两腿都通过六级校验、都无失败事件
-    assert not any(e.event_type == COMMAND_FAILED_EVENT_TYPE for e in events)
-    assert record.failure_code is None
+    assert ui_applied == [scripted_entry.device_id]
+    assert scenario_applied == [scripted_entry.device_id]
+    # 场景来源的命令没有失败事件，且动作/反馈事件同样带 source=scenario
+    scenario_failures = [
+        event
+        for event in result.events
+        if event.event_type == COMMAND_FAILED_EVENT_TYPE
+        and event.data["source"] == "scenario"
+    ]
+    assert scenario_failures == []
+    scenario_actions = [
+        event
+        for event in result.events
+        if event.event_type == ACTION_EVENT_TYPE and event.data["source"] == "scenario"
+    ]
+    assert len(scenario_actions) == 1
+    assert any(
+        event.event_type == FEEDBACK_EVENT_TYPE
+        and event.causal_parent == scenario_actions[0].event_id
+        for event in result.events
+    )
 
 
 # ---------------------------------------------------------------------------

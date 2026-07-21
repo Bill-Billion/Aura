@@ -2,7 +2,7 @@
 
 Author: Bill Billion  
 Date: 2026-04-22  
-Updated: 2026-07-21（S1：命令生命周期事件、§10.2 失败语义、事件顺序承诺）
+Updated: 2026-07-21（S2：`CMD_RUN_SCENARIO` 场景启动、场景启动失败码、`SIMULATION_STATUS` 带 run 归属）
 
 这份文档定义 SmartHomeSim 当前对外开放的 WebSocket 命令、服务端消息、结构化事件类型和错误格式。当前阶段已经进入 Phase 2，所以除了 Phase 1 的世界状态同步消息，还会通过 `SIM_EVENT` 实时外发 `reasoning.*` 事件。S1 之后，所有设备变更（UI / Agent / 场景脚本 / 规则降级四来源）都走同一台 `CommandExecutor`，因此 `SIM_EVENT` 里还会看到 `command.lifecycle`、`device.command_failed`、`system.invariant_violation` 三类新事件。
 
@@ -14,7 +14,7 @@ WebSocket 入口固定为 `/ws/simulation`。
 
 ## 客户端命令
 
-当前开放的命令有六类：
+当前开放的命令有七类：
 
 - `CMD_SIM_START`
 - `CMD_SIM_PAUSE`
@@ -22,6 +22,7 @@ WebSocket 入口固定为 `/ws/simulation`。
 - `CMD_SIM_MODE`
 - `CMD_SIM_SPEED`
 - `CMD_DEVICE_CONTROL`
+- `CMD_RUN_SCENARIO`
 
 命令信封格式统一如下：
 
@@ -40,6 +41,35 @@ WebSocket 入口固定为 `/ws/simulation`。
 
 - 新格式：`device_id + action + params`
 - 兼容格式：`device_id + property + value`
+
+### `CMD_RUN_SCENARIO`（S2）
+
+按场景库里的场景在当前服务端开一个新 run（§11）：新 `run_id`、记录 `seed`、应用场景
+`initial_state`、装上 §4.5 三条事件生成产线（`scripted` / `rule_based` / `stochastic`），
+随后仿真自动开始跑，事件照常从 `SIM_EVENT` 出来。
+
+```json
+{
+  "type": "CMD_RUN_SCENARIO",
+  "payload": {
+    "scenario_id": "user_arrives_home_evening",
+    "seed": 1001
+  }
+}
+```
+
+- `scenario_id` 必填，取值来自 `GET /api/scenarios`；库里查不到即失败，不会开出一个 run
+- `seed` 可选，不传取场景自己声明的 `seed`（§11 要求每个 run 都有 seed）
+- 成功后服务端依次广播 `STATE_FULL`（场景起始世界）与 `SIMULATION_STATUS`（含 `run_id` /
+  `scenario_id`）；**不为场景启动新增消息类型**
+- 失败回一条 `ERROR`，`code` 取下面的"场景启动失败码"
+
+REST 等价入口是 `POST /api/runs`（载荷同形，成功返回 `201` + `{"run": {...§11 元数据...}}`），
+两者是同一条实现。
+
+停止与重置**不另设入口**：`CMD_SIM_PAUSE` 暂停，`CMD_SIM_RESET` 取消在飞 episode 与命令、
+换回默认世界并开一个匿名 run。重置后场景产线随之摘掉——新 run 不是那个场景的 run，
+继续按它的 timeline 发事件只会让工件与事件流互相矛盾。
 
 ## 服务端消息
 
@@ -142,9 +172,23 @@ WebSocket 入口固定为 `/ws/simulation`。
 - `device.command_failed`
 - `system.invariant_violation`
 
+场景 run（`CMD_RUN_SCENARIO` / `POST /api/runs`）期间还会看到 §4.1 的富根事件——它们由
+三条生成产线发出，因此**带 §4.5 生成元数据**（`event_generation_mode` 取
+`scripted` / `rule_based` / `stochastic`，另有 `generation_rule_id` / `rng_stream`）：
+
+- `user.arrives_home`、`user.leaves_home`、`user.enters_room`、`user.exits_room`、`user.starts_activity`、`user.ends_activity`
+- `environment.weather_change`、`environment.temperature_threshold`、`environment.light_level_threshold`
+- `security.presence_detected`、`security.door_opened`、`safety.smoke_detected`
+- `device.offline`、`device.recovered`
+
+字段语义以 `docs/architecture/sim-event-schema.md` 为准。
+
 说明：
 
 - `system.timer_tick` 和 `environment.state_refresh` 继续实时外发
+- 每条 `SimEvent` 都带 `run_id` / `scenario_id`：一条事件属于哪次实验，从事件本身就能读出来（§18 Q1）。匿名 run 的 `scenario_id` 为 `null`
+- 每条外发的 `SimEvent` 都带 `seq`（run 内单调发布序号），**包括 `CMD_DEVICE_CONTROL` 的根 `user.command`**：它在广播前先经 `EventBus.stamp()` 盖章，因此 WS 副本与 `events.jsonl` 副本同号，前端可以直接按 `seq` 排因果树
+- `event_generation_mode` 只出现在根事件上（三条生成产线 + 引擎的 `system.*`）。`user.command` 和所有派生事件（`reasoning.*` / `command.lifecycle` / `action.device_control` / `feedback.state_delta`）该字段为 `null`——要问派生事件的来源，顺 `causal_parent` 找它的根事件
 - `reasoning.*` 不新增新的 envelope，全部通过 `SIM_EVENT` 输出
 - S1 起 `CMD_DEVICE_CONTROL` 也走 `CommandExecutor`：与 Agent 路径同一条六级校验、同一套十态生命周期、同一份失败词表，不再有"UI 直控专用链路"
 
@@ -152,6 +196,8 @@ WebSocket 入口固定为 `/ws/simulation`。
 
 当前会下发这些字段：
 
+- `run_id`：当前 run 的 id（§11），匿名 run 也有
+- `scenario_id`：当前 run 跑的场景；`null` 表示这是一个不属于任何场景的匿名 run
 - `is_running`
 - `speed`
 - `mode`
@@ -208,6 +254,18 @@ WebSocket 入口固定为 `/ws/simulation`。
 | `superseded_by_newer_command` | 同一控制点被更新的命令取代，本命令不执行 |
 
 > `state_feedback_missing` 目前**没有产出方**：同步 StateManager 下 `apply_action` 立即返回，唯一的反馈类失败路径（超出预算窗口）报 `execution_timeout`。该码列在这里只为保持 §10.2 十类词表完整——客户端应认得它，但不要等它出现。引入异步 episode（S2/S3）后才会有真实产出方。
+
+**场景启动失败码**（`CMD_RUN_SCENARIO` / `POST /api/runs`，与上面两套正交——它们描述"这个 run 为什么没开起来"）：
+
+| code | 语义 | REST 状态码 |
+| --- | --- | --- |
+| `scenario_not_found` | `scenario_id` 不在已加载的场景库里（`details.known_ids` 列出可选项） | 404 |
+| `scenario_library_invalid` | 场景库本身加载失败（YAML/校验错，`details` 带文件路径） | 500 |
+| `initial_state_invalid` | 场景 `initial_state` 无法一致地应用到世界上 | 400 |
+| `invalid_seed` | seed 不是合法整数或越界 | 400 |
+| `engine_unavailable` | 仿真引擎尚未启动 | 503 |
+
+启动失败不留副作用：当前 run 不换、世界不动、仿真不会被拆掉。
 
 此外 `system.invariant_violation` 使用独立错误码 `invariant_violation`：它描述"世界差点被改坏"（系统级故障），不属于上面十类"命令为什么没被执行"。
 
