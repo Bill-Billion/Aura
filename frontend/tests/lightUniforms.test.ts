@@ -1,5 +1,3 @@
-import test from 'node:test'
-import assert from 'node:assert/strict'
 import * as THREE from 'three'
 
 import { useLightUniforms } from '../src/composables/useLightUniforms.ts'

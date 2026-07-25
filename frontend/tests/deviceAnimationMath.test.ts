@@ -1,5 +1,3 @@
-import test from 'node:test'
-import assert from 'node:assert/strict'
 
 import {
   computeCameraConeOpacity,
@@ -36,10 +34,10 @@ test('computeCurtainPanelPose 在关闭状态保持 authored bounds 不变', () 
   })
   const projected = projectBoundsFromPose(authoredBounds, 1.261, 1, pose)
 
-  assert.ok(Math.abs(pose.position - 1.261) < 1e-9)
-  assert.ok(Math.abs(pose.scale - 1) < 1e-9)
-  assert.ok(Math.abs(projected.min - authoredBounds.min) < 1e-9)
-  assert.ok(Math.abs(projected.max - authoredBounds.max) < 1e-9)
+  expect(Math.abs(pose.position - 1.261)).toBeLessThan(1e-9)
+  expect(Math.abs(pose.scale - 1)).toBeLessThan(1e-9)
+  expect(Math.abs(projected.min - authoredBounds.min)).toBeLessThan(1e-9)
+  expect(Math.abs(projected.max - authoredBounds.max)).toBeLessThan(1e-9)
 })
 
 test('computeCurtainPanelPose 在打开状态固定左帘外侧边缘，只让内侧边缘向外滑动', () => {
@@ -55,8 +53,8 @@ test('computeCurtainPanelPose 在打开状态固定左帘外侧边缘，只让�
   })
   const projected = projectBoundsFromPose(authoredBounds, 1.261, 1, pose)
 
-  assert.ok(Math.abs(pose.scale - 0.18) < 1e-9)
-  assert.ok(Math.abs(projected.max - authoredBounds.max) < 1e-9)
+  expect(Math.abs(pose.scale - 0.18)).toBeLessThan(1e-9)
+  expect(Math.abs(projected.max - authoredBounds.max)).toBeLessThan(1e-9)
   assert.ok(projected.min > authoredBounds.min)
 })
 
@@ -73,8 +71,8 @@ test('computeCurtainPanelPose 在中间态保持左右对称，右帘外侧边�
   })
   const projected = projectBoundsFromPose(authoredBounds, -1.231, 1, pose)
 
-  assert.ok(Math.abs(pose.scale - 0.59) < 1e-9)
-  assert.ok(Math.abs(projected.min - authoredBounds.min) < 1e-9)
+  expect(Math.abs(pose.scale - 0.59)).toBeLessThan(1e-9)
+  expect(Math.abs(projected.min - authoredBounds.min)).toBeLessThan(1e-9)
   assert.ok(projected.max < authoredBounds.max)
 })
 

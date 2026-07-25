@@ -1,5 +1,3 @@
-import test from 'node:test'
-import assert from 'node:assert/strict'
 
 import type { DeviceCapability, DeviceState, DeviceType } from '../src/types/world-state.ts'
 import { hasDeviceCapability, isDeviceWritable } from '../src/utils/deviceFloorMap.ts'
