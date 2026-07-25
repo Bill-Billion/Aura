@@ -1,0 +1,160 @@
+# 场景定义（S3-T4）—— 场景是**数据**，不是散在前端 switch 里的分支。
+#
+# 被推翻的现状：frontend/src/components/dashboard/SceneSelector.vue 在浏览器里循环发
+# 2×N 条 CMD_DEVICE_CONTROL。后果有三：
+#   1. 后端看不见"这是一次场景切换"，可观测性面板拼不出因果链；
+#   2. 场景语义只存在于 .vue 里，headless 场景脚本 / 评估器无从复用；
+#   3. 每台设备一条命令直接进执行层，绕过编排与仲裁（§9 对场景不生效）。
+#
+# 本表的四个预设（reading / entertainment / away / sleep）**逐值抄自当时的 .vue**，
+# 保证下推后演示行为一字不差；spec §6 用到的 home / wake / cooking 三个另起，source 标注区分。
+#
+# 加载期硬校验（backend/agents/scene.py::load_scene_definitions，改表前先读）：
+#   1. selector.device_type 必须存在于 §3.2 能力矩阵；
+#   2. property 去掉 "extra." 前缀后必须是该类型的**可写**能力
+#      —— camera.online/view、sensor.value 是只读的，写进场景只会得到一串失败命令；
+#   3. selector.room_ids 必须是 device_registry.build_default_rooms 里的房间。
+#
+# 步骤顺序 = 命令展开顺序（同一步内按 device_id 升序），确定性门要求它稳定。
+
+schema_version: 1
+
+scenes:
+  reading:
+    label: 阅读模式
+    description: 局部暖光和半开窗帘
+    source: "frontend SceneSelector.vue (S3-T4 下推)"
+    steps:
+      - selector: {device_type: light}
+        property: power
+        value: true
+      - selector: {device_type: light}
+        property: extra.brightness
+        value: 68
+      - selector: {device_type: light}
+        property: extra.color_temp
+        value: 3400
+      - selector: {device_type: curtain}
+        property: extra.open_percent
+        value: 52
+
+  entertainment:
+    label: 娱乐模式
+    description: 保持低亮度，强化客厅氛围
+    source: "frontend SceneSelector.vue (S3-T4 下推)"
+    steps:
+      - selector: {device_type: light}
+        property: power
+        value: true
+      - selector: {device_type: light}
+        property: extra.brightness
+        value: 42
+      - selector: {device_type: light}
+        property: extra.color_temp
+        value: 2850
+      - selector: {device_type: curtain}
+        property: extra.open_percent
+        value: 28
+      - selector: {device_type: hvac}
+        property: power
+        value: true
+      - selector: {device_type: hvac}
+        property: extra.target_temp
+        value: 24
+      - selector: {device_type: hvac}
+        property: extra.mode
+        value: cool
+
+  away:
+    label: 离家模式
+    description: 收束灯光和窗帘，压低存在感
+    source: "frontend SceneSelector.vue (S3-T4 下推)"
+    steps:
+      - selector: {device_type: light}
+        property: power
+        value: false
+      - selector: {device_type: hvac}
+        property: power
+        value: false
+      - selector: {device_type: curtain}
+        property: extra.open_percent
+        value: 0
+
+  sleep:
+    label: 睡眠模式
+    description: 关闭主要灯光，空调归夜间值
+    source: "frontend SceneSelector.vue (S3-T4 下推)"
+    steps:
+      - selector: {device_type: light}
+        property: power
+        value: false
+      - selector: {device_type: curtain}
+        property: extra.open_percent
+        value: 0
+      - selector: {device_type: hvac}
+        property: power
+        value: true
+      - selector: {device_type: hvac}
+        property: extra.target_temp
+        value: 22
+      - selector: {device_type: hvac}
+        property: extra.mode
+        value: cool
+
+  # —— spec §6 场景用到的命名场景（.vue 里没有对应按钮，故 source 标 spec）——
+  home:
+    label: 居家模式
+    description: 到家后恢复日常照明与空调（§6.1 arrives_home）
+    source: "spec §6.1"
+    steps:
+      - selector: {device_type: light}
+        property: power
+        value: true
+      - selector: {device_type: light}
+        property: extra.brightness
+        value: 60
+      - selector: {device_type: hvac}
+        property: power
+        value: true
+      - selector: {device_type: hvac}
+        property: extra.target_temp
+        value: 24
+
+  wake:
+    label: 起床模式
+    description: 卧室渐亮 + 拉开窗帘（§6.3 morning routine）
+    source: "spec §6.3"
+    steps:
+      - selector: {device_type: light, room_ids: [bedroom]}
+        property: power
+        value: true
+      - selector: {device_type: light, room_ids: [bedroom]}
+        property: extra.brightness
+        value: 90
+      - selector: {device_type: light, room_ids: [bedroom]}
+        property: extra.color_temp
+        value: 5000
+      - selector: {device_type: curtain, room_ids: [bedroom]}
+        property: extra.open_percent
+        value: 100
+
+  cooking:
+    label: 烹饪模式
+    description: 任务照明 + 送风（§7 user.starts_activity:cooking 行）
+    source: "spec §7"
+    steps:
+      - selector: {device_type: light}
+        property: power
+        value: true
+      - selector: {device_type: light}
+        property: extra.brightness
+        value: 85
+      - selector: {device_type: light}
+        property: extra.color_temp
+        value: 4500
+      - selector: {device_type: fan}
+        property: power
+        value: true
+      - selector: {device_type: fan}
+        property: extra.speed
+        value: medium

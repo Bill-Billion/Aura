@@ -147,11 +147,31 @@ def resolve_run_scenario(
 
 
 class LLMMode(str, Enum):
-    """§11.1 三种 LLM 决定性模式；每份 run 工件都必须标注用的是哪种。"""
+    """§11.1 三种 LLM 决定性模式 + 一档"根本没有 LLM"；每份 run 工件都必须标注用的是哪种。
+
+    ``RULE_BASED`` 不在 §11.1 的三种之列，它记的是第四种实验条件：**这一份 run 从头到尾
+    没有任何 LLM 参与**（没配 key / provider 被禁用 → 全程规则回退）。它必须与 ``MOCKED``
+    分开，因为两者是**不同的实验条件**：mocked 跑的是确定性罐头决策（有决策载荷、有 LLM
+    契约的形状），rule_based 连罐头都没有。S3 review 之前两者共用 ``mocked`` 标签，于是
+    一份全程规则跑出来的 run 会被 S4 评估、S5 对比视图读成"用了固定 fixture 的 LLM 跑"，
+    而这正是 §11.1"每份 run 工件必须记下模式"要防的那种误读。
+    """
 
     MOCKED = "mocked"
     RECORDED = "recorded"
     LIVE = "live"
+    RULE_BASED = "rule_based"
+
+    @property
+    def calls_provider(self) -> bool:
+        """本模式下是否真的会向 provider 要一份决策。
+
+        ``mocked``（罐头）与 ``rule_based``（无 LLM）都不会——判"要不要打 provider"
+        的地方必须问这个属性，而不是拿 ``is not MOCKED`` 当近似，否则新加的
+        ``rule_based`` 会被当成"可以打"。
+        """
+
+        return self in {LLMMode.RECORDED, LLMMode.LIVE}
 
 
 @lru_cache(maxsize=1)
@@ -183,19 +203,25 @@ def compute_initial_state_hash(world: WorldState) -> str:
 
 
 def resolve_llm_mode(provider: Any) -> LLMMode:
-    """由 provider 推断 §11.1 模式（S3-T7 接入录制回放后会显式传 RECORDED）。
+    """由**裸** provider 推断 §11.1 模式（录制/罐头包装自己声明模式，见
+    :func:`backend.agents.llm_modes.resolve_mode_for_provider`）。
 
     鸭子类型而非 isinstance：本模块在 engine 层，不能反向依赖 backend.agents。
+
+    这里只认得出两档：**有 key 的真 provider = live**，其余一律是"这份 run 里没有
+    LLM"= :attr:`LLMMode.RULE_BASED`。刻意**不**再把它们折进 ``mocked``——
+    "没有 LLM"和"确定性罐头 LLM"是两种实验条件，run.json 是研究溯源工件，
+    读者拿 llm_mode 做分组时必须能把这两批分开（S3 review minor-3）。
     """
 
     if provider is None:
-        return LLMMode.MOCKED
+        return LLMMode.RULE_BASED
     provider_name = str(getattr(provider, "provider_name", "") or "")
     if provider_name in {"", "unknown", "disabled"}:
-        return LLMMode.MOCKED
+        return LLMMode.RULE_BASED
     if not getattr(provider, "api_key", None):
-        # 配了 provider 名但没有 key：实际走的是规则回退，不是 live 调用。
-        return LLMMode.MOCKED
+        # 配了 provider 名但没有 key：实际走的是规则回退，一次 LLM 调用都不会发生。
+        return LLMMode.RULE_BASED
     return LLMMode.LIVE
 
 

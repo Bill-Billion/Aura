@@ -14,12 +14,14 @@ S4 之后会在同一前缀下加 GET /api/runs/{run_id}/report；本文件锁�
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 from fastapi.testclient import TestClient
 
 from backend.api.ws import ConnectionManager
 from backend.engine.event_bus import EventBus
+from backend.engine.event_log import run_dir
 from backend.engine.event_types import TIMER_TICK_EVENT_TYPE
 from backend.engine.run_manager import SPEC11_REQUIRED_FIELDS
 from backend.engine.simulation import SimulationEngine
@@ -37,6 +39,19 @@ from backend.main import _init_default_state, app
 @pytest.fixture
 def client():
     return TestClient(app)
+
+
+# 会让 AgentRuntime._build_default_provider 挑到真 provider 的环境变量
+# （开发机的 backend/.env.local 里就有它们）。"这个 run 里没有 LLM"必须显式做到，
+# 否则这条断言在开发机上测的是"key 还在"的那种 run。
+_PROVIDER_ENV_VARS = (
+    "LLM_MODE",
+    "LLM_PROVIDER",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_COMPAT_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+)
 
 
 def _make_world() -> WorldState:
@@ -113,12 +128,36 @@ def test_run_metadata_answers_spec18_q1_scenario_and_seed(client):
     assert run["scenario_id"] == "user_arrives_home_evening"
     assert run["seed"] == 4242
     assert run["sim_version"]
-    assert run["llm_mode"] in {"mocked", "recorded", "live"}
+    assert run["llm_mode"] in {"mocked", "recorded", "live", "rule_based"}
     assert len(run["initial_state_hash"]) == 64
     assert payload["event_count"] > 0
     # S3 会把 llm_recordings.jsonl 放进同一个目录，S4 两份一起读——清单必须自描述。
     assert "events.jsonl" in payload["artifacts"]
     assert "run.json" in payload["artifacts"]
+
+
+def test_keyless_run_artifact_is_labelled_rule_based_not_mocked(client, monkeypatch):
+    """§11.1 溯源诚实：全程没有 LLM 的 run，工件里必须写 ``rule_based``。
+
+    审计口径：``mocked``（确定性罐头决策）与"根本没有 LLM"是**两种实验条件**。
+    两者共用一个标签时，一份全程规则跑出来的 run 会被 S4 评估与 S5 对比视图
+    读成"用了固定 fixture 的 LLM 跑"，而 run.json 是研究溯源工件——它必须能被
+    第三方拿去分组，而不是需要口头解释。
+    """
+
+    for name in _PROVIDER_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+    run_id = _produce_run(seed=77)
+
+    run = client.get(f"/api/runs/{run_id}").json()["run"]
+    assert run["llm_provider"] == "disabled"
+    assert run["llm_model"] == "rule_based"
+    assert run["llm_mode"] == "rule_based"
+
+    # 端点只是读侧投影；真正被第三方拿走的是磁盘上那份 run.json。
+    artifact = json.loads((run_dir(run_id) / "run.json").read_text(encoding="utf-8"))
+    assert artifact["llm_mode"] == "rule_based"
 
 
 def test_unknown_run_returns_404_with_known_ids(client):

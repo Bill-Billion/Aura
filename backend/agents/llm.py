@@ -82,6 +82,11 @@ class LLMProviderError(RuntimeError):
 class LLMProvider(ABC):
     provider_name = "unknown"
     model = ""
+    # §11.1 三模式里的哪一种。裸 provider 一律 "live"（它真的会打网）；
+    # backend/agents/llm_modes.py 的三层包装会覆盖成 mocked / recorded。
+    # 声明在基类而不是在包装层单独判 isinstance：run 元数据与 /api/health 只需问
+    # 一个属性，就不会出现"接了新 provider 忘了登记模式"这种静默错标。
+    llm_mode = "live"
 
     @abstractmethod
     async def generate_decision(self, request: LLMDecisionRequest) -> AgentLLMDecision:

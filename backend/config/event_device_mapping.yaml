@@ -1,0 +1,185 @@
+# §7 Event-To-Device Mapping —— 根事件 → 默认设备搜索空间（数据，不是 agent 里的分支）。
+#
+# spec §7 两句话定了这份文件的存在方式：
+#   "Every root event type must declare its default device relevance. This mapping is
+#    not the same as mandatory execution. It defines the search space for agents."
+#   "The implementation should expose this mapping as data, not hard-coded branching
+#    inside individual agents."
+#
+# 怎么读这张表：
+#   - primary_device_types / secondary_device_types：搜索空间 = 两者并集。
+#     primary 是"这类事件首先该看的设备"，secondary 是"可选补位"。区分只影响 agent 的
+#     排序与解释，不影响相关性判定。
+#   - default_policy：§7 第四列原文，做为编排/仲裁的解释文案与研究者可读的意图标注。
+#   - room_scope：§7 里 "bedroom lights" / "kitchen lights" 那种房间限定（可选，空 = 全屋）。
+#   - capabilities：该事件面下值得关注的能力位（可选，空 = 不额外收口）。加载期会校验
+#     每个能力至少属于本行声明的某个设备类型（backend/execution/capability_matrix.py）。
+#   - source："spec §7" 表示这一行是 §7 表里的原文行；"derived" 是 §4.1 里 §7 没列出的
+#     根事件按同族补齐（补齐依据写在各行注释里）；"compat" 是 §4.1 迁移期兼容命名空间。
+#   - dynamic: affected_device —— §7「device.offline → affected device | alternatives」那行：
+#     搜索面由事件里那台设备的类型现场决定，因此不写死 primary/secondary，改用 alternatives
+#     声明"哪种设备掉线时能由哪些设备补位"。
+#
+# 键可以带活动限定："user.starts_activity:sleeping" 优先于基础行 "user.starts_activity"；
+# 未知活动回落基础行。
+#
+# 三条加载期硬校验（改这张表前先读）：
+#   1. 事件键必须是 backend/engine/event_types.py 里的根事件类型，且十七个类型一个都不能缺
+#      —— 漏一行 = 那类事件对所有 agent 静默失明，比多响应一次难查得多；
+#   2. 设备类型 / 能力必须在设备注册表的能力矩阵里存在（未知即加载失败，不是运行期静默漏配）；
+#   3. room_scope 必须是 backend/config/device_registry.py::build_default_rooms 里的房间。
+
+schema_version: 1
+
+events:
+  # —— §7 原文八行 ————————————————————————————————————————————————
+  # | user.arrives_home | lights, HVAC | curtains, cameras | comfort and presence transition |
+  user.arrives_home:
+    source: "spec §7"
+    primary_device_types: [light, hvac]
+    secondary_device_types: [curtain, camera]
+    default_policy: comfort and presence transition
+
+  # | user.leaves_home | lights, HVAC, fans, cameras | curtains | energy saving and security |
+  user.leaves_home:
+    source: "spec §7"
+    primary_device_types: [light, hvac, fan, camera]
+    secondary_device_types: [curtain]
+    default_policy: energy saving and security
+
+  # | user.starts_activity:sleeping | bedroom lights, HVAC, curtains | cameras | sleep comfort and quiet security |
+  "user.starts_activity:sleeping":
+    source: "spec §7"
+    primary_device_types: [light, hvac, curtain]
+    secondary_device_types: [camera]
+    room_scope: [bedroom]
+    default_policy: sleep comfort and quiet security
+
+  # | user.starts_activity:cooking | kitchen lights, sensors | fan | task lighting and air monitoring |
+  "user.starts_activity:cooking":
+    source: "spec §7"
+    primary_device_types: [light, sensor]
+    secondary_device_types: [fan]
+    room_scope: [kitchen]
+    default_policy: task lighting and air monitoring
+
+  # | environment.temperature_threshold | HVAC, fans | curtains, sensors | comfort if occupied, energy if empty |
+  environment.temperature_threshold:
+    source: "spec §7"
+    primary_device_types: [hvac, fan]
+    secondary_device_types: [curtain, sensor]
+    capabilities: [target_temp, mode, speed, open_percent, value]
+    default_policy: comfort if occupied, energy if empty
+
+  # | environment.light_level_threshold | lights, curtains | sensors | preserve target light level |
+  environment.light_level_threshold:
+    source: "spec §7"
+    primary_device_types: [light, curtain]
+    secondary_device_types: [sensor]
+    capabilities: [brightness, color_temp, open_percent, value]
+    default_policy: preserve target light level
+
+  # | security.presence_detected | cameras, entry lights | sensors | security first |
+  # "entry lights" 在当前设备注册表里没有单独的类型位，故按 light 登记；真正的"门口灯"
+  # 收口留给 agent 的 allowed_command_specs（表定搜索面，不定该发什么命令）。
+  security.presence_detected:
+    source: "spec §7"
+    primary_device_types: [camera, light]
+    secondary_device_types: [sensor]
+    default_policy: security first
+
+  # | device.offline | affected device | alternatives | fail closed and explain |
+  device.offline:
+    source: "spec §7"
+    dynamic: affected_device
+    default_policy: fail closed and explain
+    alternatives:
+      light: [light, curtain]   # 灯掉线 → 另一盏灯；再不行拉开窗帘补自然光
+      hvac: [hvac, fan]         # 空调掉线 → 风扇顶一段
+      fan: [fan, hvac]
+      curtain: [curtain, light] # 窗帘掉线 → 用灯补到目标照度
+      camera: [camera, sensor]  # 摄像头掉线 → 靠别的摄像头 / 传感器维持覆盖
+      sensor: [sensor, camera]
+
+  # —— §4.1 里 §7 没有列出的根事件（按同族补齐）——————————————————————
+  # 房间级进出与到家/离家同属"人在哪"的舒适面；去掉安防——进出房间本身不是安防信号
+  # （§6.8 的安防信号是 security.*）。
+  user.enters_room:
+    source: derived
+    primary_device_types: [light, hvac]
+    secondary_device_types: [curtain, fan]
+    default_policy: comfort follows occupancy
+
+  user.exits_room:
+    source: derived
+    primary_device_types: [light, hvac]
+    secondary_device_types: [curtain, fan]
+    default_policy: release comfort resources in empty rooms
+
+  # 活动开始的基础行：事件没带活动名（或活动名不在上面两行里）时的兜底 = 两行的并集，
+  # 真正的取舍留给 agent 的 allowed_command_specs。
+  user.starts_activity:
+    source: derived
+    primary_device_types: [light, hvac, curtain, sensor]
+    secondary_device_types: [camera, fan]
+    default_policy: activity comfort baseline
+
+  user.ends_activity:
+    source: derived
+    primary_device_types: [light, hvac, curtain, sensor]
+    secondary_device_types: [camera, fan]
+    default_policy: restore baseline after activity
+
+  # 天气变化同时改室内热负荷与自然光，故覆盖冷热 + 采光两条链。
+  environment.weather_change:
+    source: derived
+    primary_device_types: [hvac, curtain]
+    secondary_device_types: [light, fan, sensor]
+    default_policy: adapt comfort to outdoor conditions
+
+  # 开门与 presence_detected 同族（§6.8 同一条场景里并列出现）。
+  security.door_opened:
+    source: derived
+    primary_device_types: [camera, light]
+    secondary_device_types: [sensor]
+    default_policy: security first
+
+  # §19「prefer fail-closed behavior for safety and security events」：烟雾是唯一一类
+  # "宁可多开一轮推理"的事件——空调要停止循环、灯要亮、摄像头要留存，一个都不能漏。
+  safety.smoke_detected:
+    source: derived
+    primary_device_types: [hvac, fan, light, camera]
+    secondary_device_types: [curtain, sensor]
+    default_policy: life safety first, fail closed
+
+  # 恢复事件与掉线同为设备族事件，同样按事件里那台设备现场解析。
+  device.recovered:
+    source: derived
+    dynamic: affected_device
+    default_policy: restore normal operation and explain
+    alternatives:
+      light: [light, curtain]
+      hvac: [hvac, fan]
+      fan: [fan, hvac]
+      curtain: [curtain, light]
+      camera: [camera, sensor]
+      sensor: [sensor, camera]
+
+  # —— §4.1 迁移期兼容命名空间（语义故意保持宽，旧前端 / 旧场景行为一字不改）————
+  user.activity_change:
+    source: compat
+    primary_device_types: [light, hvac, curtain, fan, camera, sensor]
+    secondary_device_types: []
+    default_policy: legacy broad relevance
+
+  user.command:
+    source: compat
+    primary_device_types: [light, hvac, curtain, fan, camera, sensor]
+    secondary_device_types: []
+    default_policy: explicit user command
+
+  environment.state_refresh:
+    source: compat
+    primary_device_types: [light, hvac, curtain, fan, camera, sensor]
+    secondary_device_types: []
+    default_policy: legacy broad relevance

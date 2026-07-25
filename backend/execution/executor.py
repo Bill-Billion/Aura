@@ -409,6 +409,99 @@ class CommandExecutor:
                 )
         return records
 
+    async def propose(
+        self,
+        command: DeviceCommand,
+        *,
+        tick: int | None = None,
+        publish: PublishEvent | None = None,
+    ) -> CommandRecord:
+        """S3-T5 仲裁门入口：只让命令**出生**（``proposed``）并登记在飞，不跑流水线。
+
+        S1 的 ``submit()`` 把 propose 与执行焊在一起，因为那时 ``proposed → approved``
+        是自动放行的。S3 把仲裁装进这条岔口之后，"已提出、尚未批准"成了一个**真实存在
+        且可被观测的窗口**：仲裁门在这里开窗，:meth:`execute_approved` 关窗。
+
+        开窗的副作用正是它存在的理由——记录进了 ``_pending``，于是一条用户命令能在
+        agent 命令还在等仲裁时把它取代掉（S1 文档把取代范围写成"同批/待发队列内"，
+        这里把它扩宽到仲裁窗口）。
+        """
+
+        return await self._propose(command, tick, publish=self._resolve_publish(publish))
+
+    async def execute_approved(
+        self,
+        record: CommandRecord,
+        *,
+        pre_submit: PreSubmitHook | None = None,
+        tick: int | None = None,
+        publish: PublishEvent | None = None,
+    ) -> CommandRecord:
+        """S3-T5 仲裁门入口：接手一条**已由仲裁批准**的 ``proposed`` 记录跑完流水线。
+
+        与 :meth:`submit` 的唯一差别是不再自己 propose——否则同一条命令会发出两条
+        ``None → proposed`` 生命周期事件，因果树上凭空多一个节点。
+
+        终态早退是必须的：开窗期间它可能已经被用户命令取代，此时再迁移会抛
+        IllegalTransitionError 冲出调用方（正是 review2 finding-1 的现场）。
+        """
+
+        if record.is_terminal:
+            return record
+        resolved_publish = self._resolve_publish(publish)
+        try:
+            return await self._pipeline(
+                record,
+                record.command,
+                pre_submit=pre_submit,
+                tick=tick,
+                publish=resolved_publish,
+            )
+        except asyncio.CancelledError:
+            # 与 _run 同一条收尾纪律：绝不留非终态的幽灵记录。
+            try:
+                if (
+                    not record.is_terminal
+                    and CommandStatus.CANCELLED in LEGAL_TRANSITIONS[record.status]
+                ):
+                    await record.transition(
+                        CommandStatus.CANCELLED, detail="command task cancelled", tick=tick
+                    )
+            finally:
+                self._deregister(record)
+            raise
+
+    async def report_command_failed(
+        self,
+        command: DeviceCommand,
+        *,
+        error_code: str,
+        reason: str,
+        causal_parent: str | None,
+        tick: int | None = None,
+        publish: PublishEvent | None = None,
+    ) -> SimEvent:
+        """S3-T5 仲裁门入口：一条**没能走到执行**的命令仍按 §10.2 词表如实上报失败。
+
+        为什么需要它：仲裁在 ``proposed`` 阶段就能否掉一条命令（例如设备离线，§9.2 第五类），
+        于是它永远到不了 :func:`validate_command`。但 S0-4 那条护栏要求「同一条坏命令在
+        agent 腿与 UI 腿拿到**完全相同**的 §10.2 错误码」——UI 腿不受仲裁单边拒绝约束，
+        照常走校验拿到 ``unknown_device``；agent 腿若只留一条"仲裁落败"，两条腿就在
+        错误词表上分叉了，而那正是 S0-4 要钉死的东西。
+
+        本方法不新增词表、不新增事件类型，只是把既有的 ``device.command_failed`` 发射口
+        开放给仲裁门——失败码仍由 ``validation.py`` 计算，事件仍由 executor 发。
+        """
+
+        return await self._emit_command_failed(
+            command,
+            error_code=error_code,
+            reason=reason,
+            causal_parent=causal_parent,
+            tick=tick,
+            publish=publish,
+        )
+
     async def cancel_pending(
         self, reason: str, *, tick: int | None = None
     ) -> list[CommandRecord]:
@@ -755,6 +848,16 @@ class CommandExecutor:
                     status=record.status.value,
                 )
         self._deregister(record)
+
+    def forget(self, record: CommandRecord) -> None:
+        """把一条**已终态**的记录移出在飞注册表（S3-T5 仲裁门收尾用）。
+
+        非终态记录一律不动：静默删掉一条活命令等于零可观测性，那是 review2 finding-1
+        的原症状。要终结它请走 ``cancel_pending`` / ``_supersede``，它们都会先落账再注销。
+        """
+
+        if record.is_terminal:
+            self._deregister(record)
 
     def _deregister(self, record: CommandRecord) -> None:
         key = (record.command.device_id, record.command.capability)

@@ -522,3 +522,146 @@ def test_heartbeat_pong_is_accepted_without_error(client):
         assert data["type"] == "SIMULATION_STATUS"
         assert data["payload"]["speed"] == 1.5
 
+
+
+# ---------------------------------------------------------------------------
+# S3-T4 review minor: CMD_SCENE_APPLY —— 场景切换的前门
+#
+# 被推翻的现状：SceneSelector.vue 在浏览器里循环发 2×N 条 CMD_DEVICE_CONTROL，
+# 后端只看到 N 条互不相干的直控，拼不出"这是一次场景切换"这条因果链；SceneAgent 与
+# scene_definitions.yaml 因此只有场景 YAML / 单测两个入口，产品里根本够不着。
+# 现在一条 CMD_SCENE_APPLY = 一条 user.command 根事件 → 编排 → 仲裁 → CommandExecutor。
+# ---------------------------------------------------------------------------
+
+
+def test_ws_cmd_scene_apply_flows_through_arbitration_to_executor(client):
+    with _connect(client) as ws:
+        ws.receive_json()  # initial STATE_FULL
+        ws.send_json({"type": "CMD_SCENE_APPLY", "payload": {"scene_id": "away"}})
+
+        messages = _receive_until_event_types(
+            ws,
+            {"user.command", "reasoning.coordination_decision", "command.lifecycle"},
+            max_messages=80,
+        )
+        events = [
+            message["payload"] for message in messages if message["type"] == "SIM_EVENT"
+        ]
+
+        # 1) 根事件：一条消息 = 一次场景切换，带 scene_id，且先于任何子事件外发。
+        roots = [
+            event
+            for event in events
+            if event["event_type"] == "user.command"
+            and event["data"].get("message_type") == "CMD_SCENE_APPLY"
+        ]
+        assert len(roots) == 1, "一条 CMD_SCENE_APPLY 只能开一条根事件"
+        root = roots[0]
+        assert root["data"]["scene_id"] == "away"
+        assert root["seq"] is not None, "根事件必须先盖章再外发（S5 按 seq 排因果树）"
+        assert events[0]["event_id"] == root["event_id"]
+
+        # 2) 仲裁：SceneAgent 的提案真的进了同一台仲裁器（不是绕过去直接落地）。
+        decisions = [
+            event
+            for event in events
+            if event["event_type"] == "reasoning.coordination_decision"
+            and event["correlation_id"] == root["correlation_id"]
+        ]
+        assert decisions, "场景切换必须留下一条 coordination_decision"
+        scene_participation = [
+            entry
+            for decision in decisions
+            for entry in decision["data"]["per_agent"]
+            if entry["agent_id"] == "scene_agent"
+        ]
+        assert scene_participation, "SceneAgent 必须出现在仲裁的 per_agent 里"
+        approved_by_scene = [
+            item
+            for decision in decisions
+            for item in decision["data"]["approved_commands"]
+            if item["agent_id"] == "scene_agent"
+        ]
+        assert approved_by_scene, "away 场景的命令必须有被批准的那几条"
+
+        # 3) 执行：批准的命令走 CommandExecutor 的十态生命周期（同一条腿，无隐藏写入）。
+        lifecycles = [
+            event
+            for event in events
+            if event["event_type"] == "command.lifecycle"
+            and event["correlation_id"] == root["correlation_id"]
+        ]
+        assert lifecycles, "场景命令必须经 CommandExecutor"
+        assert {event["source"] for event in lifecycles} == {"command_executor"}
+
+
+def test_ws_cmd_scene_apply_unknown_scene_returns_error_and_connection_survives(client):
+    with _connect(client) as ws:
+        ws.receive_json()  # initial STATE_FULL
+        ws.send_json({"type": "CMD_SCENE_APPLY", "payload": {"scene_id": "ghost_scene"}})
+
+        err = _receive_until_message_type(ws, "ERROR")
+        assert err["payload"]["code"] == "unknown_scene"
+        assert err["payload"]["details"]["scene_id"] == "ghost_scene"
+        # 点名已知场景：前端拼错一个 id 时不必去翻后端 YAML。
+        assert "away" in err["payload"]["details"]["known_scenes"]
+
+        # 坏消息不杀连接
+        ws.send_json({"type": "CMD_SIM_SPEED", "payload": {"speed": 1.25}})
+        status = _receive_until_message_type(ws, "SIMULATION_STATUS")
+        assert status["payload"]["speed"] == 1.25
+
+
+def test_ws_cmd_scene_apply_missing_scene_id_returns_invalid_payload(client):
+    with _connect(client) as ws:
+        ws.receive_json()  # initial STATE_FULL
+        ws.send_json({"type": "CMD_SCENE_APPLY", "payload": {}})
+        err = _receive_until_message_type(ws, "ERROR")
+        assert err["payload"]["code"] == "invalid_payload"
+        assert err["payload"]["details"]["issues"]
+
+
+# --------------------------------------------------------------- /api/health §11.1
+
+
+# 会让 AgentRuntime._build_default_provider 挑到真 provider 的环境变量
+# （开发机的 backend/.env.local 里就有它们）。"没有 LLM"这件事必须在测试里显式做到。
+_PROVIDER_ENV_VARS = (
+    "LLM_MODE",
+    "LLM_PROVIDER",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_COMPAT_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+)
+
+
+def test_health_surfaces_the_resolved_llm_mode(client):
+    """§11.1：健康检查必须回答"这台实例现在跑在哪种模式上"，而不只是 provider 名。
+
+    只报 provider/model/configured 时，研究者（与 S5 面板）无法区分
+    live / mocked / recorded / rule_based——而这正是模式系统存在的理由。
+    """
+
+    llm = client.get("/api/health").json()["llm"]
+
+    assert set(llm) >= {"provider", "model", "configured", "mode", "benchmark_safe"}
+    assert llm["mode"] in {"mocked", "recorded", "live", "rule_based"}
+    # DECISION #7：只有非 live 的模式能拿去做 benchmark 声明，标志位必须与模式同源。
+    assert llm["benchmark_safe"] is (llm["mode"] != "live")
+
+
+def test_health_reports_rule_based_mode_when_no_llm_is_configured(monkeypatch):
+    """拔掉全部 key 之后，模式必须是 rule_based——"没有 LLM"不是"罐头 LLM"。"""
+
+    for name in _PROVIDER_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+    with TestClient(app) as bare_client:
+        llm = bare_client.get("/api/health").json()["llm"]
+
+    assert llm["configured"] is False
+    assert llm["provider"] == "disabled"
+    assert llm["model"] == "rule_based"
+    assert llm["mode"] == "rule_based"
+    assert llm["benchmark_safe"] is True

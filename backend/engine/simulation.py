@@ -6,10 +6,9 @@ import time
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from backend.agents.hvac import HVACAgent
-from backend.agents.lighting import LightingAgent
 from backend.agents.llm import LLMProvider
-from backend.agents.runtime import AgentRuntime
+from backend.agents.llm_modes import resolve_mode_for_provider
+from backend.agents.runtime import AgentRuntime, register_default_agents
 from backend.api.ws import ConnectionManager
 from backend.core.logging import log
 from backend.engine.event_bus import EventBus, SimEvent, WorldEvent
@@ -115,8 +114,9 @@ class SimulationEngine:
             episode_timeout_ms=agent_episode_timeout_ms,
             command_executor=self.command_executor,
         )
-        self.agent_runtime.register(LightingAgent())
-        self.agent_runtime.register(HVACAgent())
+        # §8.2 五个域 agent；"注册了谁、什么顺序"的唯一真相在 runtime.DEFAULT_AGENT_FACTORIES
+        # ——顺序同时决定 TaskPlan.domain_tasks 序与 canonical trace 行序（S2-T9 门）。
+        register_default_agents(self.agent_runtime)
 
         # §11 run 模型：引擎一起来就处在一个 run 里——"没有 run 的事件"是 S2 之前那种
         # 无法归属的连续带，正是可复现性缺失的形态。scenario_id/seed 由场景运行方
@@ -219,6 +219,10 @@ class SimulationEngine:
             scenario_id=scenario_id,
             seed=seed,
             llm_provider=provider,
+            # §11.1：run 工件必须记下用的是哪种模式。显式传是因为 run_manager 在 engine 层，
+            # 它只会鸭子类型地看 provider_name/api_key，认不出 S3 的三层模式包装
+            # （recorded 会被它当成 live 或 mocked）。裸 provider 走到这里结果与 S2 一致。
+            llm_mode=resolve_mode_for_provider(provider),
             agent_versions=agent_versions,
             clear_event_history=clear_event_history,
         )

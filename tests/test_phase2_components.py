@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from backend.agents.arbiter import Arbiter
+from backend.agents.arbiter import Arbiter, ConflictClass
+from backend.agents.contracts import PriorityLevel
 from backend.agents.memory import AgentMemoryStore
 from backend.agents.llm import AnthropicCompatibleProvider
 from backend.agents.runtime import AgentRuntime, TriggerClassifier
@@ -131,14 +132,55 @@ def test_arbiter_prefers_higher_priority_and_recent_root_timestamp():
 
     result = arbiter.resolve([energy, comfort], root_event=_event("environment.state_refresh"))
 
+    # S3-T5：旧六标签由 migrate_legacy_priority 迁到 §9.1（user_comfort→comfort、
+    # energy_efficiency→energy），裁决结论不变，输出换成 §9.3 三项。
     assert len(result.winning_commands) == 1
     assert result.winning_commands[0].value == 22
+    assert result.winning_priority is PriorityLevel.COMFORT
     assert len(result.conflicts) == 1
-    assert result.conflicts[0]["winner_agent_id"] == "hvac_agent"
-    assert result.conflicts[0]["loser_agent_id"] == "energy_agent"
+    assert result.conflicts[0].winner_agent_id == "hvac_agent"
+    assert result.conflicts[0].loser_agent_id == "energy_agent"
+    assert result.conflicts[0].conflict_class is ConflictClass.SAME_DEVICE_PROPERTY
+
+
+def test_arbiter_breaks_same_tier_ties_by_recent_root_timestamp():
+    """同档位时保留旧的"根事件更新者赢"语义（信封携带 root_event_timestamp）。"""
+
+    arbiter = Arbiter()
+
+    def _envelope(agent_id: str, value: int, timestamp: float) -> AgentDecisionEnvelope:
+        return AgentDecisionEnvelope(
+            agent_id=agent_id,
+            agent_name=agent_id,
+            mode="llm",
+            trigger_event_type="environment.state_refresh",
+            intent="adjust target temp",
+            confidence=0.9,
+            explanation="same tier",
+            priority="user_comfort",
+            candidate_commands=[
+                AgentCommandProposal(
+                    device_id="ac_living_01",
+                    property="extra.target_temp",
+                    value=value,
+                    reason="same tier",
+                )
+            ],
+            root_event_id=f"root-{timestamp}",
+            root_event_timestamp=timestamp,
+        )
+
+    # 字典序上 "a_agent" 在前，但它的根事件更旧 → 新近度先于 agent_id 起作用。
+    result = arbiter.resolve(
+        [_envelope("a_agent", 27, 10.0), _envelope("z_agent", 22, 20.0)],
+        root_event=_event("environment.state_refresh"),
+    )
+    assert [item.agent_id for item in result.approved_commands] == ["z_agent"]
+    assert [item.agent_id for item in result.rejected_commands] == ["a_agent"]
 
 
 def test_agent_runtime_builds_anthropic_provider_from_env(monkeypatch):
+    monkeypatch.setenv("AURA_ALLOW_LIVE_LLM", "1")
     monkeypatch.setenv("LLM_PROVIDER", "anthropic_compatible")
     monkeypatch.setenv("ANTHROPIC_COMPAT_API_KEY", "test-key")
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.minimax.io/anthropic")

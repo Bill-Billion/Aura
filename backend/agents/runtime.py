@@ -57,13 +57,47 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from backend.agents.arbiter import Arbiter
+from backend.agents.arbiter import (
+    ARBITER_ID,
+    COORDINATION_DECISION_EVENT_TYPE,
+    Arbiter,
+    ArbiterResult,
+    ArbitrationGate,
+    RejectedCommand,
+)
 from backend.agents.base import BaseAgent
+from backend.agents.contracts import AgentProposal, DomainTask, RootEventContext
+from backend.agents.energy import EnergyAgent
+from backend.agents.hvac import HVACAgent
+from backend.agents.lighting import LightingAgent
+from backend.agents.scene import SceneAgent
+from backend.agents.security import SecurityAgent
+from backend.agents.orchestrator import (
+    ORCHESTRATOR_ENABLED_ENV,
+    DomainAgentBinding,
+    HomeOrchestratorAgent,
+    OrchestrationDecision,
+    orchestrator_enabled,
+)
 from backend.agents.llm import (
     AnthropicCompatibleProvider,
     LLMProvider,
     LLMProviderError,
     OpenAIResponsesProvider,
+)
+from backend.agents.llm_modes import (
+    BudgetGuardedLLMProvider,
+    EpisodeCostGuard,
+    LLMMode,
+    RunScopedRecordedProvider,
+    VersionedDecision,
+    WorldVersionTracker,
+    build_provider_for_mode,
+    build_stale_decision_event,
+    check_stale_decision,
+    live_llm_allowed,
+    llm_mode_health,
+    resolve_llm_mode_from_env,
 )
 from backend.agents.memory import AgentMemoryStore
 from backend.agents.types import AgentCommandProposal, AgentDecisionEnvelope
@@ -82,6 +116,7 @@ from backend.engine.run_manager import (
 from backend.engine.state import AgentRuntimeState, WorldState
 from backend.engine.state_manager import DeltaChange, StateManager
 from backend.execution.command import (
+    LEGAL_TRANSITIONS,
     CommandRecord,
     CommandSource,
     CommandStatus,
@@ -92,6 +127,7 @@ from backend.execution.executor import (
     FEEDBACK_EVENT_TYPE,
     CommandExecutor,
 )
+from backend.execution.validation import validate_command
 from backend.models.schemas import WSMessage
 
 PublishEvent = Callable[[SimEvent], Awaitable[SimEvent]]
@@ -101,13 +137,54 @@ PublishEvent = Callable[[SimEvent], Awaitable[SimEvent]]
 RunIdSource = Callable[[], str | None]
 
 __all__ = [
+    "DEFAULT_AGENT_FACTORIES",
     "AgentRuntime",
+    "ArbitrationGate",
     "DisabledLLMProvider",
+    "HomeOrchestratorAgent",
     "SerialEmissionGate",
     "TriggerClassifier",
     "STALE_RUN_DISCARD_EVENT_TYPE",
     "STALE_RUN_DISCARD_REASON",
+    "build_default_agents",
+    "register_default_agents",
 ]
+
+
+# —— 默认域 agent 注册表（§8.2 五个域）——————————————————————————————
+#
+# **顺序即契约**：它同时决定三件事——
+#   1. ``TaskPlan.domain_tasks`` 的顺序（S3-T3 编排器按绑定顺序生成）；
+#   2. episode 内事件的发射顺序（``_ordered_agents`` 的 tie-break）；
+#   3. S2-T9 字节一致性门看到的 canonical trace 行序。
+# 改这张表的顺序 = 改 canonical trace。lighting/hvac 排在前面是为了让 S2 之前
+# 落地的 trace 前缀保持稳定。
+DEFAULT_AGENT_FACTORIES: tuple[Callable[[], BaseAgent], ...] = (
+    LightingAgent,
+    HVACAgent,
+    SecurityAgent,
+    EnergyAgent,
+    SceneAgent,
+)
+
+
+def build_default_agents() -> list[BaseAgent]:
+    """按 :data:`DEFAULT_AGENT_FACTORIES` 的顺序造一组默认域 agent。"""
+
+    return [factory() for factory in DEFAULT_AGENT_FACTORIES]
+
+
+def register_default_agents(runtime: "AgentRuntime") -> list[BaseAgent]:
+    """把默认域 agent 注册进 runtime（引擎装配的唯一入口）。
+
+    引擎侧只留这一行调用，"注册了谁、什么顺序"这件事就只有一处真相；否则
+    S4 的 headless runner、S5 的对比实验各抄一份注册代码，顺序迟早分叉。
+    """
+
+    agents = build_default_agents()
+    for agent in agents:
+        runtime.register(agent)
+    return agents
 
 
 class SerialEmissionGate:
@@ -255,8 +332,32 @@ class AgentRuntime:
         command_executor: CommandExecutor | None = None,
         run_id_source: RunIdSource | None = None,
         observation_projector: ObservableProjector | None = None,
+        orchestrator: HomeOrchestratorAgent | None = None,
+        orchestrator_enabled_flag: bool | None = None,
+        arbitration_gate: ArbitrationGate | None = None,
     ) -> None:
         self.agents: list[BaseAgent] = []
+        # S3-T3：编排层。它**不在** self.agents 里——BaseAgent 的契约是"控设备、发命令"，
+        # 编排器一条命令都不发（spec §8.1）。开关默认开，置 ORCHESTRATOR_ENABLED=0 时
+        # 回到 S2 的"全体相关 agent 扇出"路径（strangler 逃生阀）。
+        self.orchestrator = orchestrator or HomeOrchestratorAgent()
+        self.orchestrator_enabled = (
+            orchestrator_enabled() if orchestrator_enabled_flag is None else orchestrator_enabled_flag
+        )
+        if not self.orchestrator_enabled:
+            # 逃生阀被拉下来这件事**必须出声**：关掉编排器就回到 S2 的旧分发路径，
+            # 那条路径上的 reasoning.task_decomposition 装的是 LLM 自由文本，
+            # 即审计坑 (c)。默认开 + 静默关 = 一条流水线可以被无声降级，
+            # 而事后没人能从日志里看出这份数据是哪条路径产的（S3 review minor-6）。
+            log.warning(
+                "orchestrator_disabled",
+                env_var=ORCHESTRATOR_ENABLED_ENV,
+                impact="legacy_fanout_free_text_task_decomposition",
+                detail=(
+                    "编排器已关闭：任务分解退回 S2 自由文本路径（审计坑 c），"
+                    "本次运行的事件流不具备 §8.3 结构化 domain_tasks 契约"
+                ),
+            )
         self.event_bus = event_bus
         self.run_id_source = run_id_source
         self.state_manager = state_manager
@@ -269,9 +370,20 @@ class AgentRuntime:
         # 引擎注入的那台唯一 executor；未注入时首次用到才自建一台并长期持有
         # （S1 review finding-8：绝不再每个 agent 每条 episode 造一台）。
         self.command_executor = command_executor
-        self.llm_provider = llm_provider or self._build_default_provider()
+        # §11.1 模式路由的**唯一**生产入口（S3 review major-2）。注入的 provider 在这里的
+        # 角色是"live 那一档"：LLM_MODE=recorded 时被录制层包住，=mocked 时被罐头顶掉。
+        self.llm_provider = self._resolve_llm_provider(llm_provider)
+        # S3-T8 成本护栏（S3 review major-4）：台账挂在 runtime 上（跨 episode 累计，
+        # run 工件要的是整份 run 的汇总），收费口按 episode 现套——见 _episode_llm_provider。
+        self.cost_guard = EpisodeCostGuard()
+        log.info("llm_mode_resolved", **llm_mode_health(self.llm_provider))
         self.memory_store = memory_store or AgentMemoryStore()
         self.arbiter = arbiter or Arbiter()
+        # 仲裁门（S3-T5）：命令的 proposed→approved|rejected 都经它，且它就是装在
+        # S1 预留的 ``submit(..., pre_submit=…)`` 接缝上的那个实现。UI 腿（main.py）与
+        # agent 腿共用**同一台**，否则用户占用登记在一台、agent 仲裁读另一台，
+        # "用户覆盖 agent" 又会退回名义状态。
+        self.arbitration_gate = arbitration_gate or ArbitrationGate(arbiter=self.arbiter)
         self.trigger_classifier = trigger_classifier or TriggerClassifier()
         if episode_timeout_ms is None:
             # 设计意图：默认把单个 agent episode 的最长耗时压到和 LLM 超时同量级，
@@ -303,8 +415,59 @@ class AgentRuntime:
             return False
         return bool(getattr(self.llm_provider, "api_key", None))
 
+    def _resolve_llm_provider(self, injected: LLMProvider | None) -> LLMProvider:
+        """§11.1：``LLM_MODE`` 决定这台 runtime 跑的是罐头 / 录制回放 / 真 provider。
+
+        **``under_test=False`` 是刻意的。** ``resolve_llm_mode_from_env`` 那条"pytest 下
+        缺省 mocked"的分岔是给库调用方的便利默认；用在这条生产接线上，会让整套后端测试
+        在没设 ``LLM_MODE`` 时静默切成罐头决策（其中大量断言断的正是规则回退链的形状）。
+        缺省 = ``live`` = 既有行为：没有 key 时 :meth:`_build_default_provider` 返回
+        :class:`DisabledLLMProvider`，与 S2 逐字一致。想要罐头就显式说 ``LLM_MODE=mocked``。
+
+        注入的 provider 在这里的角色是 **live 那一档**，而不是"绕开模式系统"：
+        ``LLM_MODE=recorded`` 时它被 :class:`RecordingLLMProvider` 包住（第一次跑落录制），
+        ``LLM_MODE=mocked`` 时它整个被罐头顶掉。ScenarioRunner 注入的那台 disabled provider
+        因此也吃 ``LLM_MODE``——headless 跑法不需要再开第二个开关。
+        """
+
+        live_provider_factory = (
+            (lambda: injected) if injected is not None else self._build_default_provider
+        )
+        mode = resolve_llm_mode_from_env(under_test=False)
+        if mode is LLMMode.RECORDED:
+            # 录制文件的位置要 run_id，而 run_id 在本方法执行时还不存在（RunManager 后建，
+            # run_id_source 要到 bind() 才注入）。所以交给按 run 惰性解析的那层。
+            return RunScopedRecordedProvider(
+                live_provider_factory=live_provider_factory,
+                run_id_source=self.current_run_id,
+            )
+        return build_provider_for_mode(mode, live_provider_factory=live_provider_factory)
+
+    def _episode_llm_provider(self, correlation_id: str) -> LLMProvider:
+        """本条 episode 的收费口（S3-T8）。
+
+        预算是 **per-episode** 的，而 provider 是全局单例，所以按 correlation_id 现套一层：
+        编排器的 intent 调用与每个域 agent 的调用因此记在同一条 episode 台账上，
+        "预算是在哪一步咬下去的"才有定义。mocked/replay/disabled 由
+        ``BudgetGuardedLLMProvider.is_billable`` 自动免检——预算绝不能改写确定性跑法的行为。
+        """
+
+        return BudgetGuardedLLMProvider(
+            self.llm_provider, self.cost_guard, correlation_id=correlation_id
+        )
+
     @staticmethod
     def _build_default_provider() -> LLMProvider:
+        """``live`` 那一档：按 ``LLM_PROVIDER`` + key 选真 provider，都没有就 disabled。
+
+        测试进程里必须显式设 ``AURA_ALLOW_LIVE_LLM=1`` 才会搭真 provider——缺省闸门把
+        本机拉回 CI 那条路径（无 key → DisabledLLMProvider → 规则回退），根治
+        S3 review-2 blocker：仓库根的 ``.env.local`` 带着真 key，不再被意外消费。
+        """
+
+        if not live_llm_allowed():
+            return DisabledLLMProvider()
+
         provider_name = os.getenv("LLM_PROVIDER", "").strip()
 
         if provider_name == "anthropic_compatible":
@@ -356,10 +519,14 @@ class AgentRuntime:
             self.run_id_source = run_id_source
         # 绑定 = 换了世界（引擎构造 / 重新接线）：上一份观测历史不属于这个世界。
         self.observation_projector.reset()
+        # S3-T7：世界版本簿记装在 StateManager 的唯一写入口上（幂等）。装不上就等于
+        # 陈旧决策丢弃整条不存在——所以它跟 observation_projector 一样属于"绑定即装"。
+        WorldVersionTracker.attach(state_manager)
         self._refresh_subscriptions()
 
     def update_state_manager(self, state_manager: StateManager) -> None:
         self.state_manager = state_manager
+        WorldVersionTracker.attach(state_manager)
         # reset 换世界后必须丢掉观测历史，否则上一个 run 的读数会被当成本 run 的
         # "最后一次汇报"回放给 agent——与 S1 根治的 reset 污染同类。
         self.observation_projector.reset()
@@ -418,11 +585,16 @@ class AgentRuntime:
             await self.command_executor.bind_state_manager(
                 self.state_manager, reason="state_manager_rebound"
             )
+        # 仲裁门必须跟着同一台 executor 走（换世界时它的仲裁窗口记录也一并作废）。
+        self.arbitration_gate.bind(self.command_executor)
         return self.command_executor
 
     def reset(self) -> None:
         self.memory_store.clear()
         self.observation_projector.reset()
+        # 旧世界的 explicit_user 占用不属于新世界：不清掉的话，reset 之后第一条
+        # agent 提案会输给一条根本不存在的用户命令。
+        self.arbitration_gate.forget_claims()
 
     async def cancel_active_episodes(self, reason: str = "simulation_reset") -> None:
         """Cancel in-flight episode tasks and surface each as system.episode_cancelled.
@@ -585,6 +757,10 @@ class AgentRuntime:
         # 的感知（它读 devices/rooms），因此与 episode 共用**同一次**投影——分两次取会
         # 让"决定要不要跑"和"跑的时候看到的"来自两个不同时刻的观测。
         observable = self.observable_world()
+        # S3-T7：与那次投影**同一刻**的世界版本。陈旧判定的语义就是"这条决策据以推理的
+        # 世界读数是在这个版本上取的"，所以它必须与 observable 在同一行取，不能在
+        # episode 协程里补取——那已经隔了若干次调度。
+        observed_version = self._current_world_version()
         relevant_agents = [agent for agent in self.agents if agent.is_relevant(observable, event)]
         if not relevant_agents:
             return
@@ -624,6 +800,7 @@ class AgentRuntime:
                 agents_to_run,
                 run_id=episode_run_id,
                 observable=observable,
+                observed_version=observed_version,
                 emission_ticket=emission_ticket,
             )
         )
@@ -686,6 +863,7 @@ class AgentRuntime:
         *,
         run_id: str | None = None,
         observable: WorldState | None = None,
+        observed_version: int | None = None,
         emission_ticket: int | None = None,
     ) -> None:
         """一条 episode：并发**算**，持号**发**（见模块开头的顺序契约）。
@@ -698,7 +876,12 @@ class AgentRuntime:
         ticket = self.emission_gate.take_ticket() if emission_ticket is None else emission_ticket
         try:
             await self._run_episode_body(
-                root_event, agents, run_id=run_id, observable=observable, ticket=ticket
+                root_event,
+                agents,
+                run_id=run_id,
+                observable=observable,
+                observed_version=observed_version,
+                ticket=ticket,
             )
         finally:
             # 幂等放号。协程体压根没开始就被取消时，本 finally 不会执行——那条路径由
@@ -713,6 +896,7 @@ class AgentRuntime:
         run_id: str | None,
         observable: WorldState | None,
         ticket: int,
+        observed_version: int | None = None,
     ) -> None:
         if self.state_manager is None or self.publish_event is None or self.conn is None:
             return
@@ -721,7 +905,22 @@ class AgentRuntime:
         # 调用方（_handle_root_event）已经投影过一次就复用那一份——同一条 episode 里
         # 相关性判定与推理必须基于同一次观测。
         snapshot = observable if observable is not None else self.observable_world()
-        agents = self._ordered_agents(agents)
+        if observed_version is None:
+            # 直接调用本方法的入口（单测 / 未来的编排器）没给版本时就地取一次：
+            # 与 observable 的兜底同源，陈旧判定因此没有"关掉"的旁路。
+            observed_version = self._current_world_version()
+        candidates = self._ordered_agents(agents)
+
+        # —— 编排（§8.1）：也是"算"的一部分，因此在闸门之外做完。——
+        # 它不写世界、不发事件，只决定"这一轮派给谁、每人干什么"。
+        decision: OrchestrationDecision | None = None
+        agents = candidates
+        if self.orchestrator_enabled:
+            decision = await self._plan_episode(root_event, snapshot, candidates)
+            selected = set(decision.selected_agent_ids)
+            # 顺序仍取自 candidates（= 注册序）：TaskPlan.domain_tasks 本身就是按注册序
+            # 生成的，这里再过一次是把"两处顺序必须一致"变成机制而不是巧合。
+            agents = [agent for agent in candidates if agent.agent_id in selected]
 
         for agent in agents:
             self._ensure_agent_state(agent)
@@ -731,7 +930,14 @@ class AgentRuntime:
         # 同一根事件下的 agent episode 并发执行，避免慢 provider 把整条因果链串行拖死。
         # 这里是契约允许的"并发算"：gather 的**结果顺序**恒等于入参顺序，谁先算完不影响。
         evaluation_tasks = [
-            asyncio.create_task(self._evaluate_agent(root_event=root_event, snapshot=snapshot, agent=agent))
+            asyncio.create_task(
+                self._evaluate_agent(
+                    root_event=root_event,
+                    snapshot=snapshot,
+                    agent=agent,
+                    domain_task=decision.task_for_agent(agent.agent_id) if decision else None,
+                )
+            )
             for agent in agents
         ]
         evaluated = await asyncio.gather(*evaluation_tasks)
@@ -739,8 +945,46 @@ class AgentRuntime:
         # 从这里往下是"发"：整段持号，按取号序（=根事件发布序）串行。
         async with self.emission_gate.turn(ticket):
             await self._emit_episode(
-                root_event=root_event, agents=agents, evaluated=list(evaluated), run_id=run_id
+                root_event=root_event,
+                agents=agents,
+                evaluated=list(evaluated),
+                run_id=run_id,
+                decision=decision,
+                candidates=candidates,
+                snapshot=snapshot,
+                observed_version=observed_version,
             )
+
+    # --- §8.1 编排 ----------------------------------------------------------
+
+    def _domain_bindings(self, agents: list[BaseAgent]) -> list[DomainAgentBinding]:
+        """按**注册顺序**把候选 agent 投影成编排器认识的绑定（确定性契约的起点）。"""
+
+        return [DomainAgentBinding.from_agent(agent) for agent in agents]
+
+    async def _plan_episode(
+        self,
+        root_event: SimEvent,
+        snapshot: WorldState,
+        agents: list[BaseAgent],
+    ) -> OrchestrationDecision:
+        """根事件 → :class:`OrchestrationDecision`（§8.3）。
+
+        编排器拿到的是 ``RootEventContext.from_observable_world`` 的**深拷贝**，因此
+        "orchestrator 不写世界"不是靠约定：它手上根本没有真世界的引用。
+        """
+
+        context = RootEventContext.from_observable_world(
+            root_event=root_event,
+            observable_world=snapshot,
+            run_id=root_event.run_id or self.current_run_id(),
+        )
+        return await self.orchestrator.plan(
+            context,
+            self._domain_bindings(agents),
+            # 编排器的 intent 调用与域 agent 的调用记在**同一条** episode 台账上（S3-T8）。
+            llm_provider=self._episode_llm_provider(root_event.correlation_id),
+        )
 
     async def _emit_episode(
         self,
@@ -749,6 +993,10 @@ class AgentRuntime:
         agents: list[BaseAgent],
         evaluated: list[AgentDecisionEnvelope | None],
         run_id: str | None,
+        decision: OrchestrationDecision | None = None,
+        candidates: list[BaseAgent] | None = None,
+        snapshot: WorldState | None = None,
+        observed_version: int | None = None,
     ) -> None:
         """episode 的**发射**阶段：本方法内发出的每一条事件都在持号期间。
 
@@ -760,7 +1008,7 @@ class AgentRuntime:
             return
 
         envelopes: list[AgentDecisionEnvelope] = []
-        causal_heads: dict[str, str] = {}
+        candidates = candidates if candidates is not None else agents
 
         # run 门（§2.2）：LLM 那一段是本 episode 最长的 await，期间 run 可能已经换掉。
         # 取消在飞任务是第一道防线，但换 run 不一定伴随取消（场景连跑、headless runner），
@@ -775,24 +1023,185 @@ class AgentRuntime:
             )
             return
 
+        # 编排层的三环（感知 → 意图 → 任务拆分）先发，域 agent 的推理链挂在它下面：
+        # §4.4「causal_parent 必须指向直接父事件」，而这一轮里域 agent 的直接父就是
+        # 编排器的任务拆分，不是根事件本身。
+        episode_parent = root_event.event_id
+        if decision is not None:
+            episode_parent = await self._emit_orchestrator_prefix(root_event, decision)
+
+        # S3-T6：编排器在场时，**前三环归编排器**，域 agent 不再各起一棵平行小树。
+        # 审计 §六「episode 被稀释」说的就是旧形状：一条 correlation 下挂着 N 套同名的
+        # perception/intent/task_decomposition，六环名义上齐了，却没有一棵树能从感知一路
+        # 读到反馈。域 agent 的感知/意图/置信度改由 reasoning.execution_plan 承载
+        # （见 _agent_contribution_data）——信息一条不少，树只有一棵。
+        orchestrated = decision is not None
         for agent, envelope in zip(agents, evaluated, strict=False):
             if envelope is None:
                 self._set_agent_idle(agent.agent_id)
                 continue
 
             envelopes.append(envelope)
-            causal_heads[agent.agent_id] = root_event.event_id
-            causal_heads[agent.agent_id] = await self._emit_reasoning_prefix(root_event, envelope, causal_heads[agent.agent_id])
+            if orchestrated:
+                # 降级是唯一仍要**当场**发的一环：它发生在仲裁之前，挪到执行环里补记
+                # 就读不出"这一轮从哪一步开始是规则算的"（§15 降级验收）。
+                await self._emit_agent_fallback(root_event, envelope, episode_parent)
+            else:
+                # strangler 逃生阀（ORCHESTRATOR_ENABLED=0）：没有编排器就没人拥有前三环，
+                # 此时域 agent 必须发回自己的那一套，否则整条 episode 一环不剩。
+                await self._emit_reasoning_prefix(root_event, envelope, episode_parent)
 
-        result = self.arbiter.resolve(envelopes, root_event)
         pending_deltas: list[DeltaChange] = []
+        agent_by_id = {agent.agent_id: agent for agent in agents}
+        publishers = {
+            envelope.agent_id: self._agent_publish_event(envelope.agent_id, pending_deltas)
+            for envelope in envelopes
+        }
+        tick = int(self.state_manager.world.simulation_tick)
 
+        # —— §8.4：信封 → 提案。仲裁器消费的是**结论**（提案），不是决策过程（信封）——
+        # 也正是这一步让 §8.4 的五种非动作表达（低置信 / 缺观测 / 不安全…）真正生效：
+        # 被扣下的命令进 withheld_commands，不会一路溜进 executor。
+        proposals: list[AgentProposal] = []
         for envelope in envelopes:
-            # 推理事件外发同样是 await 点；每个信封落地前复查一次 run 身份，
-            # 保证"最后一个 await 之后才写世界"这条边界不被拉长的 episode 撑破。
+            agent = agent_by_id.get(envelope.agent_id)
+            if agent is None or snapshot is None:
+                continue
+            proposals.append(
+                agent.build_proposal(
+                    envelope=envelope,
+                    world_state=snapshot,
+                    root_event=root_event,
+                    domain_task=decision.task_for_agent(agent.agent_id) if decision else None,
+                )
+            )
+
+        # §8.2 能耗否决权：占用门在 EnergyAgent 内部，这里只负责把评审结果喂给仲裁器。
+        energy_review = None
+        if snapshot is not None:
+            energy_agent = next(
+                (agent for agent in self.agents if isinstance(agent, EnergyAgent)), None
+            )
+            if energy_agent is not None:
+                energy_review = energy_agent.review_peer_proposals(proposals, snapshot)
+
+        result = self.arbiter.resolve(
+            proposals,
+            root_event,
+            snapshot,
+            energy_review=energy_review,
+            # 用户在本 episode 开始**之后**下的直控 → agent 提案在同一控制点上让位。
+            # 这是"用户覆盖 agent"从名义变机制的读取端（写入端见 ArbitrationGate.pre_submit）。
+            user_claims=self.arbitration_gate.claims_since(float(root_event.wall_time or 0.0)),
+        )
+
+        # run 门（§2.2）：推理事件外发也是 await 点，写世界之前再问一次身份。
+        if self._is_stale_run(run_id):
+            await self._broadcast_pending_deltas(pending_deltas)
+            await self._discard_stale_episode(
+                root_event=root_event,
+                agents=agents,
+                episode_run_id=run_id,
+                stage="before_command_execution",
+                envelopes=envelopes,
+            )
+            return
+
+        # —— §9.3：一条 episode **只发一条** reasoning.coordination_decision ——
+        # 审计原文「仲裁全序名存实亡」的症状之一就是这条事件按 agent 各发一条：
+        # 于是"仲裁"看起来像每人自说自话，全序压根没有落点。per-agent 结论现在降级为
+        # 本事件 data 里的 per_agent 分解。
+        coordination_event = await self._emit_agent_event(
+            root_event=root_event,
+            agent_id=ARBITER_ID,
+            event_type=COORDINATION_DECISION_EVENT_TYPE,
+            causal_parent=episode_parent,
+            data=result.event_data(),
+        )
+        for envelope in envelopes:
+            self._update_reasoning_step(envelope.agent_id, coordination_event.event_type)
+
+        # —— S3-T7 陈旧决策丢弃：仲裁之后、开命令之前的最后一问 ——
+        # 位置是有讲究的：放在这里，本 episode 自己的命令一条都还没落地，因此"设备版本变了"
+        # 只可能是**别人**改的（用户直控 / 另一条 episode / 仿真器），不会自己把自己判死。
+        stale_by_agent = await self._discard_stale_decisions(
+            root_event=root_event,
+            envelopes=envelopes,
+            result=result,
+            causal_parent=coordination_event.event_id,
+            observed_version=observed_version,
+        )
+
+        # 解析（并把仲裁门绑到）引擎持有的那台唯一 executor。
+        executor = await self._resolve_executor()
+
+        # —— 开仲裁窗口：每条胜出命令先出生成 proposed 并进在飞注册表 ——
+        # 出生与执行之间隔着若干次事件外发（await），一条用户直控可以在这段窗口里
+        # 把它取代掉（S1 把取代范围写成"同批内"，这里扩宽到仲裁窗口）。
+        opened: list[tuple[str, CommandRecord, str]] = []
+        for envelope in envelopes:
+            agent_id = envelope.agent_id
+            stale_devices = stale_by_agent.get(agent_id, frozenset())
+            # 被判陈旧的命令在这里就出局：execution_plan 里因此只剩真会执行的那些，
+            # "计划"与"落地"不再各说各话（丢了哪些、为什么，在上面那条
+            # reasoning.decision_discarded 里）。
+            approved = [
+                command
+                for command in result.approved_for(agent_id)
+                if command.device_id not in stale_devices
+            ]
+            execution_event = await self._emit_agent_event(
+                root_event=root_event,
+                agent_id=agent_id,
+                event_type="reasoning.execution_plan",
+                causal_parent=coordination_event.event_id,
+                data={
+                    "agent_id": agent_id,
+                    "agent_role": getattr(agent_by_id.get(agent_id), "role", ""),
+                    "execution_mode": envelope.mode,
+                    "commands": [command.as_proposal().model_dump() for command in approved],
+                    # 域 agent 的推理贡献（编排器在场时这里是它唯一的落点）。
+                    **self._agent_contribution_data(
+                        envelope,
+                        decision.task_for_agent(agent_id) if decision else None,
+                    ),
+                },
+            )
+            self._update_reasoning_step(agent_id, execution_event.event_type)
+
+            # 仲裁落败的命令绝不凭空消失：proposed→rejected，detail 带 §9.2 冲突分类。
+            for rejected in result.rejected_for(agent_id):
+                await self._reject_arbitration_loser(
+                    executor=executor,
+                    rejected=rejected,
+                    envelope=envelope,
+                    root_event=root_event,
+                    causal_parent=execution_event.event_id,
+                    publish=publishers[agent_id],
+                    tick=tick,
+                )
+
+            for command in approved:
+                record = await self.arbitration_gate.open(
+                    self._build_device_command(
+                        proposal=command.as_proposal(),
+                        source=self._command_source(envelope),
+                        root_event=root_event,
+                        causal_parent=execution_event.event_id,
+                        actor=agent_id,
+                        actor_name=envelope.agent_name,
+                    ),
+                    publish=publishers[agent_id],
+                    tick=tick,
+                )
+                opened.append((agent_id, record, command.reason))
+
+        # —— 执行：审计必修①，落地全部交给 CommandExecutor（六级校验 / 十态生命周期 /
+        # 失败事件 / effect 钩子都在那一条流水线里）。
+        last_actions = {envelope.agent_id: envelope.explanation for envelope in envelopes}
+        for agent_id, record, reason in opened:
             if self._is_stale_run(run_id):
-                # 本轮已落地的 delta 照常广播：它们是在 run 还有效时写进世界的既成事实，
-                # 丢掉它们只会让前端状态与世界永久错位。要丢的是**尚未落地**的产物。
+                await self._cancel_opened_commands(opened, tick=tick)
                 await self._broadcast_pending_deltas(pending_deltas)
                 await self._discard_stale_episode(
                     root_event=root_event,
@@ -802,103 +1211,204 @@ class AgentRuntime:
                     envelopes=envelopes,
                 )
                 return
-
-            agent_id = envelope.agent_id
-            winning_commands = result.winning_commands_by_agent.get(agent_id, [])
-            relevant_conflicts = [
-                conflict
-                for conflict in result.conflicts
-                if conflict.get("winner_agent_id") == agent_id or conflict.get("loser_agent_id") == agent_id
-            ]
-            outcome = "approved" if winning_commands else ("conflicted" if relevant_conflicts else "no_commands")
-
-            coordination_event = await self._emit_agent_event(
-                root_event=root_event,
-                agent_id=agent_id,
-                event_type="reasoning.coordination_decision",
-                causal_parent=causal_heads.get(agent_id, root_event.event_id),
-                data={
-                    "agent_id": agent_id,
-                    "outcome": outcome,
-                    "priority": envelope.priority,
-                    "conflicts": relevant_conflicts,
-                    "winning_commands": [command.model_dump() for command in winning_commands],
-                },
+            executed = await self.arbitration_gate.execute(
+                record, publish=publishers[agent_id], tick=tick
             )
-            causal_heads[agent_id] = coordination_event.event_id
-            self._update_reasoning_step(agent_id, coordination_event.event_type)
+            if executed.status is CommandStatus.SUCCEEDED and reason:
+                last_actions[agent_id] = reason
 
-            execution_event = await self._emit_agent_event(
-                root_event=root_event,
-                agent_id=agent_id,
-                event_type="reasoning.execution_plan",
-                causal_parent=coordination_event.event_id,
-                data={
-                    "agent_id": agent_id,
-                    "execution_mode": envelope.mode,
-                    "commands": [command.model_dump() for command in winning_commands],
-                },
-            )
-            causal_heads[agent_id] = execution_event.event_id
-            self._update_reasoning_step(agent_id, execution_event.event_type)
-
-            # 审计必修①：命令落地全部交给 CommandExecutor——六级校验、十态生命周期、
-            # 失败事件、房间光照 effect 都在那一条流水线里，runtime 不再自己 apply_action，
-            # 也不再有 `except KeyError: continue` 的静默吞失败。
-            command_source = (
-                CommandSource.RULE_FALLBACK
-                if envelope.mode == "fallback_rule_based"
-                else CommandSource.AGENT
-            )
-            # 唯一 executor 由引擎注入；per-agent 的 publish 包装按次传给 submit，
-            # 这样 _pending 注册表跨 agent、跨 episode 只有一份（S1 review finding-8）。
-            executor = await self._resolve_executor()
-            agent_publish = self._agent_publish_event(agent_id, pending_deltas)
-
-            # 仲裁 loser 不再凭空消失：走 proposed→rejected，带上冲突详情。
-            for proposal in envelope.candidate_commands:
-                if any(proposal is winner for winner in winning_commands):
-                    continue
-                await self._reject_losing_command(
-                    root_event=root_event,
-                    agent_id=agent_id,
-                    agent_name=envelope.agent_name,
-                    source=command_source,
-                    proposal=proposal,
-                    causal_parent=coordination_event.event_id,
-                    conflicts=relevant_conflicts,
-                )
-
-            last_action = envelope.explanation
-            for command in winning_commands:
-                record = await executor.submit(
-                    self._build_device_command(
-                        proposal=command,
-                        source=command_source,
-                        root_event=root_event,
-                        causal_parent=execution_event.event_id,
-                        actor=agent_id,
-                        actor_name=envelope.agent_name,
-                    ),
-                    tick=int(self.state_manager.world.simulation_tick),
-                    publish=agent_publish,
-                )
-                if record.status is CommandStatus.SUCCEEDED:
-                    last_action = command.reason or last_action
-
+        for envelope in envelopes:
             self._set_agent_complete(
-                agent_id=agent_id,
+                agent_id=envelope.agent_id,
                 envelope=envelope,
-                last_action=last_action,
+                last_action=last_actions.get(envelope.agent_id, envelope.explanation),
             )
 
         await self._broadcast_pending_deltas(pending_deltas)
 
-        for agent in agents:
+        # S3-T8：这条 episode 花了多少、有没有被预算挡下来，落进 run 成本工件。
+        self._persist_llm_cost(run_id, root_event.correlation_id)
+
+        # candidates ⊇ agents：被编排器判为"这一轮没你的事"的 agent 也要回到 idle，
+        # 否则它们会永远停在 thinking——面板上看起来像卡死。
+        for agent in candidates:
             if all(envelope.agent_id != agent.agent_id for envelope in envelopes):
                 self._set_agent_idle(agent.agent_id)
 
         await self._broadcast_agent_status()
+
+    # --- S3-T7 陈旧决策丢弃 / S3-T8 成本工件 --------------------------------
+
+    def _current_world_version(self) -> int | None:
+        """此刻的世界版本；没装 tracker（未绑定 runtime）时 None＝不做陈旧判定。"""
+
+        if self.state_manager is None:
+            return None
+        tracker = WorldVersionTracker.of(self.state_manager)
+        return tracker.version if tracker is not None else None
+
+    async def _discard_stale_decisions(
+        self,
+        *,
+        root_event: SimEvent,
+        envelopes: list[AgentDecisionEnvelope],
+        result: ArbiterResult,
+        causal_parent: str,
+        observed_version: int | None,
+    ) -> dict[str, frozenset[str]]:
+        """落地前比一次世界版本，命中就丢弃并留痕（evolution-review 风险 #2）。
+
+        LLM 一轮要 1-5 秒，世界不会停下来等它：决策据以推理的那台设备可能已经被用户直控
+        或另一条 episode 改过。此时照发下去，就是拿一份过期世界去改现在的世界，而事后没有
+        任何记录说明这次改动的前提早已不成立。
+
+        粒度是 **per-device**：环境每 tick 都在推进全局版本，用全局计数器判等于把所有决策
+        都判死。返回 ``{agent_id: 陈旧设备集合}``，调用方据此把那些命令挡在 executor 之外
+        （零状态改动）。
+        """
+
+        if observed_version is None or self.state_manager is None or self.publish_event is None:
+            return {}
+        tracker = WorldVersionTracker.of(self.state_manager)
+        if tracker is None:
+            return {}
+
+        stale_by_agent: dict[str, frozenset[str]] = {}
+        for envelope in envelopes:
+            approved = result.approved_for(envelope.agent_id)
+            if not approved:
+                continue
+            decision = VersionedDecision.at_version(
+                observed_version,
+                agent_id=envelope.agent_id,
+                commands=[command.as_proposal() for command in approved],
+                correlation_id=root_event.correlation_id,
+                root_event_id=causal_parent,
+            )
+            check = check_stale_decision(decision, tracker)
+            if not check.is_stale:
+                continue
+
+            event = build_stale_decision_event(
+                decision,
+                check,
+                root_event=root_event,
+                source=envelope.agent_id,
+                sim_time_s=root_event.sim_time_s,
+            )
+            # 时间戳与 wall_time 对齐 _emit_agent_event：build_stale_decision_event 是纯函数，
+            # 它拿不到"现在第几拍"。
+            event.timestamp = float(self.state_manager.world.simulation_tick)
+            event.wall_time = time.time()
+            published = await self.publish_event(event)
+            self.memory_store.remember(published, agent_id=envelope.agent_id)
+            log.warning(
+                "agent_decision_discarded_stale",
+                agent_id=envelope.agent_id,
+                correlation_id=root_event.correlation_id,
+                decided_at_version=check.decided_at_version,
+                current_version=check.current_version,
+                stale_device_ids=check.stale_device_ids,
+            )
+            stale_by_agent[envelope.agent_id] = frozenset(check.stale_device_ids)
+        return stale_by_agent
+
+    def _persist_llm_cost(self, run_id: str | None, correlation_id: str) -> None:
+        """把本 run 的 LLM 成本汇总落到 ``data/runs/{run_id}/llm_cost.json``。
+
+        只在这条 episode 真的动过收费口时写（发生过调用，或被预算挡下过）：mocked/回放/
+        disabled 跑法一次都不动，也就不该在 run 目录里凭空多出一份全零账单。
+        """
+
+        if not run_id:
+            return
+        episode = self.cost_guard.episode(correlation_id)
+        if not episode.calls and not episode.blocked_calls:
+            return
+        self.cost_guard.write_run_artifact(run_id)
+
+    async def _emit_orchestrator_prefix(
+        self,
+        root_event: SimEvent,
+        decision: OrchestrationDecision,
+    ) -> str:
+        """编排层的三环事件，返回域 agent 推理链应当挂靠的父事件 id。
+
+        ``reasoning.task_decomposition`` 的 data 是**结构化的 domain_tasks**，不是 LLM 散文
+        （审计 §六 那条坑的落点）；LLM 失败时额外发一条 ``reasoning.fallback_rule_based``，
+        让"这一轮是规则算出来的"在事件流里可见（§15 降级验收）。
+        """
+
+        context_view = decision.plan
+        # —— 前端冻结期兼容键（与 arbiter.event_data 同一套理由）——
+        # ObservabilityPanel 现在就在读 perception 的 world_summary/relevant_* 与
+        # task_decomposition 的 task_steps；S3-T6 把这两环从"每个 agent 一份"收敛成
+        # "编排器一份"之后，不补这几个键，面板会在 `data.task_steps.length` 上直接抛错
+        # （不是显示得难看，是整块空白）。S5 换渲染时再删。
+        # 注意它们是**结构化 domain_tasks 的投影**，不是回填 LLM 散文——审计那条坑
+        # （拆分环里装模型自由文本）的落点仍然是 domain_tasks。
+        scope_devices = sorted(
+            {device_id for task in context_view.domain_tasks for device_id in task.relevant_device_ids}
+        )
+        scope_rooms = sorted(
+            {room_id for task in context_view.domain_tasks for room_id in task.relevant_room_ids}
+        )
+        perception = await self._emit_agent_event(
+            root_event=root_event,
+            agent_id=self.orchestrator.orchestrator_id,
+            event_type="reasoning.perception_snapshot",
+            causal_parent=root_event.event_id,
+            data={
+                "orchestrator_id": context_view.orchestrator_id,
+                "trigger_event_type": root_event.event_type,
+                "search_space_device_types": list(decision.rule_intent.device_types),
+                "search_space_resolved_from": decision.rule_intent.resolved_from,
+                "default_policy": decision.rule_intent.default_policy,
+                # 兼容键
+                "world_summary": (
+                    f"{root_event.event_type} → 搜索空间 {len(scope_devices)} 台设备 / "
+                    f"{len(scope_rooms)} 个房间（{decision.rule_intent.resolved_from}）"
+                ),
+                "relevant_devices": scope_devices,
+                "relevant_rooms": scope_rooms,
+            },
+        )
+        intent_event = await self._emit_agent_event(
+            root_event=root_event,
+            agent_id=self.orchestrator.orchestrator_id,
+            event_type="reasoning.intent_recognized",
+            causal_parent=perception.event_id,
+            data=decision.intent_event_data(),
+        )
+        decomposition_data = decision.task_decomposition_event_data()
+        decomposition_data["task_steps"] = [
+            f"{task.agent_role}: {task.task}" for task in context_view.domain_tasks
+        ]
+        decomposition = await self._emit_agent_event(
+            root_event=root_event,
+            agent_id=self.orchestrator.orchestrator_id,
+            event_type="reasoning.task_decomposition",
+            causal_parent=intent_event.event_id,
+            data=decomposition_data,
+        )
+        parent_id = decomposition.event_id
+
+        if decision.plan.fallback_reason:
+            fallback = await self._emit_agent_event(
+                root_event=root_event,
+                agent_id=self.orchestrator.orchestrator_id,
+                event_type="reasoning.fallback_rule_based",
+                causal_parent=decomposition.event_id,
+                data={
+                    "orchestrator_id": context_view.orchestrator_id,
+                    "reason": decision.plan.fallback_reason,
+                    "failed_step": "intent_classification",
+                    "fallback_strategy": "rule_based",
+                },
+            )
+            parent_id = fallback.event_id
+
+        return parent_id
 
     async def _broadcast_pending_deltas(self, pending_deltas: list[DeltaChange]) -> None:
         """把本 episode 已落地的 delta 一次性广播（保持"一 episode 一条 STATE_DELTA"口径）。"""
@@ -988,14 +1498,20 @@ class AgentRuntime:
         root_event: SimEvent,
         snapshot: WorldState,
         agent: BaseAgent,
+        domain_task: DomainTask | None = None,
     ) -> AgentDecisionEnvelope | None:
+        # S3-T8：每条 episode 现套一层预算收费口。超预算时它抛
+        # LLMProviderError(budget_exceeded)，被下面既有的 except 接住 → 规则回退，
+        # fallback_reason 就是 budget_exceeded（"预算在哪一步咬下去"因此可数）。
+        episode_provider = self._episode_llm_provider(root_event.correlation_id)
         try:
             if self.episode_timeout_ms is None:
                 return await agent.handle_event(
                     root_event=root_event,
                     world_state=snapshot,
                     memory_store=self.memory_store,
-                    llm_provider=self.llm_provider,
+                    llm_provider=episode_provider,
+                    domain_task=domain_task,
                 )
 
             return await asyncio.wait_for(
@@ -1003,7 +1519,8 @@ class AgentRuntime:
                     root_event=root_event,
                     world_state=snapshot,
                     memory_store=self.memory_store,
-                    llm_provider=self.llm_provider,
+                    llm_provider=episode_provider,
+                    domain_task=domain_task,
                 ),
                 timeout=self.episode_timeout_ms / 1000,
             )
@@ -1082,12 +1599,79 @@ class AgentRuntime:
             raw_output_preview=raw_output_preview,
         )
 
+    @staticmethod
+    def _agent_contribution_data(
+        envelope: AgentDecisionEnvelope,
+        domain_task: DomainTask | None,
+    ) -> dict[str, Any]:
+        """域 agent 在 ``reasoning.execution_plan`` 上的推理贡献（§4.3 六环合并后的落点）。
+
+        编排器接管前三环之后，域 agent 自己的感知与意图不再单独成环——但它们**不能消失**：
+        "这个 agent 看到了什么、打算干什么、有多确信、是不是降级算出来的"正是可观测性
+        面板要展示的东西。这些字段因此原样搬到执行环上，键名与旧的 per-agent 事件保持一致
+        （``world_summary`` / ``relevant_devices`` / ``relevant_rooms`` 收进 ``perception``
+        子对象，避免和执行环自己的 ``commands`` 混在一层）。
+        """
+
+        return {
+            "intent": envelope.intent,
+            "confidence": envelope.confidence,
+            "explanation": envelope.explanation,
+            "provider": envelope.provider_name,
+            "model": envelope.model,
+            "latency_ms": envelope.latency_ms,
+            "task_steps": list(envelope.task_steps),
+            "fallback_reason": envelope.fallback_reason,
+            "perception": {
+                "trigger_event_type": envelope.trigger_event_type,
+                "world_summary": envelope.world_summary,
+                "relevant_devices": list(envelope.relevant_devices),
+                "relevant_rooms": list(envelope.relevant_rooms),
+            },
+            # 编排器派给它的那件事：没有这个字段就答不出"这条执行计划是谁点的名"。
+            "domain_task": domain_task.model_dump(mode="json") if domain_task is not None else None,
+        }
+
+    async def _emit_agent_fallback(
+        self,
+        root_event: SimEvent,
+        envelope: AgentDecisionEnvelope,
+        causal_parent: str,
+    ) -> None:
+        """域 agent 的降级环（§4.3 ``reasoning.fallback_rule_based``）。
+
+        编排器在场时这是域 agent 唯一自己发的推理事件：降级发生在仲裁**之前**，
+        挪进执行环补记就读不出"哪一步失败了才转的规则"。非降级 episode 不发。
+        """
+
+        if envelope.mode != "fallback_rule_based":
+            return
+        event = await self._emit_agent_event(
+            root_event=root_event,
+            agent_id=envelope.agent_id,
+            event_type="reasoning.fallback_rule_based",
+            causal_parent=causal_parent,
+            data={
+                "agent_id": envelope.agent_id,
+                "reason": envelope.fallback_reason,
+                "failed_step": envelope.failed_step or "intent_generation",
+                "fallback_strategy": "rule_based",
+            },
+        )
+        self._update_reasoning_step(envelope.agent_id, event.event_type)
+
     async def _emit_reasoning_prefix(
         self,
         root_event: SimEvent,
         envelope: AgentDecisionEnvelope,
         causal_parent: str,
     ) -> str:
+        """域 agent 自己的前三环 —— **只在编排器关闭时**走这条路。
+
+        编排器开着的时候，前三环由 ``_emit_orchestrator_prefix`` 拥有（S3-T6：一条根事件
+        一棵 episode 树），本方法不参与。
+        """
+
         perception_event = await self._emit_agent_event(
             root_event=root_event,
             agent_id=envelope.agent_id,
@@ -1207,62 +1791,104 @@ class AgentRuntime:
 
         return publish
 
-    async def _reject_losing_command(
+    async def _reject_arbitration_loser(
         self,
         *,
+        executor: CommandExecutor,
+        rejected: RejectedCommand,
+        envelope: AgentDecisionEnvelope,
         root_event: SimEvent,
-        agent_id: str,
-        agent_name: str | None = None,
-        source: CommandSource,
-        proposal: AgentCommandProposal,
         causal_parent: str,
-        conflicts: list[dict[str, Any]],
+        publish: PublishEvent,
+        tick: int,
     ) -> CommandRecord:
-        """仲裁落败的提案：proposed→rejected，detail 记冲突详情。
+        """一条仲裁落败命令的收口：``proposed → rejected`` + （若适用）§10.2 失败上报。
 
-        §10.2 十码词表里没有"仲裁落败"这一类（那是执行前的协作结果而非执行失败），
-        因此这里只写 detail 不写 failure_code，避免在校验层词表外私自造码。
+        两层词表在这里刻意**同时**出现，而且各归各的所有者：
+
+        * ``detail`` 写 §9.2 冲突分类——"为什么没被选中"是协作层的问题；
+        * ``failure_code`` 与 ``device.command_failed`` 走 §10.2 词表，且失败码由
+          ``validation.py`` 现算——"这条命令本来也执行不了"是执行层的判断。
+
+        少了第二层，S0-4 那条奇偶护栏（同一条坏命令在 agent 腿与 UI 腿必须拿到相同错误码）
+        就会在"仲裁抢先否掉"的路径上悄悄失效：UI 腿不受单边拒绝约束，照常拿到
+        ``unknown_device``，agent 腿却只剩一句"仲裁落败"。
         """
 
-        conflict = next(
-            (
-                item
-                for item in conflicts
-                if item.get("loser_agent_id") == agent_id
-                and item.get("device_id") == proposal.device_id
-                and item.get("property") == proposal.property
-            ),
-            None,
+        command = self._build_device_command(
+            proposal=rejected.as_proposal(),
+            source=self._command_source(envelope),
+            root_event=root_event,
+            causal_parent=causal_parent,
+            actor=rejected.agent_id,
+            actor_name=envelope.agent_name,
         )
-        detail = (
-            f"仲裁落败：{conflict['winner_agent_id']}（{conflict['winner_priority']}）"
-            f"占用 {proposal.device_id}.{proposal.property}"
-            if conflict is not None
-            else f"仲裁未采纳 {proposal.device_id}.{proposal.property}"
+        detail = f"仲裁落败（{rejected.conflict_class.value}）：{rejected.rejection_reason}"
+        failure = (
+            validate_command(
+                self.state_manager.world,
+                command.device_id,
+                command.capability,
+                command.value,
+                policy=executor.policy,
+            )
+            if self.state_manager is not None
+            else None
         )
         log.warning(
             "agent_command_rejected",
-            agent_id=agent_id,
-            device_id=proposal.device_id,
-            property=proposal.property,
-            reason=detail,
+            agent_id=rejected.agent_id,
+            device_id=command.device_id,
+            capability=command.capability,
+            conflict_class=rejected.conflict_class.value,
+            failure_code=failure.code.value if failure is not None else None,
         )
-
-        tick = int(self.state_manager.world.simulation_tick) if self.state_manager else 0
-        record = await CommandRecord.propose(
-            self._build_device_command(
-                proposal=proposal,
-                source=source,
-                root_event=root_event,
-                causal_parent=causal_parent,
-                actor=agent_id,
-                actor_name=agent_name,
-            ),
-            self._agent_publish_event(agent_id, []),
+        record = await self.arbitration_gate.reject(
+            command,
+            publish=publish,
+            detail=detail,
+            failure_code=failure.code.value if failure is not None else None,
             tick=tick,
         )
-        await record.transition(CommandStatus.REJECTED, detail=detail, tick=tick)
+        if failure is not None:
+            await executor.report_command_failed(
+                command,
+                error_code=failure.code.value,
+                reason=failure.message,
+                causal_parent=causal_parent,
+                tick=tick,
+                publish=publish,
+            )
         return record
+
+    @staticmethod
+    def _command_source(envelope: AgentDecisionEnvelope) -> CommandSource:
+        """命令来源：规则回退与 LLM 决策在审计口径上必须分得开。"""
+
+        return (
+            CommandSource.RULE_FALLBACK
+            if envelope.mode == "fallback_rule_based"
+            else CommandSource.AGENT
+        )
+
+    async def _cancel_opened_commands(
+        self, opened: list[tuple[str, CommandRecord, str]], *, tick: int | None = None
+    ) -> None:
+        """episode 中途判定 stale 时，收掉还停在仲裁窗口里的 proposed 记录。
+
+        不收的话它们会以非终态永远留在 executor 的在飞注册表里：下一条同控制点的合法
+        命令会发出一条它其实没经历过的 superseded，而这条命令自己的生命周期永远没有收尾
+        ——正是 S1 全程根治的那类静默失败。
+        """
+
+        for _, record, _reason in opened:
+            if not record.is_terminal and CommandStatus.CANCELLED in LEGAL_TRANSITIONS[record.status]:
+                await record.transition(
+                    CommandStatus.CANCELLED, detail=STALE_RUN_DISCARD_REASON, tick=tick
+                )
+            # 注册表与仲裁窗口都要清干净：终态记录留在里面会让下一条同控制点命令
+            # 发出一条它其实没经历过的 superseded。
+            self.arbitration_gate.discard(record)
 
     async def _emit_agent_event(
         self,

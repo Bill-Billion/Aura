@@ -27,13 +27,20 @@ from backend.scenarios.generator import scenario_timeline_device_entries
 from backend.scenarios.loader import load_library
 from backend.scenarios.runner import run_scenario
 
-# §6.1-6.9 的八个典型场景（§6.10 多用户冲突按计划留给 S3 自带的 multi_user_conflict.yaml）。
+# §6.1-6.10 的九个典型场景。前八个是 S2-T8 落地的 §6.1-6.9；
+# ``multi_user_conflict``（§6.10）由 S3-T10 补上——S2-T8 当时刻意留给 S3，因为它是
+# S3 阶段门的头号场景（仲裁必须真的选边并解释，见 tests/test_multi_user_conflict.py）。
+# ``safety_smoke_kitchen`` 不属于 §6，它是 §13「safety event interrupts comfort or
+# energy-saving behavior」的库内落点：S3 复审实测九个 §6 场景一次都没产出过 safety 档提案，
+# §9.1 的最高档因此只被合成夹具走过（见 tests/test_episode_completeness.py 的档位生产者门）。
 CANONICAL_SCENARIO_IDS = (
     "cooking_dinner",              # §6.5
     "device_offline_fallback",     # §6.9
     "hot_weather_afternoon",       # §6.6
     "morning_wake_up",             # §6.4
+    "multi_user_conflict",         # §6.10（S3-T10）
     "night_sleep_bedtime",         # §6.3
+    "safety_smoke_kitchen",        # §13 安全打断（S3 复审 minor）
     "security_presence_night",     # §6.8
     "user_arrives_home_evening",   # §6.1
     "user_leaves_home_morning",    # §6.2
@@ -46,7 +53,9 @@ SCENARIO_SIGNATURE_ROOT_EVENT = {
     "device_offline_fallback": "device.offline",
     "hot_weather_afternoon": "environment.temperature_threshold",
     "morning_wake_up": "user.starts_activity",
+    "multi_user_conflict": "user.starts_activity",
     "night_sleep_bedtime": "user.starts_activity",
+    "safety_smoke_kitchen": "safety.smoke_detected",
     "security_presence_night": "security.presence_detected",
     "user_arrives_home_evening": "user.arrives_home",
     "user_leaves_home_morning": "user.leaves_home",
@@ -69,7 +78,7 @@ def library_client():
 # ----------------------------------------------------------------- 1. 形状
 
 
-def test_library_contains_exactly_the_eight_canonical_scenarios():
+def test_library_contains_exactly_the_canonical_scenarios():
     library = load_library()
     assert tuple(library) == CANONICAL_SCENARIO_IDS
 
@@ -194,11 +203,11 @@ def test_expected_failure_device_ids_are_registry_checked():
 # ----------------------------------------------------------------- 2. 枚举
 
 
-def test_api_scenarios_enumerates_exactly_the_eight(library_client):
+def test_api_scenarios_enumerates_exactly_the_canonical_library(library_client):
     resp = library_client.get("/api/scenarios")
     assert resp.status_code == 200
     payload = resp.json()
-    assert payload["count"] == 8
+    assert payload["count"] == len(CANONICAL_SCENARIO_IDS) == 10
     assert [item["id"] for item in payload["scenarios"]] == list(CANONICAL_SCENARIO_IDS)
     # §2.3：枚举投影不得泄露 ground truth 本体
     assert all("ground_truth" not in item for item in payload["scenarios"])

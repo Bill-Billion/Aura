@@ -103,10 +103,10 @@ def test_missing_provider_is_recorded_as_mocked_mode():
     manager = RunManager()
     metadata = manager.start_run(world=_make_world())
 
-    # §11.1：每份 run 工件都必须标注 LLM 模式；没有 provider 就是 mocked（规则回退路径）。
-    assert metadata.llm_mode is LLMMode.MOCKED
+    # §11.1：每份 run 工件都必须标注 LLM 模式；没有 provider 就是 rule_based（规则回退路径）。
+    assert metadata.llm_mode is LLMMode.RULE_BASED
     assert metadata.llm_provider == "disabled"
-    assert resolve_llm_mode(None) is LLMMode.MOCKED
+    assert resolve_llm_mode(None) is LLMMode.RULE_BASED
 
 
 # ---------------------------------------------------------------------------

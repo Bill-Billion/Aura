@@ -15,6 +15,20 @@ from backend.api.routes import (
     get_scenario_dirs,
     router as api_router,
 )
+from backend.agents.arbiter import (
+    ARBITER_ID,
+    COORDINATION_DECISION_EVENT_TYPE,
+    UI_ACTOR_ID,
+    ArbitrationGate,
+)
+from backend.agents.contracts import AgentProposal, PriorityLevel
+from backend.agents.llm_modes import llm_mode_health
+from backend.agents.scene import (
+    SCENE_APPLY_MESSAGE_TYPE,
+    SceneApplyPayload,
+    get_scene_definitions,
+)
+from backend.agents.types import AgentCommandProposal
 from backend.api.ws import ConnectionManager
 from backend.config.device_registry import (
     build_default_devices,
@@ -63,6 +77,7 @@ load_local_env()
 WS_ERROR_MALFORMED_MESSAGE = "malformed_message"
 WS_ERROR_INVALID_PAYLOAD = "invalid_payload"
 WS_ERROR_INVALID_DEVICE_COMMAND = "invalid_device_command"
+WS_ERROR_UNKNOWN_SCENE = "unknown_scene"
 WS_ERROR_UNSUPPORTED_MESSAGE_TYPE = "unsupported_message_type"
 WS_ERROR_INTERNAL = "internal_error"
 
@@ -121,18 +136,21 @@ def _simulation_health() -> dict[str, object]:
 
 
 def _llm_health() -> dict[str, object]:
+    """§11.1：健康检查必须回答"这台实例现在跑的是哪种模式"。
+
+    ``mode`` / ``benchmark_safe``（以及 replay 时的 ``recordings_path``）由
+    :func:`llm_mode_health` 提供，与启动日志、run 工件同一份判据——
+    只报 provider/model/configured 的话，研究者无法从运行中的实例上区分
+    live / mocked / recorded / rule_based，而这正是模式系统存在的理由
+    （DECISION #7：只有非 live 的模式能拿去做 benchmark 声明）。
+    """
+
     if simulation_engine is None:
-        return {
-            "provider": "disabled",
-            "model": "rule_based",
-            "configured": False,
-        }
+        return {**llm_mode_health(None), "configured": False}
 
     runtime = simulation_engine.agent_runtime
-    provider = runtime.llm_provider
     return {
-        "provider": getattr(provider, "provider_name", "disabled"),
-        "model": getattr(provider, "model", "rule_based"),
+        **llm_mode_health(runtime.llm_provider),
         "configured": runtime.is_provider_configured,
     }
 
@@ -174,6 +192,19 @@ def _resolve_command_executor() -> CommandExecutor:
     if simulation_engine is not None:
         return simulation_engine.command_executor
     return CommandExecutor(state_manager)
+
+
+def _resolve_arbitration_gate() -> ArbitrationGate:
+    """取 runtime 持有的那台仲裁门（UI 腿与 agent 腿必须共用同一台）。
+
+    共用是硬要求：用户占用登记在这台门上，agent episode 的仲裁又从这台门读占用。
+    各持一台的话，"用户覆盖 agent" 会重新退回审计里那种名义状态——两边根本看不见对方。
+    引擎没起来（lifespan 之外的兜底路径）才临时造一台。
+    """
+
+    if simulation_engine is not None:
+        return simulation_engine.agent_runtime.arbitration_gate
+    return ArbitrationGate()
 
 
 def _ui_command_targets(payload: CmdDeviceControlPayload) -> list[tuple[str, Any]]:
@@ -452,22 +483,71 @@ async def _handle_device_control(ws: WebSocket, raw_payload: dict) -> None:
     collected: list[DeltaChange] = []
     # 共用引擎那台 executor；本次调用的 publish 包装按次传入（delta 聚合仍是每条消息一份）。
     executor = _resolve_command_executor()
+    gate = _resolve_arbitration_gate()
+    gate.bind(executor)
+    publish = _collecting_publish(collected)
+
+    # —— 用户命令进仲裁（S3-T5）——————————————————————————————————
+    # 审计 §六：过去 main.py 直接落地 UI 命令、runtime 又显式跳过 CMD_DEVICE_CONTROL，
+    # 于是 §9.1 的 explicit_user 档从来没被走过——"用户覆盖 agent"只是名义上的。
+    # 现在 UI 命令以 explicit_user 档进同一台仲裁器，并发出与 agent episode 同格式的
+    # 一条 reasoning.coordination_decision。
+    #
+    # 按 decision #4，它**不**触发一轮完整 agent 推理（即时反馈延迟不能被 LLM 拖长）：
+    # 仲裁在这里是同步纯函数，只多一条事件。
+    user_proposal = AgentProposal(
+        agent_id=UI_ACTOR_ID,
+        agent_role="user",
+        intent=f"user {payload.action or payload.property or 'command'}",
+        priority=PriorityLevel.EXPLICIT_USER,
+        confidence=1.0,
+        commands=[
+            AgentCommandProposal(
+                device_id=payload.device_id,
+                property=capability if capability == "power" else f"extra.{capability}",
+                value=value,
+                reason=f"ui {payload.action or payload.property or 'command'}",
+            )
+            for capability, value in targets
+        ],
+    )
+    arbitration = gate.arbiter.resolve(
+        [user_proposal],
+        root_event,
+        state_manager.world,
+        user_claims=gate.claims_since(float(root_event.wall_time or 0.0)),
+    )
+    coordination_event = await publish(
+        SimEvent(
+            event_type=COORDINATION_DECISION_EVENT_TYPE,
+            source=ARBITER_ID,
+            timestamp=float(tick),
+            wall_time=time.time(),
+            correlation_id=root_event.correlation_id,
+            causal_parent=root_event.event_id,
+            priority=2,
+            data=arbitration.event_data(),
+        )
+    )
+
     commands = [
         DeviceCommand(
             source=CommandSource.UI,
-            device_id=payload.device_id,
-            capability=capability,
-            value=value,
-            reason=f"ui {payload.action or payload.property or 'command'}",
+            device_id=approved.device_id,
+            capability=approved.capability,
+            value=approved.value,
+            reason=approved.reason,
             correlation_id=root_event.correlation_id,
-            causal_parent=root_event.event_id,
+            causal_parent=coordination_event.event_id,
             issued_tick=tick,
             priority=2,
         )
-        for capability, value in targets
+        for approved in arbitration.approved_commands
     ]
+    # pre_submit 是 S1 预留的那个接缝（出厂 no-op）；仲裁门在这里登记 explicit_user 占用，
+    # 并点名要取代的在飞目标——包括还停在仲裁窗口里等批准的 agent 命令。
     records = await executor.submit_batch(
-        commands, tick=tick, publish=_collecting_publish(collected)
+        commands, tick=tick, publish=publish, pre_submit=gate.pre_submit
     )
 
     if collected:
@@ -476,6 +556,22 @@ async def _handle_device_control(ws: WebSocket, raw_payload: dict) -> None:
                 type="STATE_DELTA",
                 payload={"deltas": [delta.model_dump() for delta in collected]},
             )
+        )
+
+    # 被仲裁否掉的用户命令**不会**静默消失。今天 explicit_user 档豁免全部单边拒绝、
+    # 同一提案者内部也不判互斥，因此这条分支正常跑不到；留着是因为"命令没执行却什么都
+    # 不说"正是 S1 全程根治的那类缺陷——将来若新增一条对用户也生效的仲裁规则，
+    # 用户会立刻收到解释，而不是面对一个没反应的开关。
+    for rejected in arbitration.rejected_commands:
+        await _send_ws_error(
+            ws,
+            WS_ERROR_INVALID_DEVICE_COMMAND,
+            rejected.rejection_reason,
+            details={
+                "device_id": rejected.device_id,
+                "capability": rejected.capability,
+                "conflict_class": rejected.conflict_class.value,
+            },
         )
 
     for record in records:
@@ -493,6 +589,84 @@ async def _handle_device_control(ws: WebSocket, raw_payload: dict) -> None:
                 "status": record.status.value,
             },
         )
+
+
+async def _handle_scene_apply(ws: WebSocket, raw_payload: dict) -> None:
+    """CMD_SCENE_APPLY：一条消息 = 一次场景切换（S3-T4 的前门）。
+
+    被推翻的现状：SceneSelector.vue 在浏览器里循环发 2×N 条 ``CMD_DEVICE_CONTROL``。
+    后端因此**看不见**"这是一次场景切换"——事件流里只有 N 条互不相干的直控，可观测性
+    面板拼不出一条完整因果链，而"看得见 Agent 的推理链路"正是这个平台的产品本身。
+    场景语义同时被锁在 .vue 的 switch 里：headless 脚本与 S4 评估器复用不了，命令也
+    绕过编排与仲裁，§9 的优先级全序对场景完全不生效。
+
+    这里**只做翻译**：消息 → 一条带 ``scene_id`` 的 ``user.command`` 根事件。展开成哪些
+    设备命令是 :class:`~backend.agents.scene.SceneAgent` 的事（§9.1 ambience 档），随后
+    与其他 agent 走同一条编排 → 仲裁 → CommandExecutor 的腿。所以本函数**不**碰
+    executor、也不自己 apply——那正是它要取代的形态。
+
+    与 :func:`_handle_device_control` 的两处刻意不同：
+
+    - **不同步执行**。直控要求即时反馈，故那条路径同步跑完仲裁与 executor；场景是一轮
+      真正的 agent episode（可能带 LLM），由 runtime 在后台跑完并自行广播事件与增量。
+    - **不占 explicit_user 档**。场景是一整套氛围预设，理应让位于安全/安防/舒适；
+      "用户点名某台设备"才是 explicit_user（见 SceneAgent.proposal_priority）。
+
+    未知 ``scene_id`` 当场回 ERROR，而不是放一条只会 no-op 的 episode 出去：点错场景的
+    人应该立刻知道，而不是盯着一个没反应的按钮去翻事件流。
+    """
+
+    assert state_manager is not None
+
+    try:
+        payload = SceneApplyPayload.model_validate(raw_payload)
+    except ValidationError as exc:
+        await _send_ws_error(
+            ws,
+            WS_ERROR_INVALID_PAYLOAD,
+            "场景应用载荷结构非法",
+            details={
+                "issues": [
+                    f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}"
+                    for error in exc.errors()
+                ]
+            },
+        )
+        return
+
+    library = get_scene_definitions()
+    if library.get(payload.scene_id) is None:
+        await _send_ws_error(
+            ws,
+            WS_ERROR_UNKNOWN_SCENE,
+            f"未知场景 id '{payload.scene_id}'",
+            details={
+                "scene_id": payload.scene_id,
+                # 点名已知场景：拼错一个 id 的人不必去翻后端 YAML 才知道有哪些。
+                "known_scenes": sorted(library.scenes),
+            },
+        )
+        return
+
+    tick = int(state_manager.world.simulation_tick)
+    root_event = event_bus.coerce_event(
+        SimEvent(
+            event_type="user.command",
+            source="user_ui",
+            timestamp=float(tick),
+            wall_time=time.time(),
+            priority=2,
+            data={
+                "message_type": SCENE_APPLY_MESSAGE_TYPE,
+                "scene_id": payload.scene_id,
+            },
+        )
+    )
+    # 盖章 → 广播 → 入总线，三步的理由与 _handle_device_control 处完全相同：
+    # 根事件必须是这次切换外发的第一条 WS 消息，且带着 seq（S5 按 seq 排因果树）。
+    event_bus.stamp(root_event)
+    await manager.broadcast(WSMessage(type="SIM_EVENT", payload=root_event.model_dump()))
+    await event_bus.publish(root_event)
 
 
 async def _handle_run_scenario(ws: WebSocket, raw_payload: dict) -> None:
@@ -546,6 +720,9 @@ async def _handle_ws_message(ws: WebSocket, raw: Any) -> None:
 
     if msg_type == "CMD_DEVICE_CONTROL":
         await _handle_device_control(ws, payload)
+
+    elif msg_type == SCENE_APPLY_MESSAGE_TYPE:
+        await _handle_scene_apply(ws, payload)
 
     elif msg_type == "CMD_RUN_SCENARIO":
         await _handle_run_scenario(ws, payload)

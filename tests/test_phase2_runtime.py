@@ -263,7 +263,9 @@ async def test_runtime_evaluates_agents_concurrently():
 
     while True:
         event_types = [event["event_type"] for event in _sim_events_from(engine)]
-        if event_types.count("reasoning.task_decomposition") >= 2:
+        # S3-T6 之后 task_decomposition 每 episode 只有一条（编排器独有），
+        # per-agent 的那一环是 reasoning.execution_plan——并发证据看它。
+        if event_types.count("reasoning.execution_plan") >= 2:
             break
         await asyncio.sleep(0.01)
 

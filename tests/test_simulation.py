@@ -9,7 +9,7 @@ import pytest
 
 from backend.agents.hvac import HVACAgent
 from backend.agents.lighting import LightingAgent
-from backend.agents.runtime import AgentRuntime
+from backend.agents.runtime import AgentRuntime, build_default_agents
 from backend.api.ws import ConnectionManager
 from backend.engine.event_bus import EventBus, SimEvent
 from backend.engine.simulation import SimulationEngine
@@ -160,9 +160,17 @@ class TestAgentRuntime:
 
 class TestSimulationEngine:
     def test_engine_init(self):
-        """Verify the engine initializes with 2 agents registered."""
+        """引擎起来时注册 §8.2 的五个域 agent，且**顺序**与默认注册表一致。
+
+        顺序不是风格问题：它同时决定 ``TaskPlan.domain_tasks`` 序与 canonical trace
+        行序（S2-T9 字节一致性门）。唯一真相在 ``runtime.DEFAULT_AGENT_FACTORIES``，
+        这里断言引擎确实用了它。
+        """
+
         engine = _make_engine()
-        assert len(engine.agent_runtime.agents) == 2
+        assert [agent.agent_id for agent in engine.agent_runtime.agents] == [
+            agent.agent_id for agent in build_default_agents()
+        ]
         assert isinstance(engine.agent_runtime.agents[0], LightingAgent)
         assert isinstance(engine.agent_runtime.agents[1], HVACAgent)
         assert engine.is_running is False

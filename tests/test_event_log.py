@@ -217,7 +217,7 @@ async def test_run_json_carries_all_spec11_fields():
     missing = [field for field in SPEC11_REQUIRED_FIELDS if field not in metadata]
     assert missing == [], f"run.json 缺 §11 字段: {missing}"
     # §11.1：每份 run 工件都必须标注用的是哪种 LLM 决定性模式。
-    assert metadata["llm_mode"] in {"mocked", "recorded", "live"}
+    assert metadata["llm_mode"] in {"mocked", "recorded", "live", "rule_based"}
     assert len(metadata["initial_state_hash"]) == 64
     assert (run_dir(run_id) / RUN_METADATA_FILENAME).exists()
 

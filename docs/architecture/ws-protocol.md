@@ -2,7 +2,7 @@
 
 Author: Bill Billion  
 Date: 2026-04-22  
-Updated: 2026-07-21（S2：`CMD_RUN_SCENARIO` 场景启动、场景启动失败码、`SIMULATION_STATUS` 带 run 归属）
+Updated: 2026-07-21（S3：`CMD_SCENE_APPLY` 场景切换前门与 `unknown_scene` 失败码；S2：`CMD_RUN_SCENARIO` 场景启动、场景启动失败码、`SIMULATION_STATUS` 带 run 归属）
 
 这份文档定义 SmartHomeSim 当前对外开放的 WebSocket 命令、服务端消息、结构化事件类型和错误格式。当前阶段已经进入 Phase 2，所以除了 Phase 1 的世界状态同步消息，还会通过 `SIM_EVENT` 实时外发 `reasoning.*` 事件。S1 之后，所有设备变更（UI / Agent / 场景脚本 / 规则降级四来源）都走同一台 `CommandExecutor`，因此 `SIM_EVENT` 里还会看到 `command.lifecycle`、`device.command_failed`、`system.invariant_violation` 三类新事件。
 
@@ -14,7 +14,7 @@ WebSocket 入口固定为 `/ws/simulation`。
 
 ## 客户端命令
 
-当前开放的命令有七类：
+当前开放的命令有八类：
 
 - `CMD_SIM_START`
 - `CMD_SIM_PAUSE`
@@ -22,6 +22,7 @@ WebSocket 入口固定为 `/ws/simulation`。
 - `CMD_SIM_MODE`
 - `CMD_SIM_SPEED`
 - `CMD_DEVICE_CONTROL`
+- `CMD_SCENE_APPLY`
 - `CMD_RUN_SCENARIO`
 
 命令信封格式统一如下：
@@ -41,6 +42,26 @@ WebSocket 入口固定为 `/ws/simulation`。
 
 - 新格式：`device_id + action + params`
 - 兼容格式：`device_id + property + value`
+
+### `CMD_SCENE_APPLY`（S3）
+
+一条消息 = 一次场景切换。**取代**过去前端按场景循环发 2×N 条 `CMD_DEVICE_CONTROL` 的做法：那种做法下后端看不见"这是一次场景切换"，事件流里只有 N 条互不相干的直控，可观测性面板拼不出一条完整因果链；场景语义也只存在于 `.vue` 里，headless 脚本与评估器复用不了。
+
+```json
+{
+  "type": "CMD_SCENE_APPLY",
+  "payload": {
+    "scene_id": "away"
+  }
+}
+```
+
+- `scene_id` 必填非空，取值来自 `backend/config/scene_definitions.yaml`（当前：`reading` / `entertainment` / `away` / `sleep` / `home` / `wake` / `cooking`）
+- 服务端只做**翻译**：结构守卫 → 一条带 `data.scene_id` 的 `user.command` 根事件（`data.message_type = "CMD_SCENE_APPLY"`，与直控同形），先 `stamp` 盖章、先广播、再入总线
+- 场景展开成哪些设备命令由 `SceneAgent` 按场景表决定，随后与其他 agent 走**同一条**编排 → 仲裁 → `CommandExecutor` 的腿：所以一次点击会看到一条 `reasoning.coordination_decision` 和若干 `command.lifecycle`，全部挂在同一个 `correlation_id` 下
+- 场景在 §9.1 全序里是 `ambience` 档，**不是** `explicit_user`：整套氛围预设理应让位于安全 / 安防 / 舒适；"用户点名某台设备"才是 `explicit_user`（那条腿仍是 `CMD_DEVICE_CONTROL`）
+- 与直控的另一处不同：本命令**不同步返回执行结果**。它开的是一轮真正的 agent episode，结果按事件流陆续出来（`SIM_EVENT` + `STATE_DELTA`），成功时不额外回确认消息
+- 未知 `scene_id` 当场回一条 `ERROR`（`code = unknown_scene`，`details.known_scenes` 列出已知场景），不会开出一条只会 no-op 的 episode
 
 ### `CMD_RUN_SCENARIO`（S2）
 
@@ -187,7 +208,7 @@ REST 等价入口是 `POST /api/runs`（载荷同形，成功返回 `201` + `{"r
 
 - `system.timer_tick` 和 `environment.state_refresh` 继续实时外发
 - 每条 `SimEvent` 都带 `run_id` / `scenario_id`：一条事件属于哪次实验，从事件本身就能读出来（§18 Q1）。匿名 run 的 `scenario_id` 为 `null`
-- 每条外发的 `SimEvent` 都带 `seq`（run 内单调发布序号），**包括 `CMD_DEVICE_CONTROL` 的根 `user.command`**：它在广播前先经 `EventBus.stamp()` 盖章，因此 WS 副本与 `events.jsonl` 副本同号，前端可以直接按 `seq` 排因果树
+- 每条外发的 `SimEvent` 都带 `seq`（run 内单调发布序号），**包括 `CMD_DEVICE_CONTROL` / `CMD_SCENE_APPLY` 的根 `user.command`**：它在广播前先经 `EventBus.stamp()` 盖章，因此 WS 副本与 `events.jsonl` 副本同号，前端可以直接按 `seq` 排因果树
 - `event_generation_mode` 只出现在根事件上（三条生成产线 + 引擎的 `system.*`）。`user.command` 和所有派生事件（`reasoning.*` / `command.lifecycle` / `action.device_control` / `feedback.state_delta`）该字段为 `null`——要问派生事件的来源，顺 `causal_parent` 找它的根事件
 - `reasoning.*` 不新增新的 envelope，全部通过 `SIM_EVENT` 输出
 - S1 起 `CMD_DEVICE_CONTROL` 也走 `CommandExecutor`：与 Agent 路径同一条六级校验、同一套十态生命周期、同一份失败词表，不再有"UI 直控专用链路"
@@ -235,6 +256,7 @@ REST 等价入口是 `POST /api/runs`（载荷同形，成功返回 `201` + `{"r
 | `malformed_message` | 帧不是合法 JSON，或不是 JSON 对象 |
 | `invalid_payload` | `payload` 不是对象，或字段结构校验失败（`details.issues` 列出逐条问题） |
 | `invalid_device_command` | 载荷结构合法但没有可执行的 `action` / `property` |
+| `unknown_scene` | `CMD_SCENE_APPLY` 的 `scene_id` 不在场景表里（`details.known_scenes` 列出已知场景） |
 | `unsupported_message_type` | 未知的 `type`（`details.type` 回显原值） |
 | `internal_error` | 处理该消息时服务端内部异常 |
 
@@ -283,47 +305,94 @@ REST 等价入口是 `POST /api/runs`（载荷同形，成功返回 `201` + `{"r
 - `correlation_id`
 - `causal_parent`
 - `priority`
+- `depth`（S3）
 - `data`
 
 字段约束和因果链规则以 `docs/architecture/sim-event-schema.md` 为准。
 
-## Phase 2 reasoning payload
+## Phase 2 reasoning payload（S3 六环形态）
 
-### `reasoning.perception_snapshot`
+spec §4.3 的六环推理事件在 S3 之后有一条明确的所有权划分——**一条根事件 = 一棵 episode 树**：
+
+| 环 | 事件类型 | 发出者（`source`） | 每 episode 条数 |
+|----|----------|-------------------|-----------------|
+| 感知 | `reasoning.perception_snapshot` | `home_orchestrator` | 1 |
+| 意图 | `reasoning.intent_recognized` | `home_orchestrator` | 1 |
+| 拆分 | `reasoning.task_decomposition` | `home_orchestrator` | 1 |
+| 协调 | `reasoning.coordination_decision` | `arbiter` | 1 |
+| 执行 | `reasoning.execution_plan` | 各域 agent | 每个参与 agent 一条 |
+| 反馈 | `action.device_control` → `feedback.state_delta` | agent / `state_manager` | 每条落地命令一组 |
+
+降级环 `reasoning.fallback_rule_based` 是可选的第七类：编排器自己降级时由 `home_orchestrator` 发一条，域 agent 降级时各发一条。
+
+**S3 之前的形状（前端迁移注意）**：每个域 agent 都会各发一套 `perception_snapshot` / `intent_recognized` / `task_decomposition`，一条 correlation 下挂着 N 棵平行小树。现在前三环由编排器独占，域 agent 的感知与意图改由 `reasoning.execution_plan` 承载（见下）。按 `data.agent_id` 是否存在（或 `source` 是否等于 `home_orchestrator`）区分编排层与域层。
+
+关掉编排器（`ORCHESTRATOR_ENABLED=0`，strangler 逃生阀）时回到旧的扇出形状：域 agent 重新发自己的前三环。
+
+### `reasoning.perception_snapshot`（编排层）
 
 ```json
 {
-  "agent_id": "lighting_agent",
-  "trigger_event_type": "user.activity_change",
-  "world_summary": "event=user.activity_change; time=19:00; weather=clear; ...",
+  "orchestrator_id": "home_orchestrator",
+  "trigger_event_type": "user.arrives_home",
+  "search_space_device_types": ["light", "thermostat"],
+  "search_space_resolved_from": "exact",
+  "default_policy": "comfort_first",
+  "world_summary": "user.arrives_home → 搜索空间 3 台设备 / 1 个房间（exact）",
   "relevant_devices": ["light_living_01"],
   "relevant_rooms": ["living_room"]
 }
 ```
 
-### `reasoning.intent_recognized`
+`world_summary` / `relevant_devices` / `relevant_rooms` 是前端冻结期的兼容键（面板当前直接读它们），值取自 `domain_tasks` 的并集，S5 换渲染后可删。
+
+### `reasoning.intent_recognized`（编排层）
 
 ```json
 {
-  "agent_id": "lighting_agent",
-  "intent": "light occupied room",
-  "confidence": 0.94,
-  "explanation": "Occupancy increased in the living room during the evening",
-  "provider": "openai_responses",
-  "model": "gpt-5.4",
-  "latency_ms": 320
+  "orchestrator_id": "home_orchestrator",
+  "intent": "welcome_home",
+  "domain": "comfort",
+  "confidence": 0.8,
+  "confidence_source": "rule_based",
+  "rule_confidence": 0.8,
+  "min_confidence": 0.5,
+  "low_confidence": false,
+  "outcome": "acted",
+  "requires_confirmation": false,
+  "fallback_reason": null,
+  "llm_mode": "mocked",
+  "provider": "disabled",
+  "model": "rule_based",
+  "latency_ms": 0,
+  "explanation": "…"
 }
 ```
 
-### `reasoning.task_decomposition`
+### `reasoning.task_decomposition`（编排层，结构化契约）
 
 ```json
 {
-  "agent_id": "lighting_agent",
-  "intent": "light occupied room",
-  "task_steps": ["raise brightness", "warm color"]
+  "orchestrator_id": "home_orchestrator",
+  "intent": "welcome_home",
+  "domain_tasks": [
+    {
+      "agent_role": "lighting",
+      "task": "light the arrival path",
+      "relevant_device_ids": ["light_living_01"],
+      "relevant_room_ids": ["living_room"],
+      "priority": "comfort"
+    }
+  ],
+  "agent_roles": ["lighting"],
+  "agent_ids": ["lighting_agent"],
+  "noop_reason": null,
+  "outcome": "acted",
+  "task_steps": ["lighting: light the arrival path"]
 }
 ```
+
+`domain_tasks` 是权威：审计记下的坑是这一环里装的是 LLM 自由文本，S3 之后它是编排契约。`task_steps` 只是同一份契约的兼容投影（`"<role>: <task>"`），不是模型散文。
 
 ### `reasoning.coordination_decision`
 
@@ -344,11 +413,14 @@ REST 等价入口是 `POST /api/runs`（载荷同形，成功返回 `201` + `{"r
 }
 ```
 
-### `reasoning.execution_plan`
+### `reasoning.execution_plan`（域层，承载域 agent 的全部推理贡献）
+
+编排器接管前三环之后，"这个 agent 看到了什么、打算干什么、有多确信、是不是降级算出来的"全部落在这一环上：
 
 ```json
 {
   "agent_id": "lighting_agent",
+  "agent_role": "lighting",
   "execution_mode": "llm",
   "commands": [
     {
@@ -357,11 +429,36 @@ REST 等价入口是 `POST /api/runs`（载荷同形，成功返回 `201` + `{"r
       "value": 70,
       "reason": "occupied evening lighting"
     }
-  ]
+  ],
+  "intent": "light occupied room",
+  "confidence": 0.94,
+  "explanation": "Occupancy increased in the living room during the evening",
+  "provider": "openai_responses",
+  "model": "gpt-5.4",
+  "latency_ms": 320,
+  "task_steps": ["raise brightness", "warm color"],
+  "fallback_reason": null,
+  "perception": {
+    "trigger_event_type": "user.activity_change",
+    "world_summary": "event=user.activity_change; time=19:00; weather=clear; …",
+    "relevant_devices": ["light_living_01"],
+    "relevant_rooms": ["living_room"]
+  },
+  "domain_task": {
+    "agent_role": "lighting",
+    "task": "light the arrival path",
+    "relevant_device_ids": ["light_living_01"],
+    "relevant_room_ids": ["living_room"],
+    "priority": "comfort"
+  }
 }
 ```
 
+`commands` 是**仲裁批准后**的命令；被仲裁否掉的那些走 `command.lifecycle` 的 `rejected` 与协调决策的 `rejected_commands`，绝不静默消失。
+
 ### `reasoning.fallback_rule_based`
+
+域 agent 的降级事件挂在编排器的任务拆分之下（早于协调决策——降级发生在仲裁之前）：
 
 ```json
 {
@@ -371,6 +468,34 @@ REST 等价入口是 `POST /api/runs`（载荷同形，成功返回 `201` + `{"r
   "fallback_strategy": "rule_based"
 }
 ```
+
+编排器自己降级时改带 `orchestrator_id`，`failed_step` 为 `intent_classification`。
+
+### `system.event_storm_suppressed`
+
+事件驱动取代 tick 循环之后，天然限速也一起没了：一条自派生回环可以在毫秒级打满总线。`EventBus` 因此按 `causal_parent` 给每条事件盖 `depth`，超过 `AGENT_MAX_CAUSAL_DEPTH`（默认 16，设 `0` 关闭）的事件**不发**——既不进历史也不派发给订阅者。
+
+刹车不是静默丢弃：每条 `correlation_id` 发一条本事件，把"链被刹住了、刹在多深、被刹的是什么"写进事件流本身。同一条链后续被拒的事件不再重复报告（防风暴自己不能变成风暴），真实拒发条数由 `EventBus.storm_suppressed_count(correlation_id)` 读出。
+
+```json
+{
+  "event_type": "system.event_storm_suppressed",
+  "source": "event_bus",
+  "priority": 2,
+  "event_generation_mode": "system",
+  "data": {
+    "reason": "causal_depth_exceeded",
+    "correlation_id": "…",
+    "max_depth": 16,
+    "depth": 17,
+    "suppressed_event_type": "feedback.state_delta",
+    "suppressed_event_source": "lighting_agent",
+    "suppressed_count": 1
+  }
+}
+```
+
+一条正常 episode 的树深实测 ≤ 7（根 → 感知 → 意图 → 拆分 → 协调 → 执行 → 命令生命周期 → 动作 → 反馈），离上限有一倍余量。`causal_parent` 指向的是被拒事件的**父**，避免留一个指向不存在事件的悬挂指针。
 
 ## S1 命令生命周期 payload
 
@@ -456,6 +581,7 @@ spec §2.2 不变式被破坏时发出，`priority` 恒为 `3`（最高），且
 3. `action.device_control` 先于由它派生的 `feedback.state_delta`（后者的 `causal_parent` 即前者的 `event_id`）
 4. 终态 `command.lifecycle` 最后到达
 5. 校验失败的命令绝不产生 `action.device_control` / `feedback.state_delta`，世界零变更
+6.（S3）一条 episode 内推理事件按 `感知 → 意图 → 拆分 →（降级）→ 协调 → 执行` 的顺序外发，父事件的 `seq` 恒小于子事件；多个域 agent 的执行环按 **agent 注册顺序**排列，与"谁先算完"无关
 
 ## 当前开放的设备类型
 

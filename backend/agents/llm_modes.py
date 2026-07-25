@@ -1,0 +1,1440 @@
+"""§11.1 三种 LLM 模式 + 陈旧决策丢弃（S3-T7）。
+
+本模块**不重新实现 provider**：真正会打网的两台（``OpenAIResponsesProvider`` /
+``AnthropicCompatibleProvider``，含超时与非法输出降级）在 :mod:`backend.agents.llm` 里，
+这里只在它们外面套三层可复现性语义。
+
+**三种模式（§11.1；每份 run 工件必须记下用的是哪一种）**
+
+``mocked``
+    确定性罐头决策。给测试与"不需要真模型也要跑通链路"的场景用。
+    同场景同 seed 跑两次，决策载荷必须逐位相同——这是本阶段门的一条，也是 S2 落地的
+    字节一致性门（tests/test_replay_determinism.py）在 S3 接入 LLM 之后还能站住的前提。
+
+``recorded``
+    先用真 provider 跑一遍并把 "canonical 请求指纹 → 原始决策" 落到
+    ``data/runs/{run_id}/llm_recordings.jsonl``（与 S2 的 events.jsonl 同目录，
+    critic 定死的路径），之后从文件确定性回放。
+    **DECISION #7：只有 recorded 能用于 benchmark 声明**，live 只用于产品验证——
+    因为 live 的结果依赖"当天那个模型"，不可被第三方复现。
+
+``live``
+    直接用既有 provider。
+
+**回放为什么必须"未命中就报错"**：回放最经典的塌法不是打不开文件，而是
+canonicalization 有缺口 → 键对不上 → 悄悄返回了另一条录制，于是研究者拿到一份看起来
+正常、其实张冠李戴的轨迹。所以 :class:`ReplayLLMProvider` 在未命中时抛
+``LLMProviderError("recording_miss")``，让既有的 fallback 路径带着标签降级
+（``reasoning.fallback_rule_based`` 的 data.reason 就是 ``recording_miss``），
+"这条链是回放缺口"因此可以被事后数出来。
+
+**陈旧决策丢弃（evolution-review 风险 #2）**：LLM 一轮要 1-5 秒，世界不会停下来等它。
+决策带上它据以推理的世界版本（:class:`VersionedDecision`），落地前比一次
+（:func:`check_stale_decision`）：**只比它自己要碰的那几台设备**的版本，不比全局计数器
+——环境每 tick 都在动，用全局版本判陈旧等于把所有决策都判死。
+命中就丢弃并发 ``reasoning.decision_discarded``（reason=stale），零状态改动。
+
+跨阶段契约（S3-T3/T8/T9、S4 回放、S5 面板都消费这些名字）::
+
+    LLM_MODE=mocked|recorded|live        模式选择环境变量（缺省：pytest 下 mocked，否则 live）
+    LLM_RECORDINGS_PATH=<file>           回放一份既有 run 的录制（不给则用当前 run 目录）
+    data/runs/{run_id}/llm_recordings.jsonl   录制工件（一行一条 LLMRecording）
+    reasoning.decision_discarded         陈旧丢弃事件，data.reason == "stale"
+
+生产接线点（S3 review major-2/3/4 的整改落点，别再让本模块变回一座图书馆）::
+
+    AgentRuntime._resolve_llm_provider   LLM_MODE → build_provider_for_mode / RunScopedRecordedProvider
+    AgentRuntime._episode_llm_provider   每条 episode 现套一层 BudgetGuardedLLMProvider
+    AgentRuntime._discard_stale_decisions  落地前 check_stale_decision → reasoning.decision_discarded
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+from pathlib import Path
+from typing import Any, Callable, Iterable, Mapping, Sequence
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from backend.agents.llm import (
+    LLMProvider,
+    LLMProviderError,
+    build_compact_request_payload,
+)
+from backend.agents.llm_pricing import (
+    DEFAULT_MAX_OUTPUT_TOKENS,
+    LLM_COST_FILENAME,
+    COST_DIGITS,
+    ModelPrice,
+    PricingTable,
+    TokenUsage,
+    UsageSource,
+    active_pricing_table,
+    estimate_tokens,
+    estimate_usage,
+    parse_usage,
+    worst_case_call_cost_usd,
+)
+from backend.agents.types import AgentCommandProposal, AgentLLMDecision, LLMDecisionRequest
+from backend.core.logging import log
+from backend.engine.event_bus import SimEvent
+from backend.engine.event_log import (
+    LLM_RECORDINGS_FILENAME,
+    artifacts_enabled,
+    run_dir,
+)
+from backend.engine.run_manager import LLMMode, canonical_json, resolve_llm_mode
+from backend.engine.state_manager import DeltaChange, StateManager
+
+__all__ = [
+    "ALLOW_LIVE_LLM_ENV",
+    "LLM_MODE_ENV",
+    "LLM_MODE_VALUES",
+    "LLMMode",
+    "CANONICAL_FLOAT_DIGITS",
+    "RECORDING_SCHEMA",
+    "RECORDING_MISS_REASON",
+    "RECORDING_CORRUPT_REASON",
+    "RECORDING_UNAVAILABLE_REASON",
+    "RECORDINGS_PATH_ENV",
+    "MOCK_FIXTURE_MISS_REASON",
+    "STALE_DECISION_EVENT_TYPE",
+    "STALE_DECISION_REASON",
+    "BUDGET_EXCEEDED_REASON",
+    "EPISODE_BUDGET_ENV",
+    "DEFAULT_EPISODE_BUDGET_USD",
+    "FREE_PROVIDER_NAMES",
+    "resolve_episode_budget_usd",
+    "EpisodeCost",
+    "EpisodeCostGuard",
+    "BudgetGuardedLLMProvider",
+    "canonical_request_payload",
+    "request_key",
+    "resolve_llm_mode_from_env",
+    "resolve_mode_for_provider",
+    "llm_mode_health",
+    "recordings_path",
+    "LLMRecording",
+    "load_recordings",
+    "default_mock_decision",
+    "MockedLLMProvider",
+    "RecordingLLMProvider",
+    "ReplayLLMProvider",
+    "RunScopedRecordedProvider",
+    "build_provider_for_mode",
+    "resolve_recordings_path_override",
+    "WorldVersionTracker",
+    "VersionedDecision",
+    "StaleDecisionCheck",
+    "check_stale_decision",
+    "build_stale_decision_event",
+]
+
+
+# ---------------------------------------------------------------------------
+# 常量（跨阶段契约）
+# ---------------------------------------------------------------------------
+
+LLM_MODE_ENV = "LLM_MODE"
+LLM_MODE_VALUES: tuple[str, ...] = tuple(mode.value for mode in LLMMode)
+
+# 测试进程里必须有这个环境变量才能搭一台会打真网的 provider。
+# 缺省闸门是"测试进程一律不许"——把本机拉回 CI 那条路径（无 key → rule fallback）。
+ALLOW_LIVE_LLM_ENV = "AURA_ALLOW_LIVE_LLM"
+_TRUTHY: frozenset[str] = frozenset({"1", "true", "yes", "on"})
+
+# 测试进程里
+
+# recorded 模式的录制文件位置覆盖。缺省是 ``data/runs/{当前 run_id}/llm_recordings.jsonl``，
+# 而每个 run 的 id 都是新的 —— 也就是说"缺省行为恒等于录制，永远回放不了"。研究者复现
+# 一份既有 run 的方法因此是把这个变量指到那一份录制上：
+#
+#     LLM_MODE=recorded LLM_RECORDINGS_PATH=data/runs/<run>/llm_recordings.jsonl
+#
+# 指到已存在的文件 → 回放（零网络）；指到不存在的路径 → 录制到那里。
+RECORDINGS_PATH_ENV = "LLM_RECORDINGS_PATH"
+
+# recorded 模式拿不到 run_id（runtime 还没绑 RunManager，且没给 LLM_RECORDINGS_PATH）时
+# 的降级标签。刻意不静默改用 live：那等于研究者以为自己在录，实际什么都没留下。
+RECORDING_UNAVAILABLE_REASON = "recording_unavailable"
+
+RECORDING_SCHEMA = "aura.llm_recording.v1"
+RECORDING_MISS_REASON = "recording_miss"
+RECORDING_CORRUPT_REASON = "recording_corrupt"
+MOCK_FIXTURE_MISS_REASON = "mock_fixture_miss"
+
+STALE_DECISION_EVENT_TYPE = "reasoning.decision_discarded"
+STALE_DECISION_REASON = "stale"
+
+# canonical 化时浮点保留的位数。这一位数是"回放命中率 / 语义保真"的取舍点：
+# 3 位刚好抹掉 0.30000000000000004 这类二进制尾巴（真正的不确定性来源），
+# 又不会把 21.312 与 21.318 这种语义上不同的世界读数混为一谈。
+CANONICAL_FLOAT_DIGITS = 3
+
+# 字符串里嵌的浮点也要抹尾巴：world_summary 是拼好的一句话（"temp=21.3, light_level=0.4"），
+# 它的数字不会经过 JSON 的 float 通道，纯靠 sort_keys 是治不了的。
+_FLOAT_TOKEN_RE = re.compile(r"-?\d+\.\d+")
+
+_DEVICE_PATH_RE = re.compile(r"^devices\[([^\]]+)\]")
+
+
+# ---------------------------------------------------------------------------
+# 请求 canonical 化
+# ---------------------------------------------------------------------------
+
+
+def _canonicalize(value: Any) -> Any:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, float):
+        rounded = round(value, CANONICAL_FLOAT_DIGITS)
+        # -0.0 与 0.0 序列化不同，统一掉
+        return rounded + 0.0
+    if isinstance(value, str):
+        return _FLOAT_TOKEN_RE.sub(_round_float_token, value)
+    if isinstance(value, Mapping):
+        return {str(key): _canonicalize(item) for key, item in sorted(value.items(), key=lambda kv: str(kv[0]))}
+    if isinstance(value, (list, tuple)):
+        # 顺序是语义的一部分（allowed_commands 的顺序决定 agent 看到的可选项顺序），不排序。
+        return [_canonicalize(item) for item in value]
+    return value
+
+
+def _round_float_token(match: re.Match[str]) -> str:
+    rounded = round(float(match.group(0)), CANONICAL_FLOAT_DIGITS)
+    return format(rounded + 0.0, "f").rstrip("0").rstrip(".") or "0"
+
+
+def canonical_request_payload(request: LLMDecisionRequest) -> dict[str, Any]:
+    """把 :func:`build_compact_request_payload` 的产物确定化。
+
+    确定化 = 键排序 + 浮点定位（含字符串里嵌的浮点）。审计里已知的两处不确定性
+    （world summary 浮点尾巴、dict 迭代序）正是这里要中和掉的东西——它们不中和，
+    录制回放会在"看起来一样的世界"上系统性未命中。
+    """
+
+    return _canonicalize(build_compact_request_payload(request))
+
+
+def request_key(request: LLMDecisionRequest) -> str:
+    """canonical 请求的 sha256。既是录制的查找键，也是回放的 prompt 指纹。"""
+
+    payload = canonical_request_payload(request)
+    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# 模式选择
+# ---------------------------------------------------------------------------
+
+
+def running_under_test(env: Mapping[str, str] | None = None) -> bool:
+    """本进程是不是 pytest 进程。
+
+    只此一处定义"在测试里"，模式缺省（:func:`resolve_llm_mode_from_env`）与凭证闸门
+    （:func:`live_llm_allowed`）共用它——两处各判一次的话，总有一天只有一处被改对。
+    """
+
+    environ = os.environ if env is None else env
+    return "PYTEST_CURRENT_TEST" in environ or "PYTEST_VERSION" in environ
+
+
+def live_llm_allowed(env: Mapping[str, str] | None = None) -> bool:
+    """测试进程能不能从环境变量里现搭一台**会打真网**的 provider。
+
+    S3 review-2 blocker：仓库根的 ``.env.local`` 带着真 key，``backend.main`` 在 import
+    期就 :func:`~backend.core.local_env.load_local_env` 把它灌进 ``os.environ``，于是
+    :meth:`~backend.agents.runtime.AgentRuntime._build_default_provider` 在 pytest 里
+    也照样搭出一台真 provider——实测一趟全量套件 40 次真 HTTPS POST。这不只是"花钱、
+    慢、看网络脸色"：**本机跑的和 CI 跑的是两条不同的代码路径**（CI 没有 .env.local，
+    走的是无 key → :class:`DisabledLLMProvider` → 规则回退那条），本机的绿灯因此
+    根本不是 CI 验证的那盏灯。
+
+    所以缺省闸门是"测试进程一律不许"，把本机拉回 CI 那条路径。真要跑 live 的测试必须
+    显式设 ``AURA_ALLOW_LIVE_LLM=1`` 说出来（见 tests/conftest.py 的 ``live_llm`` 标记：
+    没配 key 时它 skip，绝不静默花钱）。
+
+    刻意**不**在这里洗 ``os.environ``：清 key 是打地鼠（provider 一多就漏一个），而这
+    条闸门管的是唯一的出口——``_build_default_provider`` 是全仓库唯一按环境变量造
+    provider 的地方。兜底那一层由 tests/conftest.py 的传输层哨兵负责。
+    """
+
+    environ = os.environ if env is None else env
+    if not running_under_test(environ):
+        return True
+    return str(environ.get(ALLOW_LIVE_LLM_ENV, "")).strip().lower() in _TRUTHY
+
+
+def resolve_llm_mode_from_env(
+    env: Mapping[str, str] | None = None,
+    *,
+    under_test: bool | None = None,
+) -> LLMMode:
+    """读 ``LLM_MODE``；缺省值按"是不是在测试里"分岔。
+
+    缺省值刻意不对称：测试进程默认 ``mocked``（测试里绝不能因为本机 .env.local 配了 key
+    就意外打真网），开发/生产进程默认 ``live``。``under_test`` 显式传值可覆盖判定。
+    """
+
+    environ = os.environ if env is None else env
+    raw = str(environ.get(LLM_MODE_ENV, "")).strip().lower()
+    if raw:
+        try:
+            return LLMMode(raw)
+        except ValueError as exc:
+            raise ValueError(
+                f"{LLM_MODE_ENV}={raw!r} 不是合法模式，可选：{', '.join(LLM_MODE_VALUES)}"
+            ) from exc
+
+    if under_test is None:
+        under_test = running_under_test(environ)
+    return LLMMode.MOCKED if under_test else LLMMode.LIVE
+
+
+def resolve_mode_for_provider(provider: Any) -> LLMMode:
+    """由 provider 实例反推它实际处在哪种模式（写进 run 元数据用）。
+
+    只有本模块的三层包装会显式声明 ``llm_mode``；裸 provider 仍交给 S2 的
+    :func:`backend.engine.run_manager.resolve_llm_mode` 判（它还要看 api_key 在不在，
+    "配了 provider 名但没 key"实际上跑的是规则回退，不是 live）。
+    """
+
+    declared = getattr(provider, "llm_mode", None)
+    if isinstance(declared, LLMMode):
+        if declared is not LLMMode.LIVE:
+            return declared
+    elif isinstance(declared, str) and declared in LLM_MODE_VALUES:
+        if declared != LLMMode.LIVE.value:
+            return LLMMode(declared)
+    return resolve_llm_mode(provider)
+
+
+def llm_mode_health(provider: Any) -> dict[str, Any]:
+    """``/api/health`` 的 ``_llm_health`` 片段（S3-T3 接线时并进去）。"""
+
+    mode = resolve_mode_for_provider(provider)
+    payload: dict[str, Any] = {
+        "mode": mode.value,
+        "provider": str(getattr(provider, "provider_name", "disabled") or "disabled"),
+        "model": str(getattr(provider, "model", "") or "rule_based"),
+        "benchmark_safe": mode is not LLMMode.LIVE,  # DECISION #7
+    }
+    recordings = getattr(provider, "recordings_path", None)
+    if recordings is not None:
+        payload["recordings_path"] = str(recordings)
+    return payload
+
+
+def recordings_path(run_id: str, *, root: Path | str | None = None) -> Path:
+    """``data/runs/{run_id}/llm_recordings.jsonl``——与 events.jsonl 同目录。"""
+
+    return run_dir(run_id, root=root) / LLM_RECORDINGS_FILENAME
+
+
+# ---------------------------------------------------------------------------
+# 录制条目
+# ---------------------------------------------------------------------------
+
+
+class LLMRecording(BaseModel):
+    """一条 LLM 决策录制（jsonl 一行一条）。
+
+    同时存 ``request_key`` 与整份 canonical ``request``：前者是查找键，后者让
+    "回放时对不上"这件事可诊断——:func:`load_recordings` 会用 request 重算一遍键，
+    对不上就判工件损坏，而不是把一条张冠李戴的录制放出去。
+    """
+
+    # protected_namespaces=()：本模型有一个正当的 ``model`` 字段（哪台模型说的话），
+    # 与 pydantic 默认保留的 ``model_`` 前缀无关。
+    model_config = ConfigDict(extra="forbid", populate_by_name=True, protected_namespaces=())
+
+    schema_version: str = Field(default=RECORDING_SCHEMA, alias="schema")
+    request_key: str
+    prompt_hash: str
+    agent_id: str = ""
+    root_event_type: str = ""
+    provider: str = ""
+    model: str = ""
+    request: dict[str, Any] = Field(default_factory=dict)
+    decision: AgentLLMDecision
+
+    @classmethod
+    def decision_from_payload(cls, payload: Mapping[str, Any]) -> AgentLLMDecision:
+        """原始 JSON → AgentLLMDecision（复用 llm.py 的归一化，不另立一套解析）。"""
+
+        from backend.agents.llm import _normalize_agent_decision_payload  # noqa: PLC0415
+
+        return AgentLLMDecision.model_validate(_normalize_agent_decision_payload(dict(payload)))
+
+    def to_json_dict(self) -> dict[str, Any]:
+        payload = self.model_dump(by_alias=True, mode="json")
+        return payload
+
+    def to_json_line(self) -> str:
+        return json.dumps(self.to_json_dict(), ensure_ascii=False, sort_keys=True)
+
+
+def load_recordings(path: Path | str) -> dict[str, LLMRecording]:
+    """读一份 jsonl 录制，返回 ``{request_key: LLMRecording}``。
+
+    同一个键出现多次时保留**第一条**：回放因此是"请求 → 决策"的纯函数，同一份录制
+    回放多少次都一样。后续条目若与首条决策不同会记一条 warning（模型当时不确定，
+    值得研究者知道），但不改变回放结果。
+    """
+
+    file_path = Path(path)
+    if not file_path.exists():
+        raise LLMProviderError(
+            RECORDING_MISS_REASON,
+            f"LLM 录制文件不存在：{file_path}",
+        )
+
+    recordings: dict[str, LLMRecording] = {}
+    for line_no, raw_line in enumerate(file_path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+            record = LLMRecording.model_validate(payload)
+        except Exception as exc:  # json / pydantic 都归为"工件坏了"
+            raise LLMProviderError(
+                RECORDING_CORRUPT_REASON,
+                f"{file_path}:{line_no} 不是一条合法录制：{exc}",
+            ) from exc
+
+        recomputed = hashlib.sha256(
+            canonical_json(_canonicalize(record.request)).encode("utf-8")
+        ).hexdigest()
+        if record.request and recomputed != record.request_key:
+            # 录制被改过 / 是别的 canonicalizer 写的：宁可整份拒绝，也不放一条
+            # 键与内容对不上的录制进回放——那正是"悄悄返回错录制"的入口。
+            raise LLMProviderError(
+                RECORDING_CORRUPT_REASON,
+                f"{file_path}:{line_no} 的 request 与 request_key 不符"
+                f"（记录 {record.request_key[:12]}…，实算 {recomputed[:12]}…）",
+            )
+
+        existing = recordings.get(record.request_key)
+        if existing is None:
+            recordings[record.request_key] = record
+        elif existing.decision != record.decision:
+            log.warning(
+                "llm_recording_ambiguous",
+                path=str(file_path),
+                line=line_no,
+                request_key=record.request_key[:12],
+            )
+    return recordings
+
+
+# ---------------------------------------------------------------------------
+# 三种模式
+# ---------------------------------------------------------------------------
+
+
+def default_mock_decision(request: LLMDecisionRequest) -> AgentLLMDecision:
+    """无 fixture 时的确定性罐头决策：不提任何命令。
+
+    刻意"什么都不做"而不是瞎编几条命令：mocked 模式的用途是让链路可复现地跑通，
+    编出来的命令会把 S4 的评估指标污染成"模型表现"。需要真实决策的评估跑法请喂
+    fixture，或者直接用 :class:`ReplayLLMProvider`（录制即最好的 mock）。
+    """
+
+    return AgentLLMDecision(
+        intent=f"mocked: no action for {request.root_event_type}",
+        confidence=0.5,
+        task_steps=["review current context"],
+        proposed_commands=[],
+        explanation="Deterministic mocked decision (no fixture matched).",
+        needs_coordination=False,
+    )
+
+
+class MockedLLMProvider(LLMProvider):
+    """确定性罐头 provider（§11.1 mocked）。
+
+    三级查找：先按 canonical 请求指纹（``fixtures``），再按 agent_id
+    （``fixtures_by_agent``，写测试时最顺手），最后落到 ``default_factory``。
+    ``strict=True`` 时不落默认值，直接抛 ``mock_fixture_miss``——评估跑法应该开着它，
+    "没配到 fixture"必须是一次失败，而不是一条静悄悄的空决策。
+    """
+
+    provider_name = "mocked"
+    llm_mode = LLMMode.MOCKED
+
+    def __init__(
+        self,
+        fixtures: Mapping[str, AgentLLMDecision] | None = None,
+        *,
+        fixtures_by_agent: Mapping[str, AgentLLMDecision] | None = None,
+        default_factory: Callable[[LLMDecisionRequest], AgentLLMDecision] | None = None,
+        strict: bool = False,
+        model: str = "mocked",
+    ) -> None:
+        self.fixtures = dict(fixtures or {})
+        self.fixtures_by_agent = dict(fixtures_by_agent or {})
+        self.default_factory = default_factory or default_mock_decision
+        self.strict = strict
+        self.model = model
+        self.calls: list[str] = []
+
+    @classmethod
+    def from_recordings(cls, path: Path | str, **kwargs: Any) -> "MockedLLMProvider":
+        """把一份录制当 fixture 用（录制即最真实的 mock）。"""
+
+        records = load_recordings(path)
+        return cls({key: record.decision for key, record in records.items()}, **kwargs)
+
+    async def generate_decision(self, request: LLMDecisionRequest) -> AgentLLMDecision:
+        key = request_key(request)
+        self.calls.append(key)
+
+        fixture = self.fixtures.get(key) or self.fixtures_by_agent.get(request.agent_id)
+        if fixture is not None:
+            # 深拷贝：调用方拿到的决策不能是 fixture 本体，否则一次原地修改会污染后续调用，
+            # "两次跑出同一结果"就成了假的。
+            return fixture.model_copy(deep=True)
+
+        if self.strict:
+            raise LLMProviderError(
+                MOCK_FIXTURE_MISS_REASON,
+                f"mocked 模式没有匹配 fixture：agent={request.agent_id} key={key[:12]}…",
+            )
+        return self.default_factory(request)
+
+
+class RecordingLLMProvider(LLMProvider):
+    """真 provider 的录制包装（§11.1 recorded 的写侧）。
+
+    只在真 provider **成功**时落一条记录：失败路径已有自己的可观测出口
+    （fallback 事件），把失败也录进来会让回放悄悄复现出一堆降级链。
+    """
+
+    provider_name = "recording"
+    llm_mode = LLMMode.RECORDED
+
+    def __init__(
+        self,
+        inner: LLMProvider,
+        *,
+        path: Path | str,
+    ) -> None:
+        self.inner = inner
+        self.recordings_path = Path(path)
+        self.written = 0
+
+    # 元数据穿透：run 元数据要记的是"真正说话的那台模型"，不是包装层。
+    @property
+    def model(self) -> str:  # type: ignore[override]
+        return str(getattr(self.inner, "model", "") or "")
+
+    @property
+    def api_key(self) -> Any:
+        return getattr(self.inner, "api_key", None)
+
+    @property
+    def timeout_ms(self) -> Any:
+        return getattr(self.inner, "timeout_ms", None)
+
+    async def generate_decision(self, request: LLMDecisionRequest) -> AgentLLMDecision:
+        decision = await self.inner.generate_decision(request)
+        self._append(request, decision)
+        return decision
+
+    def _append(self, request: LLMDecisionRequest, decision: AgentLLMDecision) -> None:
+        payload = canonical_request_payload(request)
+        key = hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+        record = LLMRecording(
+            request_key=key,
+            prompt_hash=key,
+            agent_id=request.agent_id,
+            root_event_type=request.root_event_type,
+            provider=str(getattr(self.inner, "provider_name", "unknown")),
+            model=self.model,
+            request=payload,
+            decision=decision,
+        )
+        try:
+            self.recordings_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.recordings_path.open("a", encoding="utf-8") as handle:
+                handle.write(record.to_json_line() + "\n")
+                handle.flush()
+        except OSError as exc:
+            # 录不下来就说话：一份缺行的录制会让 S4 的回放静默变成"部分 live"。
+            log.error(
+                "llm_recording_write_failed",
+                path=str(self.recordings_path),
+                error=str(exc),
+            )
+            return
+        self.written += 1
+
+
+class ReplayLLMProvider(LLMProvider):
+    """从录制文件确定性回放（§11.1 recorded 的读侧）。
+
+    构造上就不持有任何 HTTP 客户端——"回放不会打网"是结构性质，不是纪律。
+    未命中抛 ``recording_miss``，由既有 fallback 路径带标签降级。
+    """
+
+    provider_name = "replay"
+    llm_mode = LLMMode.RECORDED
+
+    def __init__(
+        self,
+        recordings: Mapping[str, LLMRecording],
+        *,
+        path: Path | str | None = None,
+        model: str = "",
+    ) -> None:
+        self.recordings = dict(recordings)
+        self.recordings_path = Path(path) if path is not None else None
+        self.hits = 0
+        self.misses = 0
+        self.model = model or self._infer_model()
+
+    @classmethod
+    def from_file(cls, path: Path | str) -> "ReplayLLMProvider":
+        return cls(load_recordings(path), path=path)
+
+    def _infer_model(self) -> str:
+        models = sorted({record.model for record in self.recordings.values() if record.model})
+        return models[0] if len(models) == 1 else ",".join(models)
+
+    async def generate_decision(self, request: LLMDecisionRequest) -> AgentLLMDecision:
+        key = request_key(request)
+        record = self.recordings.get(key)
+        if record is None:
+            self.misses += 1
+            raise LLMProviderError(
+                RECORDING_MISS_REASON,
+                (
+                    f"录制里没有这条请求：agent={request.agent_id} "
+                    f"event={request.root_event_type} key={key[:12]}…"
+                ),
+            )
+        self.hits += 1
+        return record.decision.model_copy(deep=True)
+
+
+def build_provider_for_mode(
+    mode: LLMMode | str,
+    *,
+    live_provider_factory: Callable[[], LLMProvider],
+    recordings_path: Path | str | None = None,
+    fixtures: Mapping[str, AgentLLMDecision] | None = None,
+    strict_mock: bool = True,
+) -> LLMProvider:
+    """按模式装配 provider（S3-T3 的接线口）。
+
+    ``recorded`` 的读写分岔靠"文件在不在"：不存在就录（包住 live provider），
+    已存在就回放。研究者的操作因此是"跑一次留下 run 目录，之后拿同一个目录复现"，
+    不必再记第四个开关。
+    """
+
+    resolved = LLMMode(mode)
+    if resolved is LLMMode.MOCKED:
+        return MockedLLMProvider(fixtures, strict=strict_mock)
+
+    if resolved is LLMMode.RECORDED:
+        if recordings_path is None:
+            raise ValueError("recorded 模式必须给 recordings_path（data/runs/{run_id}/llm_recordings.jsonl）")
+        path = Path(recordings_path)
+        if path.exists():
+            return ReplayLLMProvider.from_file(path)
+        return RecordingLLMProvider(live_provider_factory(), path=path)
+
+    return live_provider_factory()
+
+
+def resolve_recordings_path_override(env: Mapping[str, str] | None = None) -> Path | None:
+    """读 ``LLM_RECORDINGS_PATH``（没配就 None）。"""
+
+    environ = os.environ if env is None else env
+    raw = str(environ.get(RECORDINGS_PATH_ENV, "")).strip()
+    return Path(raw) if raw else None
+
+
+class RunScopedRecordedProvider(LLMProvider):
+    """recorded 模式的生产接线口：按**当前 run_id** 惰性解析录制/回放。
+
+    为什么必须惰性：录制文件的位置是 ``data/runs/{run_id}/llm_recordings.jsonl``，而
+    :class:`~backend.agents.runtime.AgentRuntime` 在 :class:`RunManager` **之前**就构造好了
+    ——构造那一刻还没有 run_id。而且 ``reset`` / 场景连跑会换 run，一个 run 一份录制。
+    所以这里不预先绑路径，而是每次用到时问一次 run_id，并按 run 缓存内层 provider
+    （缓存是必须的：``RecordingLLMProvider`` 以追加方式写文件，每次调用新建一台会让
+    ``written`` 计数与"这份录制是谁写的"都失去意义）。
+
+    ``LLM_RECORDINGS_PATH`` 覆盖优先于 run 目录——它就是"回放一份既有 run"的开关
+    （新 run 的 run_id 恒不同，不给覆盖就永远只会录、不会放）。
+
+    拿不到 run_id 又没给覆盖时**不悄悄改用 live**：抛
+    ``LLMProviderError(recording_unavailable)``，由既有 fallback 路径带标签降级。
+    静默改用 live 等于"以为在录，其实什么都没留下"，而这正是 DECISION #7 要防的那件事。
+    """
+
+    llm_mode = LLMMode.RECORDED
+
+    def __init__(
+        self,
+        *,
+        live_provider_factory: Callable[[], LLMProvider],
+        run_id_source: Callable[[], str | None] | None = None,
+        recordings_root: Path | str | None = None,
+        path_override: Path | str | None = None,
+    ) -> None:
+        self._live_provider_factory = live_provider_factory
+        self._run_id_source = run_id_source
+        self._recordings_root = recordings_root
+        self._path_override = Path(path_override) if path_override is not None else None
+        self._resolved: dict[str, LLMProvider] = {}
+
+    # --- 解析 ---------------------------------------------------------------
+
+    def _target_path(self) -> tuple[str, Path] | None:
+        override = self._path_override or resolve_recordings_path_override()
+        if override is not None:
+            return (f"override:{override}", override)
+        run_id = self._run_id_source() if self._run_id_source is not None else None
+        if not run_id:
+            return None
+        return (run_id, recordings_path(run_id, root=self._recordings_root))
+
+    def resolve(self) -> LLMProvider | None:
+        """当前 run 对应的内层 provider（录制或回放）；拿不到位置时 None。"""
+
+        target = self._target_path()
+        if target is None:
+            return None
+        key, path = target
+        existing = self._resolved.get(key)
+        if existing is not None:
+            return existing
+        provider = build_provider_for_mode(
+            LLMMode.RECORDED,
+            live_provider_factory=self._live_provider_factory,
+            recordings_path=path,
+        )
+        log.info(
+            "llm_recorded_provider_resolved",
+            run_key=key,
+            path=str(path),
+            role=str(getattr(provider, "provider_name", "")),
+        )
+        self._resolved[key] = provider
+        return provider
+
+    @property
+    def resolved_providers(self) -> dict[str, LLMProvider]:
+        """已解析的内层 provider（按 run 键）。测试与诊断读它，不改它。"""
+
+        return dict(self._resolved)
+
+    # --- 元数据穿透 ----------------------------------------------------------
+
+    @property
+    def provider_name(self) -> str:  # type: ignore[override]
+        inner = self.resolve()
+        return str(getattr(inner, "provider_name", "recorded") or "recorded")
+
+    @property
+    def model(self) -> str:  # type: ignore[override]
+        inner = self.resolve()
+        return str(getattr(inner, "model", "") or "")
+
+    @property
+    def api_key(self) -> Any:
+        inner = self.resolve()
+        return getattr(inner, "api_key", None)
+
+    @property
+    def timeout_ms(self) -> Any:
+        inner = self.resolve()
+        return getattr(inner, "timeout_ms", None)
+
+    @property
+    def recordings_path(self) -> Any:
+        inner = self.resolve()
+        return getattr(inner, "recordings_path", None)
+
+    # --- 调用 ---------------------------------------------------------------
+
+    async def generate_decision(self, request: LLMDecisionRequest) -> AgentLLMDecision:
+        inner = self.resolve()
+        if inner is None:
+            raise LLMProviderError(
+                RECORDING_UNAVAILABLE_REASON,
+                (
+                    f"{LLM_MODE_ENV}=recorded 但既没有活跃 run_id 也没有 {RECORDINGS_PATH_ENV}，"
+                    "录制无处可落"
+                ),
+            )
+        return await inner.generate_decision(request)
+
+
+# ---------------------------------------------------------------------------
+# 世界版本 + 陈旧决策丢弃
+# ---------------------------------------------------------------------------
+
+
+class WorldVersionTracker:
+    """世界改动的单调计数器：一个全局版本 + 一张 per-device 版本表。
+
+    **不进 WorldState**（plan_raw 风险条）：版本簿记是运行期的因果台账，塞进世界快照会
+    让每条 STATE_FULL 都胖一圈，还会污染 S2 的 initial_state_hash。
+
+    接线方式是包住 ``StateManager.apply_path_update``——那是状态层唯一的写入口
+    （S1 已经把命令侧收敛到 CommandExecutor，仿真器与场景加载也都从这里过），
+    因此"有改动却没记版本"这件事在结构上不可能发生。
+    """
+
+    _ATTR = "_aura_world_version_tracker"
+
+    def __init__(self) -> None:
+        self._version = 0
+        self._device_versions: dict[str, int] = {}
+
+    # --- 查询 --------------------------------------------------------------
+
+    @property
+    def version(self) -> int:
+        return self._version
+
+    def device_version(self, device_id: str) -> int:
+        """设备最后一次被改动时的全局版本；从未被改过则 0。"""
+
+        return self._device_versions.get(device_id, 0)
+
+    def snapshot_device_versions(self, device_ids: Iterable[str]) -> dict[str, int]:
+        return {device_id: self.device_version(device_id) for device_id in sorted(set(device_ids))}
+
+    # --- 写侧 --------------------------------------------------------------
+
+    def observe(self, deltas: Sequence[DeltaChange] | None) -> int:
+        """吃一批 delta，推进版本号；返回推进后的全局版本。
+
+        空批次（同值写入 → 无 delta）不推进：不然每次"没变化的写入"都会把在飞决策判死。
+        """
+
+        if not deltas:
+            return self._version
+        for delta in deltas:
+            self._version += 1
+            device_id = _device_id_from_path(delta.path)
+            if device_id is not None:
+                self._device_versions[device_id] = self._version
+        return self._version
+
+    # --- 接线 --------------------------------------------------------------
+
+    @classmethod
+    def attach(cls, state_manager: StateManager) -> "WorldVersionTracker":
+        """给一台 StateManager 装上版本簿记（幂等）。
+
+        幂等很重要：引擎、runtime、测试都可能各调一次；套两层 wrapper 会让同一次改动
+        把版本推进两格，per-device 与全局版本随即对不上。
+        """
+
+        existing = getattr(state_manager, cls._ATTR, None)
+        if isinstance(existing, cls):
+            return existing
+
+        tracker = cls()
+        inner = state_manager.apply_path_update
+
+        def apply_path_update(*args: Any, **kwargs: Any) -> list[DeltaChange]:
+            deltas = inner(*args, **kwargs)
+            tracker.observe(deltas)
+            return deltas
+
+        state_manager.apply_path_update = apply_path_update  # type: ignore[method-assign]
+        setattr(state_manager, cls._ATTR, tracker)
+        return tracker
+
+    @classmethod
+    def of(cls, state_manager: StateManager) -> "WorldVersionTracker | None":
+        tracker = getattr(state_manager, cls._ATTR, None)
+        return tracker if isinstance(tracker, cls) else None
+
+
+def _device_id_from_path(path: str) -> str | None:
+    match = _DEVICE_PATH_RE.match(path)
+    return match.group(1) if match else None
+
+
+class VersionedDecision(BaseModel):
+    """一份"带着它据以推理的世界版本"的决策（S3-T7 的对外形状）。
+
+    ``device_versions`` 只记这条决策要碰的设备：粒度就是丢弃判定的粒度。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent_id: str = ""
+    decided_at_version: int
+    device_versions: dict[str, int] = Field(default_factory=dict)
+    commands: list[AgentCommandProposal] = Field(default_factory=list)
+    correlation_id: str | None = None
+    root_event_id: str | None = None
+
+    @classmethod
+    def snapshot(
+        cls,
+        tracker: WorldVersionTracker,
+        *,
+        commands: Sequence[AgentCommandProposal],
+        agent_id: str = "",
+        correlation_id: str | None = None,
+        root_event_id: str | None = None,
+    ) -> "VersionedDecision":
+        """在**发起 LLM 调用之前**拍一张版本快照，落地前再比。"""
+
+        return cls(
+            agent_id=agent_id,
+            decided_at_version=tracker.version,
+            device_versions=tracker.snapshot_device_versions(
+                command.device_id for command in commands
+            ),
+            commands=[command.model_copy(deep=True) for command in commands],
+            correlation_id=correlation_id,
+            root_event_id=root_event_id,
+        )
+
+    @classmethod
+    def at_version(
+        cls,
+        observed_version: int,
+        *,
+        commands: Sequence[AgentCommandProposal],
+        agent_id: str = "",
+        correlation_id: str | None = None,
+        root_event_id: str | None = None,
+    ) -> "VersionedDecision":
+        """用一个**过去的**全局版本建快照——真实链路里的顺序就是反的。
+
+        :meth:`snapshot` 要求"拍快照时命令已经算出来了"，但生产链路是：先读世界（版本在
+        那一刻定格）→ LLM 想 1-5 秒 → 命令才出来。所以运行时记下的是**读世界那一刻的
+        全局版本**，落地前问"这台设备是不是在那之后被改过"。
+
+        语义与 per-device 快照完全等价：``device_version(d)`` 就是"d 最后一次被改动时的
+        全局版本"，因此 ``device_version(d) > 读世界时的全局版本`` ⟺ d 在那之后动过。
+        """
+
+        version = int(observed_version)
+        return cls(
+            agent_id=agent_id,
+            decided_at_version=version,
+            device_versions={command.device_id: version for command in commands},
+            commands=[command.model_copy(deep=True) for command in commands],
+            correlation_id=correlation_id,
+            root_event_id=root_event_id,
+        )
+
+
+class StaleDecisionCheck(BaseModel):
+    """:func:`check_stale_decision` 的判定结果（不含任何副作用）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    is_stale: bool
+    decided_at_version: int
+    current_version: int
+    fresh_commands: list[AgentCommandProposal] = Field(default_factory=list)
+    discarded_commands: list[AgentCommandProposal] = Field(default_factory=list)
+    stale_device_ids: list[str] = Field(default_factory=list)
+
+
+def check_stale_decision(
+    decision: VersionedDecision,
+    tracker: WorldVersionTracker,
+) -> StaleDecisionCheck:
+    """决策落地前的最后一问：它碰的那几台设备，还是它当时看到的那几台吗？
+
+    **只比 per-device 版本**。全局计数器每个环境 tick 都在涨，用它判等于把所有决策
+    都判死（plan_raw 明写的粒度要求）。命令顺序原样保留——顺序是仲裁与执行的语义。
+    """
+
+    stale_devices: set[str] = set()
+    fresh: list[AgentCommandProposal] = []
+    discarded: list[AgentCommandProposal] = []
+
+    for command in decision.commands:
+        snapshot_version = decision.device_versions.get(command.device_id, 0)
+        if tracker.device_version(command.device_id) > snapshot_version:
+            stale_devices.add(command.device_id)
+            discarded.append(command)
+        else:
+            fresh.append(command)
+
+    return StaleDecisionCheck(
+        is_stale=bool(discarded),
+        decided_at_version=decision.decided_at_version,
+        current_version=tracker.version,
+        fresh_commands=fresh,
+        discarded_commands=discarded,
+        stale_device_ids=sorted(stale_devices),
+    )
+
+
+def build_stale_decision_event(
+    decision: VersionedDecision,
+    check: StaleDecisionCheck,
+    *,
+    root_event: SimEvent | None = None,
+    source: str = "agent_runtime",
+    sim_time_s: float | None = None,
+) -> SimEvent:
+    """丢弃留痕事件（``reasoning.decision_discarded``，reason=stale）。
+
+    没有丢弃就没有事件——传一个 ``is_stale=False`` 的判定进来是调用方的逻辑错误，
+    直接抛，而不是发一条"丢了 0 条命令"的空事件去污染推理链。
+    """
+
+    if not check.is_stale:
+        raise ValueError("没有被丢弃的命令，不该发 decision_discarded 事件")
+
+    return SimEvent(
+        event_type=STALE_DECISION_EVENT_TYPE,
+        source=source,
+        timestamp=root_event.timestamp if root_event is not None else 0.0,
+        correlation_id=(
+            decision.correlation_id
+            or (root_event.correlation_id if root_event is not None else None)
+        )
+        or "",
+        causal_parent=decision.root_event_id
+        or (root_event.event_id if root_event is not None else None),
+        priority=2,
+        run_id=root_event.run_id if root_event is not None else None,
+        scenario_id=root_event.scenario_id if root_event is not None else None,
+        sim_time_s=sim_time_s if sim_time_s is not None else (
+            root_event.sim_time_s if root_event is not None else None
+        ),
+        event_generation_mode="system",
+        data={
+            "reason": STALE_DECISION_REASON,
+            "agent_id": decision.agent_id,
+            "decided_at_version": check.decided_at_version,
+            "current_version": check.current_version,
+            "stale_device_ids": check.stale_device_ids,
+            "discarded_commands": [
+                command.model_dump(mode="json") for command in check.discarded_commands
+            ],
+            "kept_commands": [
+                command.model_dump(mode="json") for command in check.fresh_commands
+            ],
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# LLM 成本护栏（S3-T8）
+# ---------------------------------------------------------------------------
+
+BUDGET_EXCEEDED_REASON = "budget_exceeded"
+EPISODE_BUDGET_ENV = "AGENT_EPISODE_BUDGET_USD"
+# GSTACK §6：一条 episode 的花费上限。默认 $0.10 —— 一次"事件 → 编排 → 若干 agent"的
+# 完整推理链在这个量级内应当绰绰有余；跑不完说明要么模型太贵，要么链路在打转，
+# 两种情况都该让研究者看见，而不是让账单默默长出来。
+DEFAULT_EPISODE_BUDGET_USD = 0.10
+
+# 这些 provider 不产生账单：mocked 是罐头，replay 从文件读，disabled 压根不调用。
+# 它们必须**免检**——不然预算会改写 mocked/回放跑法的行为，而那正是 S2 落地的字节
+# 一致性门（tests/test_replay_determinism.py）赖以成立的路径。
+FREE_PROVIDER_NAMES = frozenset({"mocked", "replay", "disabled"})
+
+
+def resolve_episode_budget_usd(env: Mapping[str, str] | None = None) -> float:
+    """读 ``AGENT_EPISODE_BUDGET_USD``；非法值直接抛。
+
+    刻意不"看不懂就用默认值"：把 ``AGENT_EPISODE_BUDGET_USD=0.O1``（字母 O）静默当成
+    0.10，等于研究者以为自己压了预算、实际没压，而账单要到月底才会说话。
+    """
+
+    environ = os.environ if env is None else env
+    raw = str(environ.get(EPISODE_BUDGET_ENV, "")).strip()
+    if not raw:
+        return DEFAULT_EPISODE_BUDGET_USD
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{EPISODE_BUDGET_ENV}={raw!r} 不是合法金额（美元浮点数）") from exc
+    if value < 0:
+        raise ValueError(f"{EPISODE_BUDGET_ENV}={raw!r} 不能为负")
+    return value
+
+
+class EpisodeCost(BaseModel):
+    """一条 episode（按 correlation_id 归集）的花费台账。
+
+    直接进 ``reasoning.coordination_decision`` 的 data 与 run 成本工件，因此字段就是
+    对外契约：``first_blocked_agent_id`` / ``first_blocked_at_call`` 回答的是
+    "预算是在**哪一步**咬下去的"——只报总额的护栏没法调。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    correlation_id: str = ""
+    budget_usd: float = DEFAULT_EPISODE_BUDGET_USD
+    calls: int = 0
+    billable_calls: int = 0
+    blocked_calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: float = 0.0
+    cost_by_model: dict[str, float] = Field(default_factory=dict)
+    usage_sources: dict[str, int] = Field(default_factory=dict)
+    first_blocked_agent_id: str | None = None
+    first_blocked_at_call: int | None = None
+
+    @property
+    def budget_exceeded(self) -> bool:
+        """"护栏真的咬下去了吗"。
+
+        只看有没有调用被拦，不看"花费是否已经超过预算"：后者在预算被设成 0 的实验里
+        恒为真，会让这个字段失去信号。被拦一次 = 这条 episode 里有推理链是降级产物，
+        这正是研究者读轨迹时要知道的那件事。
+        """
+
+        return self.blocked_calls > 0
+
+    def model_dump(self, *args: Any, **kwargs: Any) -> dict[str, Any]:  # type: ignore[override]
+        payload = super().model_dump(*args, **kwargs)
+        payload["budget_exceeded"] = self.budget_exceeded
+        return payload
+
+
+class EpisodeCostGuard:
+    """按 episode 累计 LLM 花费，超预算就把后续调用挡在门外。
+
+    挡的方式是**抛既有的** :class:`LLMProviderError`（reason=``budget_exceeded``）：
+    agent 侧（``BaseAgent._build_fallback_envelope``）与编排器侧（``HomeOrchestratorAgent.plan``）
+    早就有"provider 失败 → 规则回退 + 带标签"的路径，护栏因此不需要在 runtime 里另开
+    一条降级分支，``reasoning.fallback_rule_based`` 的 data.reason 直接就是 budget_exceeded。
+
+    判定用的是**上界**：``已花 + 下一次调用的最坏成本 >= 预算`` 就不发这一次。
+    先花再算等于允许超支，而超支是本护栏唯一要防的事。
+    """
+
+    def __init__(
+        self,
+        *,
+        budget_usd: float | None = None,
+        pricing: PricingTable | None = None,
+        env: Mapping[str, str] | None = None,
+        default_max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+    ) -> None:
+        self.budget_usd = (
+            float(budget_usd) if budget_usd is not None else resolve_episode_budget_usd(env)
+        )
+        self._pricing = pricing
+        self.default_max_output_tokens = default_max_output_tokens
+        self._episodes: dict[str, EpisodeCost] = {}
+        # 记下每台模型当时用的是哪条价格：事后没人能重算"当时按什么价算的"。
+        self._prices_used: dict[str, ModelPrice] = {}
+
+    # --- 查询 --------------------------------------------------------------
+
+    @property
+    def pricing(self) -> PricingTable:
+        return self._pricing or active_pricing_table()
+
+    def episode(self, correlation_id: str = "") -> EpisodeCost:
+        key = correlation_id or ""
+        entry = self._episodes.get(key)
+        if entry is None:
+            entry = EpisodeCost(correlation_id=key, budget_usd=self.budget_usd)
+            self._episodes[key] = entry
+        return entry
+
+    @property
+    def episodes(self) -> dict[str, EpisodeCost]:
+        return dict(self._episodes)
+
+    # --- 判定与记账 --------------------------------------------------------
+
+    def check_affordable(
+        self,
+        correlation_id: str = "",
+        *,
+        model: str | None = None,
+        provider: str | None = None,
+        prompt_tokens: int = 0,
+        max_output_tokens: int | None = None,
+        agent_id: str = "",
+    ) -> float:
+        """发这一次调用之前问一句。买不起就抛 ``budget_exceeded``；买得起返回最坏成本。"""
+
+        episode = self.episode(correlation_id)
+        worst_case = worst_case_call_cost_usd(
+            model=model,
+            provider=provider,
+            prompt_tokens=prompt_tokens,
+            max_output_tokens=(
+                self.default_max_output_tokens if max_output_tokens is None else max_output_tokens
+            ),
+            table=self.pricing,
+        )
+        projected = round(episode.cost_usd + worst_case, COST_DIGITS)
+        if projected < self.budget_usd:
+            return worst_case
+
+        episode.blocked_calls += 1
+        if episode.first_blocked_agent_id is None:
+            episode.first_blocked_agent_id = agent_id or None
+            episode.first_blocked_at_call = episode.calls + 1
+        # 护栏的每一次咬合都要留日志：plan_raw 风险条 #2 要求阈值调优是有证据的，
+        # 而不是"感觉太紧了就调大一点"。
+        log.warning(
+            "llm_budget_exceeded",
+            correlation_id=correlation_id,
+            agent_id=agent_id,
+            model=str(model or ""),
+            spent_usd=episode.cost_usd,
+            worst_case_usd=worst_case,
+            budget_usd=self.budget_usd,
+            calls=episode.calls,
+        )
+        raise LLMProviderError(
+            BUDGET_EXCEEDED_REASON,
+            (
+                f"episode 预算已用尽：已花 ${episode.cost_usd:.6f} + 本次最坏 ${worst_case:.6f} "
+                f">= 预算 ${self.budget_usd:.6f}（{EPISODE_BUDGET_ENV}）；"
+                f"agent={agent_id or '-'} model={model or '-'}"
+            ),
+        )
+
+    def record_call(
+        self,
+        correlation_id: str = "",
+        *,
+        usage: TokenUsage,
+        model: str | None = None,
+        provider: str | None = None,
+        billable: bool = True,
+    ) -> EpisodeCost:
+        """记一次已经发生的调用。``billable=False``（mocked/回放）只计次数，不计钱。"""
+
+        episode = self.episode(correlation_id)
+        episode.calls += 1
+        episode.input_tokens += usage.input_tokens
+        episode.output_tokens += usage.output_tokens
+        episode.usage_sources[usage.source.value] = (
+            episode.usage_sources.get(usage.source.value, 0) + 1
+        )
+        if not billable:
+            return episode
+
+        price = self.pricing.lookup(model, provider)
+        cost = price.cost_usd(usage)
+        model_key = str(model or price.model)
+        episode.billable_calls += 1
+        episode.cost_usd = round(episode.cost_usd + cost, COST_DIGITS)
+        episode.cost_by_model[model_key] = round(
+            episode.cost_by_model.get(model_key, 0.0) + cost, COST_DIGITS
+        )
+        self._prices_used.setdefault(model_key, price)
+        return episode
+
+    def reset(self, correlation_id: str | None = None) -> None:
+        if correlation_id is None:
+            self._episodes.clear()
+            self._prices_used.clear()
+            return
+        self._episodes.pop(correlation_id or "", None)
+
+    # --- 对外载荷 ----------------------------------------------------------
+
+    def episode_payload(self, correlation_id: str = "") -> dict[str, Any]:
+        """``reasoning.coordination_decision`` 的 data 里那一块。"""
+
+        return self.episode(correlation_id).model_dump(mode="json")
+
+    def run_payload(self) -> dict[str, Any]:
+        """整个 run 的成本汇总（成本工件的内容）。"""
+
+        episodes = [
+            self._episodes[key].model_dump(mode="json") for key in sorted(self._episodes)
+        ]
+        totals = {
+            "episodes": len(episodes),
+            "calls": sum(int(item["calls"]) for item in episodes),
+            "billable_calls": sum(int(item["billable_calls"]) for item in episodes),
+            "blocked_calls": sum(int(item["blocked_calls"]) for item in episodes),
+            "input_tokens": sum(int(item["input_tokens"]) for item in episodes),
+            "output_tokens": sum(int(item["output_tokens"]) for item in episodes),
+            "cost_usd": round(sum(float(item["cost_usd"]) for item in episodes), COST_DIGITS),
+            "budget_exceeded_episodes": sum(1 for item in episodes if item["budget_exceeded"]),
+        }
+        return {
+            "schema": "aura.llm_cost.v1",
+            "budget_usd": self.budget_usd,
+            "budget_env": EPISODE_BUDGET_ENV,
+            "totals": totals,
+            "episodes": episodes,
+            # 价格随工件一起走：没有价格出处的账单是不可复核的。
+            "pricing": {
+                "default": self.pricing.default.model_dump(mode="json"),
+                "source_path": (
+                    str(self.pricing.source_path) if self.pricing.source_path else None
+                ),
+                # 每台**被调用的模型名**对上它当时用的价格记录。两者刻意分开：
+                # 未知模型用的是兜底价，此时 price.model == "__default__" 而 model 是
+                # 真正被调用的模型名——"这份账是按兜底价算的"因此一眼可见。
+                "used": [
+                    {
+                        "model": key,
+                        "price": self._prices_used[key].model_dump(mode="json"),
+                    }
+                    for key in sorted(self._prices_used)
+                ],
+            },
+        }
+
+    def write_run_artifact(self, run_id: str, *, root: Path | str | None = None) -> Path | None:
+        """把成本汇总落到 ``data/runs/{run_id}/llm_cost.json``。
+
+        写不下去只记 error 不抛：记账塌了不该把一次仿真跑整个带走（与
+        :class:`RecordingLLMProvider` 的取舍一致）。
+        """
+
+        if not artifacts_enabled():
+            return None
+        try:
+            directory = run_dir(run_id, root=root)
+            directory.mkdir(parents=True, exist_ok=True)
+            path = directory / LLM_COST_FILENAME
+            path.write_text(canonical_json(self.run_payload()) + "\n", encoding="utf-8")
+        except (OSError, ValueError) as exc:
+            log.error("llm_cost_artifact_write_failed", run_id=run_id, error=str(exc))
+            return None
+        return path
+
+
+class BudgetGuardedLLMProvider(LLMProvider):
+    """给任意 provider 套上 episode 预算（S3-T8）。
+
+    做成 provider 包装而不是 runtime 里的一段分支，是为了让**每一条**真会花钱的调用
+    （编排器的 intent 调用 + 每个领域 agent 的调用）都必须经过同一个收费口——
+    "有人新加了一处 LLM 调用却忘了记账"因此在结构上不可能发生。
+
+    透明性是硬要求：``provider_name`` / ``model`` / ``llm_mode`` 一律穿透到内层，
+    否则 run 元数据会把"budget_guarded"记成模型名，§11 的九字段就成了假的。
+    """
+
+    def __init__(
+        self,
+        inner: LLMProvider,
+        guard: EpisodeCostGuard,
+        *,
+        correlation_id: str = "",
+        max_output_tokens: int | None = None,
+    ) -> None:
+        self.inner = inner
+        self.guard = guard
+        self.correlation_id = correlation_id
+        self._max_output_tokens = max_output_tokens
+
+    # --- 元数据穿透 --------------------------------------------------------
+
+    @property
+    def provider_name(self) -> str:  # type: ignore[override]
+        return str(getattr(self.inner, "provider_name", "unknown") or "unknown")
+
+    @property
+    def model(self) -> str:  # type: ignore[override]
+        return str(getattr(self.inner, "model", "") or "")
+
+    @property
+    def llm_mode(self) -> Any:  # type: ignore[override]
+        return getattr(self.inner, "llm_mode", LLMMode.LIVE)
+
+    @property
+    def api_key(self) -> Any:
+        return getattr(self.inner, "api_key", None)
+
+    @property
+    def timeout_ms(self) -> Any:
+        return getattr(self.inner, "timeout_ms", None)
+
+    @property
+    def recordings_path(self) -> Any:
+        return getattr(self.inner, "recordings_path", None)
+
+    # --- 接线 --------------------------------------------------------------
+
+    def for_episode(self, correlation_id: str) -> "BudgetGuardedLLMProvider":
+        """换一条 episode 的收费口，共用同一台 guard（台账不重置）。"""
+
+        return BudgetGuardedLLMProvider(
+            self.inner,
+            self.guard,
+            correlation_id=correlation_id,
+            max_output_tokens=self._max_output_tokens,
+        )
+
+    def is_billable(self) -> bool:
+        if self.provider_name in FREE_PROVIDER_NAMES:
+            return False
+        return resolve_mode_for_provider(self.inner) is not LLMMode.MOCKED
+
+    async def generate_decision(self, request: LLMDecisionRequest) -> AgentLLMDecision:
+        request_text = canonical_json(canonical_request_payload(request))
+        billable = self.is_billable()
+
+        if billable:
+            # 买得起才发。抛出的是 LLMProviderError(budget_exceeded)，由既有 fallback
+            # 路径接住并盖标签。
+            self.guard.check_affordable(
+                self.correlation_id,
+                model=self.model,
+                provider=self.provider_name,
+                prompt_tokens=estimate_tokens(request_text),
+                max_output_tokens=self._resolve_max_output_tokens(),
+                agent_id=request.agent_id,
+            )
+
+        decision = await self.inner.generate_decision(request)
+        self.guard.record_call(
+            self.correlation_id,
+            usage=self._usage_for(request_text, decision),
+            model=self.model,
+            provider=self.provider_name,
+            billable=billable,
+        )
+        return decision
+
+    # --- 内部 ---------------------------------------------------------------
+
+    def _resolve_max_output_tokens(self) -> int:
+        if self._max_output_tokens is not None:
+            return self._max_output_tokens
+        declared = getattr(self.inner, "max_tokens", None)
+        if isinstance(declared, int) and declared > 0:
+            return declared
+        return self.guard.default_max_output_tokens
+
+    def _usage_for(self, request_text: str, decision: AgentLLMDecision) -> TokenUsage:
+        """先读 provider 报的账，读不到再估。
+
+        ``inner.last_usage`` 是给真 provider 留的接口：把回包里的 usage 块原样挂上来
+        （dict 或 TokenUsage 都认）。裸 provider 现在还不挂，于是走估算——估算会偏，
+        但偏了也带着 ``usage_sources={"estimated": n}`` 的自述，而不是假装精确。
+        """
+
+        reported = getattr(self.inner, "last_usage", None)
+        if isinstance(reported, TokenUsage):
+            return reported
+        if isinstance(reported, Mapping):
+            parsed = parse_usage(reported)
+            if parsed is not None:
+                return parsed
+
+        response_text = json.dumps(
+            decision.model_dump(mode="json"), ensure_ascii=False, sort_keys=True
+        )
+        return estimate_usage(request_text=request_text, response_text=response_text)

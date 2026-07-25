@@ -1,0 +1,146 @@
+# §6.10 Multi-User Conflict —— S3 阶段门的头号场景（S2-T8 刻意留给 S3-T10）。
+#
+# spec §6.10 三条期望行为，本文件逐条落地：
+#   * "Orchestrator detects conflicting preferences" —— 两个用户在**同一个房间**里
+#     先后开始互不相容的活动（睡觉 vs 阅读），编排器为每条根事件各开一条 episode；
+#   * "Arbiter chooses a policy and explains it" —— 第三条 timeline 事件让 user_02 用
+#     一次场景切换表达他的偏好（`reading` 场景：把客厅灯拉到 68），而照明域按 21:30 的
+#     睡前策略要把同一台灯压到 30。**同设备同属性两个值** = §9.2 第一类冲突，仲裁器按
+#     §9.1 全序选边（comfort > ambience）并给出解释。注意照明域在这里是 comfort 档而
+#     **不是** explicit_user：explicit_user 属于行为体是真人的提案（UI 直控腿），一个被
+#     user.command 叫醒的域 agent 是在替用户做事，它仍然是 agent（S3 复审 blocker）；
+#   * "The episode includes a coordination decision" —— 每条 episode 恰好一条
+#     reasoning.coordination_decision（tests/test_multi_user_conflict.py 在盯）。
+#
+# 【跨阶段约定，勿加脚本直控项】本场景的 timeline **不得**出现带
+# `payload.capability` + `payload.value` 的设备直控项：
+# tests/test_canonical_scenarios.py::test_only_the_arrival_scenario_anchors_the_s15_2_command_acceptance
+# 按 id 升序取第一个带直控项的库场景作为 §15-2 的验收锚点，而 `multi_user_conflict`
+# 排在 `user_arrives_home_evening` 之前——在这里加一条直控项就会悄悄改掉那条验收的
+# 被测对象。user_02 的偏好因此走 `scene_id`（SceneAgent → 仲裁 → executor），
+# 而不是绕过仲裁的直控。
+scenario_schema_version: "1.0"
+id: multi_user_conflict
+name: 多用户偏好冲突
+description: 两位用户在同一间客厅里先后开始互不相容的活动（睡觉 / 阅读），照明与空调的偏好正面冲突，需要仲裁器选边并解释。
+seed: 1010
+duration_seconds: 120
+mode: observe
+
+initial_state:
+  time_of_day: "21:30"
+  weather: clear
+  outdoor_temp: 21.0
+  users:
+    user_01:
+      location: living_room
+      activity: resting
+      presence_state: home
+    user_02:
+      location: living_room
+      activity: resting
+      presence_state: home
+  rooms:
+    living_room:
+      occupancy: true
+      # 客厅此刻偏亮偏热：两个用户对"该调成什么样"给出相反答案，冲突才不是摆拍。
+      light_level: 70
+      temperature: 27.5
+  devices:
+    light_living_01:
+      state:
+        power: true
+        extra:
+          brightness: 70
+          color_temp: 3400
+    ac_living_01:
+      state:
+        power: true
+        extra:
+          target_temp: 26
+          mode: cool
+    curtain_living_01:
+      state:
+        extra:
+          open_percent: 40
+
+timeline:
+  # user_01 要睡了：偏好是暗 + 安静。
+  - at: 0
+    type: user.starts_activity
+    user_id: user_01
+    room_id: living_room
+    activity: sleeping
+  # user_02 同一间房里开始阅读：偏好是亮。两条根事件各自开一条 episode。
+  - at: 20
+    type: user.starts_activity
+    user_id: user_02
+    room_id: living_room
+    activity: reading
+  # user_02 用一次场景切换把"要亮"这件事落到设备上（reading 场景把灯拉到 68）。
+  - at: 40
+    type: user.command
+    user_id: user_02
+    room_id: living_room
+    payload:
+      scene_id: reading
+      reason: user_02 想在客厅看书
+  # user_01 随即用 sleep 场景表达相反的偏好（灯灭）。这一轮里 SceneAgent 要把客厅灯
+  # 关掉（light_level ↓），照明域按 21:30 睡前策略要把它从 68 拉回 30（light_level ↑）
+  # —— 同一个房间、同一条环境量、方向相反 = §9.2 第二类冲突（room_environment_goal）。
+  # 仲裁器按 §9.1 全序选边（comfort > ambience）并把理由写进 coordination_decision。
+  - at: 60
+    type: user.command
+    user_id: user_01
+    room_id: living_room
+    payload:
+      scene_id: sleep
+      reason: user_01 要睡了
+
+expected_device_effects:
+  # 冲突的落点：灯最终只能有一个亮度，且必须是**仲裁选出的那一个**。
+  # 区间刻意卡在两个候选之间：照明域的睡前档（30）在区间内，场景域的阅读档（68）在区间外。
+  # 写成精确值会把 S4 评估器绑死在照明策略的具体数字上，写成 5-75 又两个候选都收——
+  # 那样这条声明就只是摆设，分不出"谁赢了"。
+  - device_id: light_living_01
+    within_seconds: 60
+    expected:
+      power: true
+      extra.brightness:
+        min: 20
+        max: 45
+  - device_id: ac_living_01
+    within_seconds: 60
+    expected:
+      power: true
+      extra.target_temp:
+        min: 22
+        max: 26
+
+involved_agents:
+  - lighting_agent
+  - hvac_agent
+  - scene_agent
+
+success_criteria:
+  require_complete_episode: true
+  max_first_action_latency_ms: 5000
+  max_command_failures: 0
+  allow_fallback: true
+
+metrics:
+  - first_action_latency_ms
+  - command_failure_count
+  - coordination_decision_count
+
+ground_truth:
+  user_goal: "在同一个共享房间里调和两位用户互不相容的照明/温度偏好"
+  primary_room_ids: ["living_room"]
+  relevant_device_ids: ["light_living_01", "ac_living_01", "curtain_living_01"]
+  # 冲突发生在客厅：卧室的灯不该被这场争执波及。
+  forbidden_device_ids: ["light_bedroom_01"]
+  required_agent_roles: ["lighting", "hvac", "scene"]
+  acceptable_noop: false
+  expected_intent: "multi_user_preference_arbitration"
+  safety_constraints:
+    - "never_leave_a_shared_room_without_any_usable_light"

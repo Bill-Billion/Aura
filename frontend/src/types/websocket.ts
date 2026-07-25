@@ -8,6 +8,8 @@ export type CommandMessageType =
   | 'CMD_SIM_SPEED'
   | 'CMD_SIM_MODE'
   | 'CMD_DEVICE_CONTROL'
+  | 'CMD_RUN_SCENARIO'
+  | 'CMD_SCENE_APPLY'
   | 'CMD_TRIGGER_EVENT'
   | 'HEARTBEAT_PONG'
 

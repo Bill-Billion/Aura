@@ -1,75 +1,26 @@
 <script setup lang="ts">
+/**
+ * 场景面板：点一下发**一条** CMD_SCENE_APPLY，不再在浏览器里循环发 2×N 条直控。
+ *
+ * 场景要展开成哪些设备命令，由后端 SceneAgent 按 scene_definitions.yaml 决定，并与其他
+ * agent 走同一条编排 → 仲裁 → CommandExecutor 的腿。因此这个组件里**不该再出现任何设备
+ * 取值**（亮度/色温/开合度…）——那些值回到这里，就等于场景语义又漏回了浏览器。
+ */
 import { useUIStore } from '@/stores/uiStore'
 import { useWebSocket } from '@/composables/useWebSocket'
-import { useWorldStore } from '@/stores/worldStore'
+import {
+  SCENE_APPLY_COMMAND,
+  SCENE_PRESETS,
+  buildSceneApplyPayload,
+} from '@/utils/scenePresets'
 
 const uiStore = useUIStore()
-const worldStore = useWorldStore()
 const { sendCommand } = useWebSocket()
 
-const scenes = [
-  { id: 'reading', label: '阅读模式', desc: '局部暖光和半开窗帘' },
-  { id: 'entertainment', label: '娱乐模式', desc: '保持低亮度，强化客厅氛围' },
-  { id: 'away', label: '离家模式', desc: '收束灯光和窗帘，压低存在感' },
-  { id: 'sleep', label: '睡眠模式', desc: '关闭主要灯光，空调归夜间值' },
-]
+const scenes = SCENE_PRESETS
 
 function applyScene(sceneId: string) {
-  const devices = Object.entries(worldStore.devices)
-
-  switch (sceneId) {
-    case 'reading':
-      for (const [id, dev] of devices) {
-        if (dev.type === 'light') {
-          sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'turn_on' })
-          sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'set_state', params: { brightness: 68, color_temp: 3400 } })
-        }
-        if (dev.type === 'curtain') {
-          sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'set_state', params: { open_percent: 52 } })
-        }
-      }
-      break
-    case 'entertainment':
-      for (const [id, dev] of devices) {
-        if (dev.type === 'light') {
-          sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'turn_on' })
-          sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'set_state', params: { brightness: 42, color_temp: 2850 } })
-        }
-        if (dev.type === 'curtain') {
-          sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'set_state', params: { open_percent: 28 } })
-        }
-        if (dev.type === 'hvac') {
-          sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'turn_on' })
-          sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'set_state', params: { target_temp: 24, mode: 'cool' } })
-        }
-      }
-      break
-    case 'away':
-      for (const [id, dev] of devices) {
-        if (dev.type === 'light' || dev.type === 'hvac') {
-          sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'turn_off' })
-        }
-        if (dev.type === 'curtain') {
-          sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'set_state', params: { open_percent: 0 } })
-        }
-      }
-      break
-    case 'sleep':
-      for (const [id, dev] of devices) {
-        if (dev.type === 'light') {
-          sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'turn_off' })
-        }
-        if (dev.type === 'curtain') {
-          sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'set_state', params: { open_percent: 0 } })
-        }
-        if (dev.type === 'hvac') {
-          sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'turn_on' })
-          sendCommand('CMD_DEVICE_CONTROL', { device_id: id, action: 'set_state', params: { target_temp: 22, mode: 'cool' } })
-        }
-      }
-      break
-  }
-
+  sendCommand(SCENE_APPLY_COMMAND, buildSceneApplyPayload(sceneId))
   uiStore.sceneSelectorOpen = false
 }
 </script>
