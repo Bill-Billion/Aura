@@ -215,6 +215,8 @@ export interface EventFilters {
   category: EventCategoryFilter
   agentId: EventAgentFilter
   fallbackOnly: boolean
+  /** 按设备 ID 过滤——点击 3D 设备时置入，清空即取消过滤 */
+  deviceId: string | null
 }
 
 export interface EpisodeSummary {

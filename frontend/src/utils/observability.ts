@@ -68,6 +68,7 @@ export function createDefaultEventFilters(): EventFilters {
     category: 'all',
     agentId: 'all',
     fallbackOnly: false,
+    deviceId: null,
   }
 }
 
@@ -261,6 +262,15 @@ export function filterEpisodes(
     }
     if (filters.fallbackOnly && !episode.hasFallback) {
       return false
+    }
+    if (filters.deviceId) {
+      // 检查 episode 中是否有事件引用了该设备
+      const hasDeviceEvent = episode.events.some((event) => {
+        const data = event.data as Record<string, unknown>
+        return data?.device_id === filters.deviceId ||
+          data?.device_ids && Array.isArray(data.device_ids) && data.device_ids.includes(filters.deviceId)
+      })
+      if (!hasDeviceEvent) return false
     }
     return true
   })

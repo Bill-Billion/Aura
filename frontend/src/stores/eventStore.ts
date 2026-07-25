@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { computed, ref, watch } from 'vue'
 import { useAgentStore } from '@/stores/agentStore'
 import { useSimulationStore } from '@/stores/simulationStore'
+import { useUIStore } from '@/stores/uiStore'
 import type {
   ConnectionStateDerived,
   EventFilters,
@@ -23,11 +24,20 @@ const MAX_EVENTS = 500
 export const useEventStore = defineStore('events', () => {
   const agentStore = useAgentStore()
   const simulationStore = useSimulationStore()
+  const uiStore = useUIStore()
   const events = ref<SimEvent[]>([])
   const selectedEpisodeId = ref<string | null>(null)
   const selectedEventId = ref<string | null>(null)
   const filters = ref<EventFilters>(createDefaultEventFilters())
   const selectionPinned = ref(false)
+
+  // S5-T5：3D 设备点击 → 自动设置 deviceId 过滤
+  watch(
+    () => uiStore.activeDevice,
+    (deviceId) => {
+      filters.value = { ...filters.value, deviceId }
+    },
+  )
 
   const allEpisodes = computed(() => buildEpisodeSummaries(events.value, agentStore.agents))
   const episodes = computed(() => filterEpisodes(allEpisodes.value, filters.value))
