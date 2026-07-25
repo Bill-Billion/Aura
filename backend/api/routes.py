@@ -112,6 +112,7 @@ async def get_scenario(scenario_id: str):
 #   GET  /api/runs                  §11 元数据列表
 #   GET  /api/runs/{run_id}         单 run 元数据 + 事件条数 + 工件清单
 #   GET  /api/runs/{run_id}/events  本 run 的事件流
+#   GET  /api/runs/{run_id}/report  §18 评估报告（S4-T5，S5 对比视图消费）
 # ---------------------------------------------------------------------------
 
 
@@ -227,3 +228,64 @@ async def health_check():
     if _health_provider is None:
         return {"status": "ok"}
     return _health_provider()
+
+
+@router.get("/api/runs/{run_id}/report")
+async def get_run_report(run_id: str):
+    """§18 评估报告（S4-T5）。S5 对比视图只消费这个端点，不自造指标。
+
+    返回七指标 + success_criteria 判定 + §18 九问的可答字段。
+    如果 run 还带有 scenario 元数据，同时返回场景级 success_criteria 与 ground_truth。
+    """
+
+    from backend.evaluation.evaluator import EvalOutcome, evaluate_run
+    from backend.scenarios.loader import get_scenario
+
+    try:
+        report = evaluate_run(run_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "eval_error",
+                "message": f"评估失败：{exc}",
+                "details": {"run_id": run_id},
+            },
+        ) from exc
+
+    if report.outcome == EvalOutcome.ERROR:
+        raise HTTPException(
+            status_code=404 if "cannot read events" in (report.failure_reasons[0] if report.failure_reasons else "") else 500,
+            detail={
+                "code": "eval_error",
+                "message": report.failure_reasons[0] if report.failure_reasons else "评估失败",
+                "details": {"run_id": run_id},
+            },
+        )
+
+    # 如果 run 有 scenario_id，附上场景级信息（§18 九问中的 scenario 相关字段）
+    scenario_info = None
+    if report.scenario_id:
+        try:
+            spec = get_scenario(report.scenario_id)
+            if spec is not None:
+                scenario_info = {
+                    "name": spec.name,
+                    "description": spec.description,
+                    "involved_agents": spec.involved_agents,
+                    "success_criteria": spec.success_criteria.model_dump(),
+                    "expected_device_effects_count": len(spec.expected_device_effects),
+                    "expected_failures": [
+                        {"category": f.category, "device_id": f.device_id, "error_code": f.error_code}
+                        for f in (spec.expected_failures or [])
+                    ],
+                }
+                if spec.ground_truth:
+                    scenario_info["ground_truth"] = spec.ground_truth.model_dump()
+        except Exception:
+            pass
+
+    return {
+        **report.to_dict(),
+        "scenario": scenario_info,
+    }

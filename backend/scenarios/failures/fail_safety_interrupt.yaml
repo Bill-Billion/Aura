@@ -1,0 +1,73 @@
+# §13 fail_safety_interrupt
+# 安全事件（烟雾检测）中断在飞的舒适 episode
+# category: safety_event_interrupts_comfort
+# expected: safety 档抢占 comfort，coordination_decision 的 winning_priority=safety
+
+scenario_schema_version: "1.1"
+
+id: fail_safety_interrupt
+name: "安全事件中断舒适 episode"
+description: >
+  验证 §13 "Safety event interrupts comfort/energy behavior"：
+  HVAC agent 正在执行降温命令（comfort 档），安全烟雾事件触发，
+  SecurityAgent 以 safety 档抢占、切断在飞 episode 并打开通风。
+
+seed: 4301
+
+initial_state:
+  time_of_day: "14:00"
+  weather: clear
+  outdoor_temp: 38.0
+  rooms:
+    kitchen:
+      temperature: 42.0
+  devices:
+    hvac_living_01:
+      state:
+        power: true
+        extra:
+          mode: cool
+          target_temp: 24
+
+timeline:
+  - at: 0.0
+    type: user.starts_activity
+    user_id: user_01
+    room_id: living_room
+    activity: cooking
+
+  # 1 秒后触发烟雾检测
+  - at: 1.0
+    type: safety.smoke_detected
+    room_id: kitchen
+    payload:
+      severity: critical
+      source: kitchen_stove
+
+expected_device_effects:
+  - device_id: hvac_living_01
+    within_seconds: 30
+    expected:
+      power:
+        equals: true
+
+involved_agents:
+  - hvac_agent
+  - security_agent
+  - energy_agent
+  - home_orchestrator
+
+success_criteria:
+  require_complete_episode: true
+  max_first_action_latency_ms: 30000
+  allow_fallback: true
+
+expected_failures:
+  - category: safety_event_interrupts_comfort
+    error_code: superseded
+    device_id: hvac_living_01
+    description: "HVAC comfort 命令被 safety 档的 SecurityAgent 抢占"
+    expected_recovery: "safety 档优先于 comfort，HVAC 命令被标记为 superseded"
+
+mode: demo
+duration_seconds: 30
