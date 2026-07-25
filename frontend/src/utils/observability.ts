@@ -216,6 +216,12 @@ export function buildEpisodeSummaries(
       const activeAgents = uniqueStrings(activeAgentsByCorrelation.get(correlationId) ?? [])
       const primaryAgentId = activeAgents[0] ?? eventAgentIds[0] ?? null
 
+      const nonTickCount = groupedEvents.filter((e) => e.event_type !== 'system.timer_tick').length
+      const hasCancelled = groupedEvents.some(
+        (e) => e.event_type === 'reasoning.decision_discarded' ||
+        (e.event_type === 'reasoning.fallback_rule_based' && (e.data as Record<string, unknown>)?.reason === 'discarded'),
+      )
+
       return {
         correlationId,
         rootEventId: rootEvent.event_id,
@@ -224,9 +230,11 @@ export function buildEpisodeSummaries(
         lastEventId: lastEvent.event_id,
         lastUpdatedAt: lastEvent.wall_time ?? lastEvent.timestamp,
         eventCount: groupedEvents.length,
+        nonTickEventCount: nonTickCount,
         primaryAgentId,
         agentIds: uniqueStrings([...activeAgents, ...eventAgentIds]),
         hasFallback: groupedEvents.some((event) => event.event_type === 'reasoning.fallback_rule_based'),
+        hasCancelled,
         isActive: activeAgents.length > 0,
         categories: uniqueStrings(groupedEvents.map((event) => categorizeSimEvent(event))) as EventCategory[],
         events: groupedEvents,

@@ -225,9 +225,13 @@ export interface EpisodeSummary {
   lastEventId: string
   lastUpdatedAt: number
   eventCount: number
+  /** 不含 timer_tick 的有效事件数 */
+  nonTickEventCount: number
   primaryAgentId: string | null
   agentIds: string[]
   hasFallback: boolean
+  /** episode 被 reasoning.decision_discarded 显式取消 */
+  hasCancelled: boolean
   isActive: boolean
   categories: EventCategory[]
   events: SimEvent[]
