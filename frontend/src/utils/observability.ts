@@ -41,6 +41,7 @@ const EVENT_LABELS: Record<string, string> = {
   'system.simulation_started': '模拟已启动',
   'system.simulation_paused': '模拟已暂停',
   'system.simulation_reset': '模拟已重置',
+  'system.episode_cancelled': 'Episode 已取消',
   'environment.state_refresh': '环境刷新',
   'user.command': '用户指令',
   'user.activity_change': '用户活动变化',
@@ -175,6 +176,11 @@ export function extractEventAgentId(event: SimEvent): string | null {
 }
 
 export function compareSimEvents(a: SimEvent, b: SimEvent): number {
+  const aSeq = Number.isInteger(a.seq) && Number(a.seq) >= 0 ? Number(a.seq) : null
+  const bSeq = Number.isInteger(b.seq) && Number(b.seq) >= 0 ? Number(b.seq) : null
+  if (aSeq !== null && bSeq !== null && aSeq !== bSeq) {
+    return aSeq - bSeq
+  }
   if (a.timestamp !== b.timestamp) {
     return a.timestamp - b.timestamp
   }
@@ -218,10 +224,7 @@ export function buildEpisodeSummaries(
       const primaryAgentId = activeAgents[0] ?? eventAgentIds[0] ?? null
 
       const nonTickCount = groupedEvents.filter((e) => e.event_type !== 'system.timer_tick').length
-      const hasCancelled = groupedEvents.some(
-        (e) => e.event_type === 'reasoning.decision_discarded' ||
-        (e.event_type === 'reasoning.fallback_rule_based' && (e.data as Record<string, unknown>)?.reason === 'discarded'),
-      )
+      const hasCancelled = groupedEvents.some((event) => event.event_type === 'system.episode_cancelled')
 
       return {
         correlationId,
@@ -242,10 +245,9 @@ export function buildEpisodeSummaries(
       }
     })
     .sort((left, right) => {
-      if (left.lastUpdatedAt !== right.lastUpdatedAt) {
-        return right.lastUpdatedAt - left.lastUpdatedAt
-      }
-      return compareSimEvents(right.rootEvent, left.rootEvent)
+      const leftLast = left.events[left.events.length - 1]
+      const rightLast = right.events[right.events.length - 1]
+      return compareSimEvents(rightLast, leftLast)
     })
 }
 

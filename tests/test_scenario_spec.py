@@ -13,7 +13,9 @@ from pathlib import Path
 
 import pytest
 import structlog
+from pydantic import ValidationError
 
+from backend.engine.rng import MAX_JSON_SAFE_SEED
 from backend.scenarios.loader import (
     DEFAULT_LIBRARY_DIRS,
     ScenarioLoadError,
@@ -24,6 +26,7 @@ from backend.scenarios.spec import (
     EXPECTED_FAILURE_CATEGORIES,
     ExpectedValue,
     ScenarioSpec,
+    SuccessCriteria,
 )
 from backend.scenarios.versioning import (
     SUPPORTED_SCENARIO_SCHEMA_VERSION,
@@ -112,6 +115,34 @@ def write_scenario(tmp_path: Path, name: str, body: str) -> Path:
     path = tmp_path / f"{name}.yaml"
     path.write_text(body, encoding="utf-8")
     return path
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("probability", "nope"),
+        ("probability", 1.01),
+        ("recovery_probability", -0.01),
+    ],
+)
+def test_failure_injection_rejects_invalid_nested_probability(tmp_path, field, value):
+    base = load_scenario_file(write_scenario(tmp_path, "valid-base", SPEC_5_2_EXAMPLE))
+    payload = base.model_dump(mode="json")
+    payload["failure_injection"] = {"device_offline": {field: value}}
+    with pytest.raises(ValidationError, match=field):
+        ScenarioSpec.model_validate(payload)
+
+
+def test_noise_model_rejects_unknown_or_inverted_contract(tmp_path):
+    base = load_scenario_file(write_scenario(tmp_path, "valid-base", SPEC_5_2_EXAMPLE))
+    payload = base.model_dump(mode="json")
+    payload["noise_model"] = {"temperature_comfort": [30, 20]}
+    with pytest.raises(ValidationError, match="min < max"):
+        ScenarioSpec.model_validate(payload)
+
+    payload["noise_model"] = {"future_untyped_knob": {"value": "nope"}}
+    with pytest.raises(ValidationError, match="Extra inputs"):
+        ScenarioSpec.model_validate(payload)
 
 
 # ---------------------------------------------------------------- 1. §5.2 契约
@@ -204,6 +235,42 @@ def test_expected_value_matches_exact_range_and_one_of():
     assert ExpectedValue(min=1).matches(True) is False
 
 
+@pytest.mark.parametrize("bound", ["min", "max"])
+@pytest.mark.parametrize("token", [".nan", ".inf", "-.inf"])
+def test_expected_value_bounds_must_be_finite_yaml_numbers(tmp_path, bound, token):
+    body = SPEC_5_2_EXAMPLE.replace("min: 50", f"{bound}: {token}", 1)
+    path = write_scenario(tmp_path, f"non_finite_expected_{bound}_{token}", body)
+
+    with pytest.raises(ScenarioLoadError) as exc:
+        load_scenario_file(path)
+
+    assert bound in str(exc.value)
+    assert "有限数值" in str(exc.value)
+
+
+@pytest.mark.parametrize("bound", ["min", "max"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_expected_value_bounds_must_be_finite_model_inputs(bound, value):
+    with pytest.raises(ValidationError, match="有限数值"):
+        ExpectedValue.model_validate({bound: value})
+
+
+def test_expected_value_rejects_inverted_range_and_allows_equal_bounds():
+    with pytest.raises(ValidationError, match="min <= max"):
+        ExpectedValue(min=51, max=50)
+
+    exact_range = ExpectedValue(min=50, max=50)
+    assert exact_range.matches(50) is True
+    assert exact_range.matches(49) is False
+
+
+def test_min_conflict_count_is_a_non_negative_typed_criterion():
+    assert SuccessCriteria(min_conflict_count=1).min_conflict_count == 1
+    for invalid in (-1, True, "1"):
+        with pytest.raises(ValueError):
+            SuccessCriteria(min_conflict_count=invalid)
+
+
 def test_empty_expected_constraint_rejected():
     with pytest.raises(ValueError):
         ExpectedValue()
@@ -219,6 +286,15 @@ def test_missing_required_field_rejected(tmp_path):
         load_scenario_file(path)
     assert "seed" in str(exc.value)
     assert str(path) in str(exc.value)
+
+
+@pytest.mark.parametrize("seed", [True, MAX_JSON_SAFE_SEED + 1])
+def test_seed_must_round_trip_exactly_through_json(tmp_path, seed):
+    body = SPEC_5_2_EXAMPLE.replace("seed: 1001", f"seed: {str(seed).lower()}")
+    path = write_scenario(tmp_path, "unsafe_seed", body)
+    with pytest.raises(ScenarioLoadError) as exc:
+        load_scenario_file(path)
+    assert "seed" in str(exc.value)
 
 
 def test_unknown_device_id_rejected_against_registry(tmp_path):
@@ -256,6 +332,28 @@ def test_timeline_at_must_be_non_decreasing(tmp_path):
     with pytest.raises(ScenarioLoadError) as exc:
         load_scenario_file(path)
     assert "timeline" in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    ("field", "needle", "replacement"),
+    [
+        ("timeline.at", "- at: 0", "- at: {token}"),
+        ("within_seconds", "within_seconds: 5", "within_seconds: {token}"),
+        ("duration_seconds", "duration_seconds: 180", "duration_seconds: {token}"),
+    ],
+)
+@pytest.mark.parametrize("token", [".nan", ".inf", "-.inf"])
+def test_scenario_times_must_be_finite_yaml_numbers(
+    tmp_path, field, needle, replacement, token
+):
+    body = SPEC_5_2_EXAMPLE.replace(needle, replacement.format(token=token), 1)
+    path = write_scenario(tmp_path, f"non_finite_{field}_{token}", body)
+
+    with pytest.raises(ScenarioLoadError) as exc:
+        load_scenario_file(path)
+
+    assert field.split(".")[-1] in str(exc.value)
+    assert "有限数值" in str(exc.value)
 
 
 def test_unknown_root_event_type_rejected(tmp_path):
@@ -302,13 +400,11 @@ def test_strict_extra_field_rejected_at_supported_version(tmp_path):
 
 def test_parse_schema_version_forms():
     assert parse_schema_version("1.0") == (1, 0)
-    assert parse_schema_version("2") == (2, 0)
-    assert parse_schema_version("1.3.7") == (1, 3)
     # YAML 里未加引号的 1.0 会被解析成 float，helper 必须容忍
     assert parse_schema_version(1.0) == (1, 0)
-    assert parse_schema_version(2) == (2, 0)
-    with pytest.raises(SchemaVersionError):
-        parse_schema_version("abc")
+    for malformed in ("2", "1.3.7", 2, "abc"):
+        with pytest.raises(SchemaVersionError):
+            parse_schema_version(malformed)
 
 
 def test_check_schema_compatibility_three_branches():

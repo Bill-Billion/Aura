@@ -55,6 +55,7 @@ import asyncio
 import os
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
 from backend.agents.arbiter import (
@@ -89,6 +90,11 @@ from backend.agents.llm_modes import (
     BudgetGuardedLLMProvider,
     EpisodeCostGuard,
     LLMMode,
+    RECORDING_CORRUPT_REASON,
+    RECORDING_MISS_REASON,
+    RECORDING_UNAVAILABLE_REASON,
+    RECORDING_WRITE_REASON,
+    ReplayLLMProvider,
     RunScopedRecordedProvider,
     VersionedDecision,
     WorldVersionTracker,
@@ -98,20 +104,31 @@ from backend.agents.llm_modes import (
     live_llm_allowed,
     llm_mode_health,
     resolve_llm_mode_from_env,
+    resolve_mode_for_provider,
+    validate_recording_artifact,
 )
 from backend.agents.memory import AgentMemoryStore
 from backend.agents.types import AgentCommandProposal, AgentDecisionEnvelope
 from backend.api.ws import ConnectionManager
 from backend.core.logging import log
 from backend.engine.event_bus import EventBus, SimEvent
+from backend.engine.event_log import (
+    LLM_RECORDINGS_FILENAME,
+    RunArtifactError,
+    artifacts_enabled,
+    read_run_metadata,
+    run_dir,
+)
 from backend.engine.event_types import (
-    ALL_ROOT_EVENT_TYPES,
-    ENVIRONMENT_ROOT_EVENT_TYPES,
+    ENVIRONMENT_STATE_REFRESH,
+    starts_agent_episode,
 )
 from backend.engine.observation import ObservableProjector
 from backend.engine.run_manager import (
     STALE_RUN_DISCARD_EVENT_TYPE,
     STALE_RUN_DISCARD_REASON,
+    baseline_policy_for_llm_mode,
+    effective_llm_mode_for_policy,
 )
 from backend.engine.state import AgentRuntimeState, WorldState
 from backend.engine.state_manager import DeltaChange, StateManager
@@ -128,7 +145,7 @@ from backend.execution.executor import (
     CommandExecutor,
 )
 from backend.execution.validation import validate_command
-from backend.models.schemas import WSMessage
+from backend.models.schemas import BaselinePolicy, WSMessage
 
 PublishEvent = Callable[[SimEvent], Awaitable[SimEvent]]
 # 当前活跃 run 的 run_id 读数源（由 SimulationEngine 注入 RunManager.run_id）。
@@ -140,9 +157,11 @@ __all__ = [
     "DEFAULT_AGENT_FACTORIES",
     "AgentRuntime",
     "ArbitrationGate",
+    "BaselinePolicyUnavailableError",
     "DisabledLLMProvider",
     "HomeOrchestratorAgent",
     "SerialEmissionGate",
+    "RuntimePolicySelection",
     "TriggerClassifier",
     "STALE_RUN_DISCARD_EVENT_TYPE",
     "STALE_RUN_DISCARD_REASON",
@@ -295,6 +314,26 @@ class DisabledLLMProvider(LLMProvider):
         raise LLMProviderError("provider_error", "LLM provider is disabled")
 
 
+class BaselinePolicyUnavailableError(RuntimeError):
+    """请求的 baseline 无法在当前服务端安全执行。"""
+
+    def __init__(self, policy: BaselinePolicy, reason: str, **details: Any) -> None:
+        super().__init__(reason)
+        self.policy = policy
+        self.reason = reason
+        self.details = {"baseline_policy": policy.value, **details}
+
+
+@dataclass(frozen=True)
+class RuntimePolicySelection:
+    """已校验但尚未激活的逐-run provider 选择。"""
+
+    baseline_policy: BaselinePolicy
+    llm_mode: LLMMode
+    provider: LLMProvider
+    recording_source_run_id: str | None = None
+
+
 class TriggerClassifier:
     """Decide whether a root event should start a new agent episode.
 
@@ -307,11 +346,7 @@ class TriggerClassifier:
     """
 
     def should_start_episode(self, event: SimEvent) -> bool:
-        event_type = event.event_type
-        if event_type in ENVIRONMENT_ROOT_EVENT_TYPES:
-            reasons = event.data.get("significant_change_reasons")
-            return isinstance(reasons, list) and len(reasons) > 0
-        return event_type in ALL_ROOT_EVENT_TYPES
+        return starts_agent_episode(event.event_type, event.data)
 
 
 class AgentRuntime:
@@ -370,9 +405,16 @@ class AgentRuntime:
         # 引擎注入的那台唯一 executor；未注入时首次用到才自建一台并长期持有
         # （S1 review finding-8：绝不再每个 agent 每条 episode 造一台）。
         self.command_executor = command_executor
+        self._recording_integrity_error_handler: (
+            Callable[[str, str], None] | None
+        ) = None
         # §11.1 模式路由的**唯一**生产入口（S3 review major-2）。注入的 provider 在这里的
-        # 角色是"live 那一档"：LLM_MODE=recorded 时被录制层包住，=mocked 时被罐头顶掉。
-        self.llm_provider = self._resolve_llm_provider(llm_provider)
+        # 角色是"live 那一档"：逐 run 切策略时始终从这台服务端工厂重建，客户端既不能
+        # 传 key，也不能传 provider URL/path。
+        self._live_provider_factory: Callable[[], LLMProvider] = (
+            (lambda: llm_provider) if llm_provider is not None else self._build_default_provider
+        )
+        self.llm_provider = self._resolve_llm_provider()
         # S3-T8 成本护栏（S3 review major-4）：台账挂在 runtime 上（跨 episode 累计，
         # run 工件要的是整份 run 的汇总），收费口按 episode 现套——见 _episode_llm_provider。
         self.cost_guard = EpisodeCostGuard()
@@ -415,7 +457,7 @@ class AgentRuntime:
             return False
         return bool(getattr(self.llm_provider, "api_key", None))
 
-    def _resolve_llm_provider(self, injected: LLMProvider | None) -> LLMProvider:
+    def _resolve_llm_provider(self) -> LLMProvider:
         """§11.1：``LLM_MODE`` 决定这台 runtime 跑的是罐头 / 录制回放 / 真 provider。
 
         **``under_test=False`` 是刻意的。** ``resolve_llm_mode_from_env`` 那条"pytest 下
@@ -430,18 +472,183 @@ class AgentRuntime:
         因此也吃 ``LLM_MODE``——headless 跑法不需要再开第二个开关。
         """
 
-        live_provider_factory = (
-            (lambda: injected) if injected is not None else self._build_default_provider
-        )
         mode = resolve_llm_mode_from_env(under_test=False)
         if mode is LLMMode.RECORDED:
             # 录制文件的位置要 run_id，而 run_id 在本方法执行时还不存在（RunManager 后建，
             # run_id_source 要到 bind() 才注入）。所以交给按 run 惰性解析的那层。
             return RunScopedRecordedProvider(
-                live_provider_factory=live_provider_factory,
+                live_provider_factory=self._live_provider_factory,
                 run_id_source=self.current_run_id,
+                integrity_error_handler=self._mark_recording_integrity_error,
             )
-        return build_provider_for_mode(mode, live_provider_factory=live_provider_factory)
+        return build_provider_for_mode(
+            mode, live_provider_factory=self._live_provider_factory
+        )
+
+    def prepare_baseline_policy(
+        self,
+        policy: BaselinePolicy | None,
+        *,
+        recording_source_run_id: str | None = None,
+    ) -> RuntimePolicySelection:
+        """校验并构造逐-run provider，但不改动当前 runtime。
+
+        这是两阶段切换的 prepare：live 凭证、recorded 来源等错误必须在引擎 pause/
+        cancel/swap 之前暴露；真正激活由 reset 在旧 episode 全部取消后执行。
+        """
+
+        if policy is None:
+            provider = self._resolve_llm_provider()
+            mode = resolve_mode_for_provider(provider)
+            return RuntimePolicySelection(
+                baseline_policy=baseline_policy_for_llm_mode(mode),
+                llm_mode=mode,
+                provider=provider,
+            )
+
+        mode = effective_llm_mode_for_policy(policy)
+        if policy is BaselinePolicy.RULE_BASED:
+            provider = build_provider_for_mode(
+                mode, live_provider_factory=self._live_provider_factory
+            )
+        elif policy is BaselinePolicy.LLM_MOCKED:
+            provider = build_provider_for_mode(
+                mode,
+                live_provider_factory=self._live_provider_factory,
+                strict_mock=False,
+            )
+        elif policy is BaselinePolicy.LLM_LIVE:
+            provider = self._live_provider_factory()
+            if not bool(getattr(provider, "api_key", None)):
+                raise BaselinePolicyUnavailableError(
+                    policy,
+                    "服务端未配置可用的 live LLM provider",
+                    reason_code="live_provider_not_configured",
+                )
+        else:
+            if recording_source_run_id is not None:
+                try:
+                    source = read_run_metadata(recording_source_run_id)
+                    source_path = run_dir(recording_source_run_id) / LLM_RECORDINGS_FILENAME
+                except RunArtifactError as exc:
+                    raise BaselinePolicyUnavailableError(
+                        policy,
+                        "recorded 来源 run 不存在或不可读",
+                        reason_code="recording_source_not_found",
+                        recording_source_run_id=recording_source_run_id,
+                    ) from exc
+                if source.get("ended_at") is None:
+                    raise BaselinePolicyUnavailableError(
+                        policy,
+                        "recorded 来源 run 尚未 finalized",
+                        reason_code="recording_source_not_finalized",
+                        recording_source_run_id=recording_source_run_id,
+                    )
+                if source.get("end_reason") != "completed":
+                    raise BaselinePolicyUnavailableError(
+                        policy,
+                        "recorded 来源 run 未成功完成",
+                        reason_code="recording_artifact_invalid",
+                        recording_source_run_id=recording_source_run_id,
+                        source_end_reason=source.get("end_reason"),
+                    )
+                if source.get("artifact_error"):
+                    raise BaselinePolicyUnavailableError(
+                        policy,
+                        "recorded 来源 run 的工件已标记为无效",
+                        reason_code="recording_artifact_invalid",
+                        recording_source_run_id=recording_source_run_id,
+                        artifact_error=source.get("artifact_error"),
+                    )
+                if source.get("llm_mode") != LLMMode.RECORDED.value:
+                    raise BaselinePolicyUnavailableError(
+                        policy,
+                        "recorded 来源 run 的实际 LLM 模式不是 recorded",
+                        reason_code="recording_source_mode_mismatch",
+                        recording_source_run_id=recording_source_run_id,
+                        source_llm_mode=source.get("llm_mode"),
+                    )
+                if source.get("recording_source_run_id") is not None:
+                    raise BaselinePolicyUnavailableError(
+                        policy,
+                        "recorded 来源必须是原始录制 run，不能继续链式引用回放 run",
+                        reason_code="recording_artifact_invalid",
+                        recording_source_run_id=recording_source_run_id,
+                        nested_source_run_id=source.get("recording_source_run_id"),
+                    )
+                if not source_path.is_file():
+                    raise BaselinePolicyUnavailableError(
+                        policy,
+                        "recorded 来源 run 没有 LLM 录制工件",
+                        reason_code="recording_artifact_missing",
+                        recording_source_run_id=recording_source_run_id,
+                    )
+                try:
+                    validate_recording_artifact(source_path)
+                    provider = ReplayLLMProvider.from_file(source_path)
+                except (OSError, LLMProviderError, ValueError) as exc:
+                    raise BaselinePolicyUnavailableError(
+                        policy,
+                        "recorded 来源工件损坏或不可回放",
+                        reason_code="recording_artifact_invalid",
+                        recording_source_run_id=recording_source_run_id,
+                    ) from exc
+                if not provider.recordings:
+                    raise BaselinePolicyUnavailableError(
+                        policy,
+                        "recorded 来源工件为空",
+                        reason_code="recording_artifact_empty",
+                        recording_source_run_id=recording_source_run_id,
+                    )
+            else:
+                if not artifacts_enabled():
+                    raise BaselinePolicyUnavailableError(
+                        policy,
+                        "run 工件已禁用，无法执行 recorded 录制",
+                        reason_code="run_artifacts_disabled",
+                    )
+                live = self._live_provider_factory()
+                if not bool(getattr(live, "api_key", None)):
+                    raise BaselinePolicyUnavailableError(
+                        policy,
+                        "服务端未配置可供 recorded 模式录制的 live provider",
+                        reason_code="recording_provider_not_configured",
+                    )
+                # 不读取 LLM_RECORDINGS_PATH：这是一次显式逐-run 策略选择，目标只能是
+                # 新 run 自己的受控工件目录。回放来源只能由 recording_source_run_id 指定。
+                provider = RunScopedRecordedProvider(
+                    live_provider_factory=lambda: live,
+                    run_id_source=self.current_run_id,
+                    allow_env_override=False,
+                    integrity_error_handler=self._mark_recording_integrity_error,
+                )
+
+        effective = resolve_mode_for_provider(provider)
+        if effective is not mode:
+            raise BaselinePolicyUnavailableError(
+                policy,
+                "baseline 策略没有解析为预期的实际 LLM 模式",
+                reason_code="effective_mode_mismatch",
+                effective_llm_mode=effective.value,
+            )
+        return RuntimePolicySelection(
+            baseline_policy=policy,
+            llm_mode=effective,
+            provider=provider,
+            recording_source_run_id=recording_source_run_id,
+        )
+
+    def activate_baseline_policy(self, selection: RuntimePolicySelection) -> None:
+        """在旧 run 任务清空后原子替换 provider，并清空逐-run 成本账。"""
+
+        self.llm_provider = selection.provider
+        self.cost_guard.reset()
+        log.info(
+            "run_baseline_policy_activated",
+            baseline_policy=selection.baseline_policy.value,
+            llm_mode=selection.llm_mode.value,
+            recording_source_run_id=selection.recording_source_run_id,
+        )
 
     def _episode_llm_provider(self, correlation_id: str) -> LLMProvider:
         """本条 episode 的收费口（S3-T8）。
@@ -508,6 +715,7 @@ class AgentRuntime:
         publish_event: PublishEvent,
         command_executor: CommandExecutor | None = None,
         run_id_source: RunIdSource | None = None,
+        recording_integrity_error_handler: Callable[[str, str], None] | None = None,
     ) -> None:
         self.event_bus = event_bus
         self.state_manager = state_manager
@@ -517,6 +725,8 @@ class AgentRuntime:
             self.command_executor = command_executor
         if run_id_source is not None:
             self.run_id_source = run_id_source
+        if recording_integrity_error_handler is not None:
+            self._recording_integrity_error_handler = recording_integrity_error_handler
         # 绑定 = 换了世界（引擎构造 / 重新接线）：上一份观测历史不属于这个世界。
         self.observation_projector.reset()
         # S3-T7：世界版本簿记装在 StateManager 的唯一写入口上（幂等）。装不上就等于
@@ -555,6 +765,20 @@ class AgentRuntime:
 
         return self.run_id_source() if self.run_id_source is not None else None
 
+    def _mark_recording_integrity_error(self, message: str) -> None:
+        run_id = self.current_run_id()
+        if run_id is not None and self._recording_integrity_error_handler is not None:
+            self._recording_integrity_error_handler(run_id, message)
+
+    @staticmethod
+    def _is_recording_integrity_reason(reason: str | None) -> bool:
+        return reason in {
+            RECORDING_CORRUPT_REASON,
+            RECORDING_MISS_REASON,
+            RECORDING_UNAVAILABLE_REASON,
+            RECORDING_WRITE_REASON,
+        }
+
     def _is_stale_run(self, episode_run_id: str | None) -> bool:
         """episode 起点抓的 run 是否已经不是活跃 run。
 
@@ -592,6 +816,8 @@ class AgentRuntime:
     def reset(self) -> None:
         self.memory_store.clear()
         self.observation_projector.reset()
+        # 成本预算是 per run；上一 run 的 episode 台账不能挤占下一 run 的预算。
+        self.cost_guard.reset()
         # 旧世界的 explicit_user 占用不属于新世界：不清掉的话，reset 之后第一条
         # agent 提案会输给一条根本不存在的用户命令。
         self.arbitration_gate.forget_claims()
@@ -768,9 +994,10 @@ class AgentRuntime:
         now = time.monotonic()
         agents_to_run: list[BaseAgent] = []
         for agent in relevant_agents:
-            # 去抖对**所有**环境类根事件生效（不止旧的 state_refresh）：富分类学把
-            # 温度/光照阈值也变成了根事件，不一起去抖就会把 episode 触发频率放大一倍。
-            if event.event_type in ENVIRONMENT_ROOT_EVENT_TYPES:
+            # Only the compatibility refresh is high-frequency. Rich threshold
+            # roots are already edge-triggered by the generator's hysteresis and
+            # §15 requires each of them to produce a visible queued episode.
+            if event.event_type == ENVIRONMENT_STATE_REFRESH:
                 existing = self._active_tasks.get(agent.agent_id)
                 if existing is not None and not existing.done():
                     continue
@@ -813,7 +1040,7 @@ class AgentRuntime:
         }
         for agent in agents_to_run:
             self._active_tasks[agent.agent_id] = task
-            if event.event_type in ENVIRONMENT_ROOT_EVENT_TYPES:
+            if event.event_type == ENVIRONMENT_STATE_REFRESH:
                 self._last_environment_episode_started_at[agent.agent_id] = now
 
         def _cleanup(done_task: asyncio.Task[None], agent_ids: list[str]) -> None:
@@ -979,12 +1206,17 @@ class AgentRuntime:
             observable_world=snapshot,
             run_id=root_event.run_id or self.current_run_id(),
         )
-        return await self.orchestrator.plan(
+        decision = await self.orchestrator.plan(
             context,
             self._domain_bindings(agents),
             # 编排器的 intent 调用与域 agent 的调用记在**同一条** episode 台账上（S3-T8）。
             llm_provider=self._episode_llm_provider(root_event.correlation_id),
         )
+        if self._is_recording_integrity_reason(decision.plan.fallback_reason):
+            self._mark_recording_integrity_error(
+                f"recorded orchestrator integrity failure: {decision.plan.fallback_reason}"
+            )
+        return decision
 
     async def _emit_episode(
         self,
@@ -1539,6 +1771,10 @@ class AgentRuntime:
                 fallback_reason="timeout",
             )
         except LLMProviderError as exc:
+            if self._is_recording_integrity_reason(exc.reason):
+                self._mark_recording_integrity_error(
+                    f"recorded agent integrity failure: {exc.reason}"
+                )
             self._log_episode_failure(
                 agent=agent,
                 reason=exc.reason,

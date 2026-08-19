@@ -82,6 +82,27 @@ def test_memory_store_trims_correlation_and_agent_history():
     assert recent_agent_events[-1].event_type == "reasoning.perception_snapshot"
 
 
+def test_memory_prompt_omits_volatile_event_identities():
+    store = AgentMemoryStore()
+    root = _event(
+        "environment.light_level_threshold",
+        correlation_id="corr-1",
+        data={
+            "room_id": "living_room",
+            "trigger_event_id": "random-event-id",
+            "nested": {"caused_by_event_id": "another-random-id", "value": 10},
+        },
+    )
+    store.remember(root)
+
+    lines = store.build_recent_event_lines("lighting_agent", "corr-1")
+
+    assert lines == [
+        "environment.light_level_threshold: "
+        "{'nested': {'value': 10}, 'room_id': 'living_room'}"
+    ]
+
+
 def test_arbiter_prefers_higher_priority_and_recent_root_timestamp():
     arbiter = Arbiter()
 

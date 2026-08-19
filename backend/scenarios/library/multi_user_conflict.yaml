@@ -126,12 +126,13 @@ success_criteria:
   require_complete_episode: true
   max_first_action_latency_ms: 5000
   max_command_failures: 0
+  min_conflict_count: 1
   allow_fallback: true
 
 metrics:
   - first_action_latency_ms
   - command_failure_count
-  - coordination_decision_count
+  - conflict_count
 
 ground_truth:
   user_goal: "在同一个共享房间里调和两位用户互不相容的照明/温度偏好"
@@ -141,6 +142,8 @@ ground_truth:
   forbidden_device_ids: ["light_bedroom_01"]
   required_agent_roles: ["lighting", "hvac", "scene"]
   acceptable_noop: false
-  expected_intent: "multi_user_preference_arbitration"
+  # 首个主根 user.starts_activity:sleeping 的权威 wire intent；是否真的完成多用户仲裁
+  # 不靠虚构 intent 标签，而由 success_criteria.min_conflict_count 独立判定。
+  expected_intent: "sleep_comfort"
   safety_constraints:
     - "never_leave_a_shared_room_without_any_usable_light"

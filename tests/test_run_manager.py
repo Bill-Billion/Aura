@@ -14,7 +14,7 @@ import json
 import pytest
 
 from backend.engine.event_bus import EventBus, SimEvent
-from backend.engine.rng import RngStream
+from backend.engine.rng import MAX_JSON_SAFE_SEED, RngStream
 from backend.engine.run_manager import (
     SPEC11_REQUIRED_FIELDS,
     LLMMode,
@@ -22,6 +22,7 @@ from backend.engine.run_manager import (
     RunMetadata,
     compute_initial_state_hash,
     read_sim_version,
+    read_source_revision,
     resolve_llm_mode,
 )
 from backend.engine.state import (
@@ -87,7 +88,33 @@ def test_metadata_contains_all_nine_spec11_fields():
     assert metadata.llm_mode is LLMMode.LIVE
     assert metadata.agent_versions == {"lighting_agent": "0.1.0"}
     assert metadata.sim_version == read_sim_version()
+    assert metadata.source_revision == read_source_revision()
     assert metadata.ended_at is None
+
+
+def test_source_revision_changes_when_runtime_source_changes(tmp_path, monkeypatch):
+    import backend.engine.run_manager as run_manager_module
+
+    source_root = tmp_path / "backend"
+    source_root.mkdir()
+    source = source_root / "runtime.py"
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    version = tmp_path / "VERSION"
+    version.write_text("1.0.0\n", encoding="utf-8")
+    monkeypatch.delenv("AURA_SOURCE_REVISION", raising=False)
+    monkeypatch.setattr(run_manager_module, "_BACKEND_SOURCE_ROOT", source_root)
+    monkeypatch.setattr(run_manager_module, "_REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(run_manager_module, "_VERSION_FILE", version)
+
+    read_source_revision.cache_clear()
+    before = read_source_revision()
+    source.write_text("VALUE = 2\n", encoding="utf-8")
+    read_source_revision.cache_clear()
+    after = read_source_revision()
+    read_source_revision.cache_clear()
+
+    assert before.startswith("sha256:")
+    assert before != after
 
 
 def test_metadata_round_trips_through_canonical_json():
@@ -231,9 +258,21 @@ def test_seed_is_recorded_and_run_rng_is_reproducible():
 def test_seed_is_generated_and_recorded_when_absent():
     metadata = RunManager().start_run(world=_make_world())
     assert isinstance(metadata.seed, int)
-    assert 0 <= metadata.seed <= 2**64 - 1
+    assert 0 <= metadata.seed <= MAX_JSON_SAFE_SEED
 
 
 def test_invalid_seed_is_rejected_at_run_start():
     with pytest.raises((TypeError, ValueError)):
         RunManager().start_run(world=_make_world(), seed="1234")  # type: ignore[arg-type]
+
+
+def test_invalid_seed_does_not_supersede_the_active_run():
+    manager = RunManager()
+    active = manager.start_run(world=_make_world(), seed=7)
+
+    with pytest.raises((TypeError, ValueError)):
+        manager.start_run(world=_make_world(), seed=2**64)
+
+    assert manager.current is active
+    assert active.ended_at is None
+    assert manager.finished == []

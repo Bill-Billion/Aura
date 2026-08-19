@@ -37,7 +37,9 @@ from backend.agents.llm import (
 from backend.agents.llm_modes import (
     LLM_MODE_ENV,
     LLM_MODE_VALUES,
+    RECORDING_CORRUPT_REASON,
     RECORDING_MISS_REASON,
+    RECORDING_WRITE_REASON,
     RECORDING_SCHEMA,
     RECORDINGS_PATH_ENV,
     LLMMode,
@@ -45,6 +47,7 @@ from backend.agents.llm_modes import (
     MockedLLMProvider,
     RecordingLLMProvider,
     ReplayLLMProvider,
+    RunScopedRecordedProvider,
     build_provider_for_mode,
     canonical_request_payload,
     llm_mode_health,
@@ -53,12 +56,18 @@ from backend.agents.llm_modes import (
     request_key,
     resolve_llm_mode_from_env,
     resolve_mode_for_provider,
+    validate_recording_artifact,
 )
 from backend.agents.memory import AgentMemoryStore
 from backend.agents.types import AgentLLMDecision, LLMDecisionRequest
 from backend.api.ws import ConnectionManager
 from backend.engine.event_bus import EventBus, SimEvent
-from backend.engine.event_log import LLM_RECORDINGS_FILENAME, read_run_metadata, run_dir
+from backend.engine.event_log import (
+    LLM_RECORDINGS_FILENAME,
+    LLM_RECORDINGS_MANIFEST_FILENAME,
+    read_run_metadata,
+    run_dir,
+)
 from backend.engine.run_manager import RunManager
 from backend.engine.simulation import SimulationEngine
 from backend.engine.state_manager import StateManager
@@ -326,6 +335,10 @@ async def test_record_then_replay_round_trip_makes_zero_network_calls(tmp_path, 
     assert record["root_event_type"] == "user.arrives_home"
     assert record["prompt_hash"] == record["request_key"]
     assert record["decision"]["intent"] == _RECORDED_DECISION_JSON["intent"]
+    manifest = validate_recording_artifact(path)
+    assert manifest.complete is True
+    assert manifest.requested == manifest.recorded == 1
+    assert (tmp_path / LLM_RECORDINGS_MANIFEST_FILENAME).is_file()
 
     # --- 回放：同一份世界重新构造，且 httpx 客户端一旦被实例化就炸 ---
     monkeypatch.setattr(httpx, "AsyncClient", _NetworkSentinel)
@@ -347,6 +360,266 @@ async def test_record_then_replay_round_trip_makes_zero_network_calls(tmp_path, 
     assert replay.misses == 0
     assert resolve_mode_for_provider(replay) is LLMMode.RECORDED
     assert resolve_mode_for_provider(recorder) is LLMMode.RECORDED
+
+
+@pytest.mark.anyio
+async def test_recording_artifact_rejects_same_request_with_different_decisions(tmp_path):
+    """一个 canonical 请求不能在纯函数 replay 语义下同时对应两个决策。"""
+
+    path = tmp_path / LLM_RECORDINGS_FILENAME
+    first = LLMRecording.decision_from_payload(_RECORDED_DECISION_JSON)
+    second = first.model_copy(update={"intent": "a conflicting recorded decision"})
+
+    class SequenceProvider(LLMProvider):
+        def __init__(self) -> None:
+            self.decisions = [first, second]
+
+        async def generate_decision(self, request):  # type: ignore[override]
+            return self.decisions.pop(0).model_copy(deep=True)
+
+    recorder = RecordingLLMProvider(SequenceProvider(), path=path)
+    request = _arrive_home_request()
+    await recorder.generate_decision(request)
+    await recorder.generate_decision(request)
+
+    # 计数/hash 完整不代表语义无歧义；source admission 必须继续做内容校验。
+    raw_manifest = json.loads(
+        (tmp_path / LLM_RECORDINGS_MANIFEST_FILENAME).read_text(encoding="utf-8")
+    )
+    assert raw_manifest["complete"] is True
+    assert raw_manifest["requested"] == raw_manifest["recorded"] == 2
+
+    for loader in (load_recordings, validate_recording_artifact, ReplayLLMProvider.from_file):
+        with pytest.raises(LLMProviderError) as excinfo:
+            loader(path)
+        assert excinfo.value.reason == RECORDING_CORRUPT_REASON
+
+
+@pytest.mark.anyio
+async def test_recording_artifact_allows_identical_duplicate_decisions_as_pure_function(tmp_path):
+    """同键同值的重复 occurrence 不含歧义，任意重复回放仍返回同一个值。"""
+
+    path = tmp_path / LLM_RECORDINGS_FILENAME
+    decision = LLMRecording.decision_from_payload(_RECORDED_DECISION_JSON)
+
+    class StableProvider(LLMProvider):
+        async def generate_decision(self, request):  # type: ignore[override]
+            return decision.model_copy(deep=True)
+
+    recorder = RecordingLLMProvider(StableProvider(), path=path)
+    request = _arrive_home_request()
+    await recorder.generate_decision(request)
+    await recorder.generate_decision(request)
+
+    manifest = validate_recording_artifact(path)
+    assert manifest.requested == manifest.recorded == 2
+    assert len(load_recordings(path)) == 1
+
+    replay = ReplayLLMProvider.from_file(path)
+    first = await replay.generate_decision(request)
+    second = await replay.generate_decision(request)
+    assert first == second == decision
+    assert replay.hits == 2
+    assert replay.misses == 0
+
+
+@pytest.mark.anyio
+async def test_recording_checks_writability_before_live_call_and_fails_closed(tmp_path):
+    blocked_parent = tmp_path / "not-a-directory"
+    blocked_parent.write_text("blocked", encoding="utf-8")
+
+    class CountingProvider(LLMProvider):
+        calls = 0
+
+        async def generate_decision(self, request):  # type: ignore[override]
+            self.calls += 1
+            return LLMRecording.decision_from_payload(_RECORDED_DECISION_JSON)
+
+    inner = CountingProvider()
+    recorder = RecordingLLMProvider(
+        inner,
+        path=blocked_parent / LLM_RECORDINGS_FILENAME,
+    )
+
+    with pytest.raises(LLMProviderError) as excinfo:
+        await recorder.generate_decision(_arrive_home_request())
+
+    assert excinfo.value.reason == RECORDING_WRITE_REASON
+    assert inner.calls == 0
+
+
+@pytest.mark.anyio
+async def test_recorded_provider_failure_marks_capture_incomplete_and_invalid(tmp_path):
+    path = tmp_path / LLM_RECORDINGS_FILENAME
+    integrity_errors: list[str] = []
+
+    class FailingProvider(LLMProvider):
+        async def generate_decision(self, request):  # type: ignore[override]
+            raise LLMProviderError("provider_error", "upstream unavailable")
+
+    recorder = RecordingLLMProvider(
+        FailingProvider(),
+        path=path,
+        integrity_error_handler=integrity_errors.append,
+    )
+
+    with pytest.raises(LLMProviderError) as excinfo:
+        await recorder.generate_decision(_arrive_home_request())
+
+    assert excinfo.value.reason == "provider_error"
+    assert integrity_errors == ["provider_error"]
+    manifest = json.loads(
+        (tmp_path / LLM_RECORDINGS_MANIFEST_FILENAME).read_text(encoding="utf-8")
+    )
+    assert manifest["complete"] is False
+    assert manifest["requested"] == 1
+    assert manifest["recorded"] == 0
+    assert manifest["failed"] == 1
+
+
+@pytest.mark.anyio
+async def test_recording_direct_cancellation_marks_capture_incomplete_and_reraises(tmp_path):
+    path = tmp_path / LLM_RECORDINGS_FILENAME
+    started = asyncio.Event()
+    integrity_errors: list[str] = []
+
+    class BlockingProvider(LLMProvider):
+        async def generate_decision(self, request):  # type: ignore[override]
+            started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    recorder = RecordingLLMProvider(
+        BlockingProvider(),
+        path=path,
+        integrity_error_handler=integrity_errors.append,
+    )
+    task = asyncio.create_task(recorder.generate_decision(_arrive_home_request()))
+    await started.wait()
+    task.cancel("operator cancelled recording")
+
+    with pytest.raises(asyncio.CancelledError) as excinfo:
+        await task
+
+    assert excinfo.value.args == ("operator cancelled recording",)
+    assert recorder.requested == 1
+    assert recorder.written == 0
+    assert recorder.failed == 1
+    assert recorder.last_error
+    assert "cancel" in recorder.last_error.lower()
+    assert integrity_errors == [recorder.last_error]
+    manifest = json.loads(
+        (tmp_path / LLM_RECORDINGS_MANIFEST_FILENAME).read_text(encoding="utf-8")
+    )
+    assert manifest["complete"] is False
+    assert manifest["requested"] == 1
+    assert manifest["recorded"] == 0
+    assert manifest["failed"] == 1
+    assert manifest["last_error"] == recorder.last_error
+
+
+@pytest.mark.anyio
+async def test_recording_wait_for_timeout_marks_capture_incomplete(tmp_path):
+    path = tmp_path / LLM_RECORDINGS_FILENAME
+    started = asyncio.Event()
+    integrity_errors: list[str] = []
+
+    class BlockingProvider(LLMProvider):
+        async def generate_decision(self, request):  # type: ignore[override]
+            started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    recorder = RecordingLLMProvider(
+        BlockingProvider(),
+        path=path,
+        integrity_error_handler=integrity_errors.append,
+    )
+    task = asyncio.create_task(
+        asyncio.wait_for(
+            recorder.generate_decision(_arrive_home_request()),
+            timeout=0.05,
+        )
+    )
+    await started.wait()
+
+    with pytest.raises(TimeoutError):
+        await task
+
+    assert recorder.requested == 1
+    assert recorder.written == 0
+    assert recorder.failed == 1
+    assert recorder.last_error
+    assert "cancel" in recorder.last_error.lower()
+    assert integrity_errors == [recorder.last_error]
+    manifest = json.loads(
+        (tmp_path / LLM_RECORDINGS_MANIFEST_FILENAME).read_text(encoding="utf-8")
+    )
+    assert manifest["complete"] is False
+    assert manifest["requested"] == 1
+    assert manifest["recorded"] == 0
+    assert manifest["failed"] == 1
+    assert manifest["last_error"] == recorder.last_error
+
+
+@pytest.mark.anyio
+async def test_cancelled_recording_marks_active_run_artifact_invalid(
+    monkeypatch,
+):
+    monkeypatch.setenv(LLM_MODE_ENV, LLMMode.RECORDED.value)
+    monkeypatch.delenv(RECORDINGS_PATH_ENV, raising=False)
+    started = asyncio.Event()
+
+    class BlockingProvider(LLMProvider):
+        provider_name = "blocking_live"
+        model = "blocking-model"
+        api_key = "test-key"
+
+        async def generate_decision(self, request):  # type: ignore[override]
+            started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    engine = SimulationEngine(
+        event_bus=EventBus(),
+        state_manager=_arrive_home_state_manager(),
+        connection_manager=ConnectionManager(),
+        llm_provider=BlockingProvider(),
+    )
+    provider = engine.agent_runtime.llm_provider
+    assert isinstance(provider, RunScopedRecordedProvider)
+    run_id = engine.run_id
+    assert run_id is not None
+
+    task = asyncio.create_task(provider.generate_decision(_arrive_home_request()))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    metadata = read_run_metadata(run_id)
+    assert metadata["artifact_error"] == "recording request cancelled"
+    artifact = recordings_path(run_id)
+    with pytest.raises(LLMProviderError) as excinfo:
+        validate_recording_artifact(artifact)
+    assert excinfo.value.reason == "recording_corrupt"
+
+
+@pytest.mark.anyio
+async def test_recording_manifest_detects_a_truncated_capture(tmp_path):
+    path = tmp_path / LLM_RECORDINGS_FILENAME
+
+    class LocalProvider(LLMProvider):
+        async def generate_decision(self, request):  # type: ignore[override]
+            return LLMRecording.decision_from_payload(_RECORDED_DECISION_JSON)
+
+    recorder = RecordingLLMProvider(LocalProvider(), path=path)
+    await recorder.generate_decision(_arrive_home_request())
+    path.write_text("", encoding="utf-8")
+
+    with pytest.raises(LLMProviderError) as excinfo:
+        validate_recording_artifact(path)
+    assert excinfo.value.reason == "recording_corrupt"
 
 
 def test_recording_with_tampered_request_is_rejected_not_silently_returned(tmp_path):
@@ -418,6 +691,9 @@ async def test_replay_miss_falls_back_with_recording_miss_reason_labeled_event(t
     fallback_events = [e for e in events if e["event_type"] == "reasoning.fallback_rule_based"]
     assert fallback_events, "回放未命中必须走既有 fallback 路径并留下事件"
     assert {e["data"]["reason"] for e in fallback_events} == {RECORDING_MISS_REASON}
+    assert engine.run_manager.current is not None
+    assert RECORDING_MISS_REASON in str(engine.run_manager.current.artifact_error)
+    await engine.close()
 
 
 # ---------------------------------------------------------------------------
@@ -528,6 +804,7 @@ class _StubLiveProvider(LLMProvider):
     """"真 provider"那一档的本地替身：零网络，但语义上是会打网的那一台。"""
 
     provider_name = "anthropic_compatible"
+    max_tokens = 1200
 
     def __init__(self) -> None:
         self.model = "MiniMax-M2.7"

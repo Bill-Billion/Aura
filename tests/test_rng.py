@@ -17,6 +17,7 @@ import random
 import pytest
 
 from backend.engine.rng import (
+    MAX_JSON_SAFE_SEED,
     MAX_SEED,
     METADATA_VERSION,
     RngStream,
@@ -154,7 +155,7 @@ def test_stream_event_metadata_carries_rng_stream_and_seed():
 def test_seed_is_generated_and_recorded_when_absent():
     rng = SimRandom()
     assert isinstance(rng.seed, int)
-    assert 0 <= rng.seed <= MAX_SEED
+    assert 0 <= rng.seed <= MAX_JSON_SAFE_SEED
     # 未显式给 seed 的 run 也必须能被复现：seed 已被记录，可原样重建。
     replay = SimRandom(rng.seed)
     assert _draw(replay.stream(RngStream.USER_SIM)) == _draw(rng.stream(RngStream.USER_SIM))

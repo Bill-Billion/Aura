@@ -13,8 +13,8 @@
 
 ``recorded``
     先用真 provider 跑一遍并把 "canonical 请求指纹 → 原始决策" 落到
-    ``data/runs/{run_id}/llm_recordings.jsonl``（与 S2 的 events.jsonl 同目录，
-    critic 定死的路径），之后从文件确定性回放。
+    ``data/runs/{run_id}/llm_recordings.jsonl``，同时写入带请求数、成功数与内容 hash 的
+    完整性 manifest，之后只从通过校验的文件确定性回放。
     **DECISION #7：只有 recorded 能用于 benchmark 声明**，live 只用于产品验证——
     因为 live 的结果依赖"当天那个模型"，不可被第三方复现。
 
@@ -24,9 +24,9 @@
 **回放为什么必须"未命中就报错"**：回放最经典的塌法不是打不开文件，而是
 canonicalization 有缺口 → 键对不上 → 悄悄返回了另一条录制，于是研究者拿到一份看起来
 正常、其实张冠李戴的轨迹。所以 :class:`ReplayLLMProvider` 在未命中时抛
-``LLMProviderError("recording_miss")``，让既有的 fallback 路径带着标签降级
-（``reasoning.fallback_rule_based`` 的 data.reason 就是 ``recording_miss``），
-"这条链是回放缺口"因此可以被事后数出来。
+``LLMProviderError("recording_miss")``。运行时仍可执行规则 fallback 保住设备安全，但会
+同步把 run 工件标为 invalid；评估、稳定导出与后续 source admission 都 fail closed，不能把
+这份混合策略结果继续声称为可复现 recorded baseline。
 
 **陈旧决策丢弃（evolution-review 风险 #2）**：LLM 一轮要 1-5 秒，世界不会停下来等它。
 决策带上它据以推理的世界版本（:class:`VersionedDecision`），落地前比一次
@@ -50,6 +50,7 @@ canonicalization 有缺口 → 键对不上 → 悄悄返回了另一条录制�
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -57,7 +58,7 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from backend.agents.llm import (
     LLMProvider,
@@ -73,7 +74,6 @@ from backend.agents.llm_pricing import (
     TokenUsage,
     UsageSource,
     active_pricing_table,
-    estimate_tokens,
     estimate_usage,
     parse_usage,
     worst_case_call_cost_usd,
@@ -83,6 +83,7 @@ from backend.core.logging import log
 from backend.engine.event_bus import SimEvent
 from backend.engine.event_log import (
     LLM_RECORDINGS_FILENAME,
+    LLM_RECORDINGS_MANIFEST_FILENAME,
     artifacts_enabled,
     run_dir,
 )
@@ -99,6 +100,8 @@ __all__ = [
     "RECORDING_MISS_REASON",
     "RECORDING_CORRUPT_REASON",
     "RECORDING_UNAVAILABLE_REASON",
+    "RECORDING_WRITE_REASON",
+    "RECORDING_MANIFEST_SCHEMA",
     "RECORDINGS_PATH_ENV",
     "MOCK_FIXTURE_MISS_REASON",
     "STALE_DECISION_EVENT_TYPE",
@@ -118,9 +121,13 @@ __all__ = [
     "llm_mode_health",
     "recordings_path",
     "LLMRecording",
+    "LLMRecordingManifest",
+    "recording_manifest_path",
+    "validate_recording_artifact",
     "load_recordings",
     "default_mock_decision",
     "MockedLLMProvider",
+    "RuleBasedLLMProvider",
     "RecordingLLMProvider",
     "ReplayLLMProvider",
     "RunScopedRecordedProvider",
@@ -141,8 +148,8 @@ __all__ = [
 LLM_MODE_ENV = "LLM_MODE"
 LLM_MODE_VALUES: tuple[str, ...] = tuple(mode.value for mode in LLMMode)
 
-# 测试进程里必须有这个环境变量才能搭一台会打真网的 provider。
-# 缺省闸门是"测试进程一律不许"——把本机拉回 CI 那条路径（无 key → rule fallback）。
+# 所有进程都必须显式设置这个变量，才能搭一台会打真网的 provider。
+# API key 存在不等于授权消费；缺省永远回到 disabled → rule fallback。
 ALLOW_LIVE_LLM_ENV = "AURA_ALLOW_LIVE_LLM"
 _TRUTHY: frozenset[str] = frozenset({"1", "true", "yes", "on"})
 
@@ -156,6 +163,8 @@ _TRUTHY: frozenset[str] = frozenset({"1", "true", "yes", "on"})
 #
 # 指到已存在的文件 → 回放（零网络）；指到不存在的路径 → 录制到那里。
 RECORDINGS_PATH_ENV = "LLM_RECORDINGS_PATH"
+RECORDING_WRITE_REASON = "recording_write_failed"
+RECORDING_MANIFEST_SCHEMA = "aura.llm-recording-manifest/1"
 
 # recorded 模式拿不到 run_id（runtime 还没绑 RunManager，且没给 LLM_RECORDINGS_PATH）时
 # 的降级标签。刻意不静默改用 live：那等于研究者以为自己在录，实际什么都没留下。
@@ -243,7 +252,7 @@ def running_under_test(env: Mapping[str, str] | None = None) -> bool:
 
 
 def live_llm_allowed(env: Mapping[str, str] | None = None) -> bool:
-    """测试进程能不能从环境变量里现搭一台**会打真网**的 provider。
+    """服务端是否显式授权构造一台**会打真网**的 provider。
 
     S3 review-2 blocker：仓库根的 ``.env.local`` 带着真 key，``backend.main`` 在 import
     期就 :func:`~backend.core.local_env.load_local_env` 把它灌进 ``os.environ``，于是
@@ -253,9 +262,9 @@ def live_llm_allowed(env: Mapping[str, str] | None = None) -> bool:
     走的是无 key → :class:`DisabledLLMProvider` → 规则回退那条），本机的绿灯因此
     根本不是 CI 验证的那盏灯。
 
-    所以缺省闸门是"测试进程一律不许"，把本机拉回 CI 那条路径。真要跑 live 的测试必须
-    显式设 ``AURA_ALLOW_LIVE_LLM=1`` 说出来（见 tests/conftest.py 的 ``live_llm`` 标记：
-    没配 key 时它 skip，绝不静默花钱）。
+    所以缺省闸门在所有环境都关闭。API key 只表示凭证存在，不表示进程所有者同意消费；
+    真要跑 live/首次 recorded 录制必须显式设 ``AURA_ALLOW_LIVE_LLM=1``。测试仍由
+    tests/conftest.py 的传输层哨兵做第二层防线。
 
     刻意**不**在这里洗 ``os.environ``：清 key 是打地鼠（provider 一多就漏一个），而这
     条闸门管的是唯一的出口——``_build_default_provider`` 是全仓库唯一按环境变量造
@@ -263,8 +272,6 @@ def live_llm_allowed(env: Mapping[str, str] | None = None) -> bool:
     """
 
     environ = os.environ if env is None else env
-    if not running_under_test(environ):
-        return True
     return str(environ.get(ALLOW_LIVE_LLM_ENV, "")).strip().lower() in _TRUTHY
 
 
@@ -377,12 +384,63 @@ class LLMRecording(BaseModel):
         return json.dumps(self.to_json_dict(), ensure_ascii=False, sort_keys=True)
 
 
+class LLMRecordingManifest(BaseModel):
+    """Proof that every attempted live decision was durably recorded."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    schema_version: str = Field(default=RECORDING_MANIFEST_SCHEMA, alias="schema")
+    requested: int = Field(ge=0)
+    recorded: int = Field(ge=0)
+    failed: int = Field(ge=0)
+    complete: bool
+    recording_sha256: str
+    last_error: str | None = None
+
+
+def recording_manifest_path(path: Path | str) -> Path:
+    return Path(path).with_name(LLM_RECORDINGS_MANIFEST_FILENAME)
+
+
+def validate_recording_artifact(path: Path | str) -> LLMRecordingManifest:
+    """Validate manifest counts, digest, and every JSONL recording entry."""
+
+    recording_path = Path(path)
+    manifest_path = recording_manifest_path(recording_path)
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = LLMRecordingManifest.model_validate(payload)
+        raw = recording_path.read_bytes()
+    except (OSError, json.JSONDecodeError, ValidationError) as exc:
+        raise LLMProviderError(
+            RECORDING_CORRUPT_REASON,
+            f"录制 manifest 不存在或损坏：{manifest_path}: {exc}",
+        ) from exc
+
+    lines = [line for line in raw.splitlines() if line.strip()]
+    digest = hashlib.sha256(raw).hexdigest()
+    if (
+        not manifest.complete
+        or manifest.requested <= 0
+        or manifest.failed != 0
+        or manifest.recorded != manifest.requested
+        or manifest.recorded != len(lines)
+        or manifest.recording_sha256 != digest
+    ):
+        raise LLMProviderError(
+            RECORDING_CORRUPT_REASON,
+            "录制工件不完整：请求数、成功数、行数或内容摘要不一致",
+        )
+    load_recordings(recording_path)
+    return manifest
+
+
 def load_recordings(path: Path | str) -> dict[str, LLMRecording]:
     """读一份 jsonl 录制，返回 ``{request_key: LLMRecording}``。
 
-    同一个键出现多次时保留**第一条**：回放因此是"请求 → 决策"的纯函数，同一份录制
-    回放多少次都一样。后续条目若与首条决策不同会记一条 warning（模型当时不确定，
-    值得研究者知道），但不改变回放结果。
+    回放契约是"canonical 请求 → 决策"的纯函数。同键同决策的重复 occurrence 因而
+    可以安全折叠；同键不同决策则没有唯一可复现答案，必须把整份工件判为损坏，而不是
+    静默保留第一条并让 A/A 回放偏离原始 run。
     """
 
     file_path = Path(path)
@@ -422,11 +480,10 @@ def load_recordings(path: Path | str) -> dict[str, LLMRecording]:
         if existing is None:
             recordings[record.request_key] = record
         elif existing.decision != record.decision:
-            log.warning(
-                "llm_recording_ambiguous",
-                path=str(file_path),
-                line=line_no,
-                request_key=record.request_key[:12],
+            raise LLMProviderError(
+                RECORDING_CORRUPT_REASON,
+                f"{file_path}:{line_no} 的 request_key {record.request_key[:12]}… "
+                "对应多个不同决策，无法确定性回放",
             )
     return recordings
 
@@ -452,6 +509,17 @@ def default_mock_decision(request: LLMDecisionRequest) -> AgentLLMDecision:
         explanation="Deterministic mocked decision (no fixture matched).",
         needs_coordination=False,
     )
+
+
+class RuleBasedLLMProvider(LLMProvider):
+    """显式的无 LLM provider；调用即进入既有规则回退链。"""
+
+    provider_name = "disabled"
+    model = "rule_based"
+    llm_mode = LLMMode.RULE_BASED
+
+    async def generate_decision(self, request: LLMDecisionRequest) -> AgentLLMDecision:
+        raise LLMProviderError("provider_error", "LLM provider is disabled")
 
 
 class MockedLLMProvider(LLMProvider):
@@ -522,10 +590,15 @@ class RecordingLLMProvider(LLMProvider):
         inner: LLMProvider,
         *,
         path: Path | str,
+        integrity_error_handler: Callable[[str], None] | None = None,
     ) -> None:
         self.inner = inner
         self.recordings_path = Path(path)
+        self.integrity_error_handler = integrity_error_handler
+        self.requested = 0
         self.written = 0
+        self.failed = 0
+        self.last_error: str | None = None
 
     # 元数据穿透：run 元数据要记的是"真正说话的那台模型"，不是包装层。
     @property
@@ -541,9 +614,67 @@ class RecordingLLMProvider(LLMProvider):
         return getattr(self.inner, "timeout_ms", None)
 
     async def generate_decision(self, request: LLMDecisionRequest) -> AgentLLMDecision:
-        decision = await self.inner.generate_decision(request)
-        self._append(request, decision)
+        self.requested += 1
+        try:
+            # Mark the artifact incomplete before making a live request.  If the
+            # process or disk fails afterwards, this source can never be accepted
+            # as a complete replay corpus.
+            self._write_manifest()
+        except LLMProviderError:
+            self.failed += 1
+            self._mark_integrity_error("recording manifest could not be initialized")
+            raise
+        try:
+            decision = await self.inner.generate_decision(request)
+            self._append(request, decision)
+            self.written += 1
+            self._write_manifest()
+        except asyncio.CancelledError as exc:
+            self.failed += 1
+            cancellation_error = str(exc).strip() or "recording request cancelled"
+            self.last_error = cancellation_error
+            # Cancellation is a failed capture, not an invisible control-flow
+            # detail: the live request may already have reached the provider, but
+            # no durable decision was recorded.  Cleanup is deliberately best
+            # effort so a callback/disk failure cannot replace the original
+            # CancelledError observed by the caller.
+            try:
+                self._mark_integrity_error(cancellation_error)
+            except Exception as cleanup_exc:
+                log.error(
+                    "llm_recording_cancel_integrity_handler_failed",
+                    path=str(self.recordings_path),
+                    error=str(cleanup_exc),
+                )
+            try:
+                self._write_manifest()
+            except Exception as cleanup_exc:
+                log.error(
+                    "llm_recording_cancel_manifest_write_failed",
+                    path=str(self.recordings_path),
+                    error=str(cleanup_exc),
+                )
+            raise
+        except Exception as exc:
+            self.failed += 1
+            self.last_error = str(getattr(exc, "reason", "") or exc)
+            # A recorded baseline is reproducible only when every requested
+            # decision was captured.  A normal provider failure is just as
+            # disqualifying as a disk failure: rule fallback may keep the world
+            # safe, but the resulting mixed-policy run must not be evaluated or
+            # exported as a complete recording.
+            self._mark_integrity_error(self.last_error)
+            try:
+                self._write_manifest()
+            except LLMProviderError:
+                pass
+            raise
         return decision
+
+    def _mark_integrity_error(self, message: str) -> None:
+        self.last_error = message
+        if self.integrity_error_handler is not None:
+            self.integrity_error_handler(message)
 
     def _append(self, request: LLMDecisionRequest, decision: AgentLLMDecision) -> None:
         payload = canonical_request_payload(request)
@@ -570,8 +701,50 @@ class RecordingLLMProvider(LLMProvider):
                 path=str(self.recordings_path),
                 error=str(exc),
             )
-            return
-        self.written += 1
+            raise LLMProviderError(
+                RECORDING_WRITE_REASON,
+                f"LLM 决策成功但录制写入失败：{self.recordings_path}: {exc}",
+            ) from exc
+
+    def _write_manifest(self) -> None:
+        manifest_path = recording_manifest_path(self.recordings_path)
+        temp_path = manifest_path.with_name(f".{manifest_path.name}.tmp")
+        try:
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            raw = self.recordings_path.read_bytes() if self.recordings_path.is_file() else b""
+            manifest = LLMRecordingManifest(
+                requested=self.requested,
+                recorded=self.written,
+                failed=self.failed,
+                complete=(
+                    self.requested > 0
+                    and self.requested == self.written
+                    and self.failed == 0
+                ),
+                recording_sha256=hashlib.sha256(raw).hexdigest(),
+                last_error=self.last_error,
+            )
+            temp_path.write_text(
+                json.dumps(
+                    manifest.model_dump(mode="json", by_alias=True),
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            temp_path.replace(manifest_path)
+        except OSError as exc:
+            log.error(
+                "llm_recording_manifest_write_failed",
+                path=str(manifest_path),
+                error=str(exc),
+            )
+            raise LLMProviderError(
+                RECORDING_WRITE_REASON,
+                f"无法持久化 LLM 录制完整性 manifest：{manifest_path}: {exc}",
+            ) from exc
 
 
 class ReplayLLMProvider(LLMProvider):
@@ -637,6 +810,10 @@ def build_provider_for_mode(
     """
 
     resolved = LLMMode(mode)
+    if resolved is LLMMode.RULE_BASED:
+        # ``rule_based`` 过去落到函数末尾，误用了 live factory；这会让显式无 LLM
+        # baseline 在有服务端凭证时悄悄变成真实网络调用。
+        return RuleBasedLLMProvider()
     if resolved is LLMMode.MOCKED:
         return MockedLLMProvider(fixtures, strict=strict_mock)
 
@@ -686,23 +863,41 @@ class RunScopedRecordedProvider(LLMProvider):
         run_id_source: Callable[[], str | None] | None = None,
         recordings_root: Path | str | None = None,
         path_override: Path | str | None = None,
+        allow_env_override: bool = True,
+        integrity_error_handler: Callable[[str], None] | None = None,
     ) -> None:
         self._live_provider_factory = live_provider_factory
         self._run_id_source = run_id_source
         self._recordings_root = recordings_root
         self._path_override = Path(path_override) if path_override is not None else None
+        self._allow_env_override = bool(allow_env_override)
+        self._integrity_error_handler = integrity_error_handler
+        self._bound_run_id: str | None = None
         self._resolved: dict[str, LLMProvider] = {}
 
     # --- 解析 ---------------------------------------------------------------
 
     def _target_path(self) -> tuple[str, Path] | None:
-        override = self._path_override or resolve_recordings_path_override()
+        override = self._path_override
+        if override is None and self._allow_env_override:
+            override = resolve_recordings_path_override()
         if override is not None:
             return (f"override:{override}", override)
-        run_id = self._run_id_source() if self._run_id_source is not None else None
+        run_id = self._bound_run_id
+        if run_id is None and self._run_id_source is not None:
+            run_id = self._run_id_source()
         if not run_id:
             return None
         return (run_id, recordings_path(run_id, root=self._recordings_root))
+
+    def bind_run(self, run_id: str) -> None:
+        """在 run 元数据读取 provider 属性前，先钉住新 run 的录制目录。
+
+        reset 期间 ``run_id_source`` 仍指向旧 run；若依赖它，provider_name/model 的
+        属性访问会提前解析旧目录，随后新 run 也继续写进旧工件。
+        """
+
+        self._bound_run_id = run_id
 
     def resolve(self) -> LLMProvider | None:
         """当前 run 对应的内层 provider（录制或回放）；拿不到位置时 None。"""
@@ -719,6 +914,8 @@ class RunScopedRecordedProvider(LLMProvider):
             live_provider_factory=self._live_provider_factory,
             recordings_path=path,
         )
+        if isinstance(provider, RecordingLLMProvider):
+            provider.integrity_error_handler = self._integrity_error_handler
         log.info(
             "llm_recorded_provider_resolved",
             run_key=key,
@@ -1134,6 +1331,10 @@ class EpisodeCostGuard:
         self._pricing = pricing
         self.default_max_output_tokens = default_max_output_tokens
         self._episodes: dict[str, EpisodeCost] = {}
+        # Worst-case cost already admitted but not yet settled.  check + reserve
+        # is synchronous (no await), so concurrent domain-agent tasks sharing
+        # one event loop cannot all observe the same stale spent balance.
+        self._reserved_usd: dict[str, float] = {}
         # 记下每台模型当时用的是哪条价格：事后没人能重算"当时按什么价算的"。
         self._prices_used: dict[str, ModelPrice] = {}
 
@@ -1179,8 +1380,11 @@ class EpisodeCostGuard:
             ),
             table=self.pricing,
         )
-        projected = round(episode.cost_usd + worst_case, COST_DIGITS)
+        key = correlation_id or ""
+        reserved = self._reserved_usd.get(key, 0.0)
+        projected = round(episode.cost_usd + reserved + worst_case, COST_DIGITS)
         if projected < self.budget_usd:
+            self._reserved_usd[key] = round(reserved + worst_case, COST_DIGITS)
             return worst_case
 
         episode.blocked_calls += 1
@@ -1195,6 +1399,7 @@ class EpisodeCostGuard:
             agent_id=agent_id,
             model=str(model or ""),
             spent_usd=episode.cost_usd,
+            reserved_usd=reserved,
             worst_case_usd=worst_case,
             budget_usd=self.budget_usd,
             calls=episode.calls,
@@ -1202,7 +1407,8 @@ class EpisodeCostGuard:
         raise LLMProviderError(
             BUDGET_EXCEEDED_REASON,
             (
-                f"episode 预算已用尽：已花 ${episode.cost_usd:.6f} + 本次最坏 ${worst_case:.6f} "
+                f"episode 预算已用尽：已花 ${episode.cost_usd:.6f} + 在飞预留 ${reserved:.6f} "
+                f"+ 本次最坏 ${worst_case:.6f} "
                 f">= 预算 ${self.budget_usd:.6f}（{EPISODE_BUDGET_ENV}）；"
                 f"agent={agent_id or '-'} model={model or '-'}"
             ),
@@ -1216,10 +1422,21 @@ class EpisodeCostGuard:
         model: str | None = None,
         provider: str | None = None,
         billable: bool = True,
+        reserved_usd: float | None = None,
     ) -> EpisodeCost:
-        """记一次已经发生的调用。``billable=False``（mocked/回放）只计次数，不计钱。"""
+        """Settle one call; release its preflight reservation before recording."""
 
         episode = self.episode(correlation_id)
+        if billable and reserved_usd is not None:
+            key = correlation_id or ""
+            remaining = round(
+                max(0.0, self._reserved_usd.get(key, 0.0) - reserved_usd),
+                COST_DIGITS,
+            )
+            if remaining:
+                self._reserved_usd[key] = remaining
+            else:
+                self._reserved_usd.pop(key, None)
         episode.calls += 1
         episode.input_tokens += usage.input_tokens
         episode.output_tokens += usage.output_tokens
@@ -1244,8 +1461,10 @@ class EpisodeCostGuard:
         if correlation_id is None:
             self._episodes.clear()
             self._prices_used.clear()
+            self._reserved_usd.clear()
             return
         self._episodes.pop(correlation_id or "", None)
+        self._reserved_usd.pop(correlation_id or "", None)
 
     # --- 对外载荷 ----------------------------------------------------------
 
@@ -1337,6 +1556,8 @@ class BudgetGuardedLLMProvider(LLMProvider):
         self.inner = inner
         self.guard = guard
         self.correlation_id = correlation_id
+        if max_output_tokens is not None and max_output_tokens <= 0:
+            raise ValueError("max_output_tokens 必须为正整数")
         self._max_output_tokens = max_output_tokens
 
     # --- 元数据穿透 --------------------------------------------------------
@@ -1380,60 +1601,218 @@ class BudgetGuardedLLMProvider(LLMProvider):
     def is_billable(self) -> bool:
         if self.provider_name in FREE_PROVIDER_NAMES:
             return False
-        return resolve_mode_for_provider(self.inner) is not LLMMode.MOCKED
+        return resolve_mode_for_provider(self.inner) in {LLMMode.LIVE, LLMMode.RECORDED}
 
     async def generate_decision(self, request: LLMDecisionRequest) -> AgentLLMDecision:
+        try:
+            request = LLMDecisionRequest.model_validate(request.model_dump(mode="python"))
+        except (AttributeError, ValidationError) as exc:
+            raise LLMProviderError(
+                "invalid_request",
+                f"LLM 请求超过安全边界，未发送到 provider：{exc}",
+            ) from exc
         request_text = canonical_json(canonical_request_payload(request))
         billable = self.is_billable()
+        resolved_max_output_tokens: int | None = None
+        reservation_usd: float | None = None
 
         if billable:
+            resolved_max_output_tokens = self._resolve_max_output_tokens()
             # 买得起才发。抛出的是 LLMProviderError(budget_exceeded)，由既有 fallback
             # 路径接住并盖标签。
-            self.guard.check_affordable(
+            reservation_usd = self.guard.check_affordable(
                 self.correlation_id,
                 model=self.model,
                 provider=self.provider_name,
-                prompt_tokens=estimate_tokens(request_text),
-                max_output_tokens=self._resolve_max_output_tokens(),
+                # A token cannot contain more information than its UTF-8 bytes.
+                # Counting every byte as a token is deliberately pessimistic and,
+                # unlike chars/4 heuristics, never undercounts CJK or punctuation.
+                prompt_tokens=self._conservative_input_token_bound(request_text),
+                max_output_tokens=resolved_max_output_tokens,
                 agent_id=request.agent_id,
             )
 
-        decision = await self.inner.generate_decision(request)
+        # Clear the whole wrapper chain, not just concrete HTTP providers. A
+        # recording wrapper can fail before it reaches its inner provider; without
+        # this reset that failure would be charged using the previous call's usage.
+        self._clear_reported_usage()
+        try:
+            decision = await self.inner.generate_decision(request)
+        except BaseException:
+            if billable and resolved_max_output_tokens is not None:
+                self._record_attempt(
+                    self._usage_for(
+                        request_text,
+                        decision=None,
+                        max_output_tokens=resolved_max_output_tokens,
+                    ),
+                    billable=True,
+                    reserved_usd=reservation_usd,
+                )
+            raise
+
+        # Revalidate even an object already typed as AgentLLMDecision. A custom
+        # provider can bypass Pydantic with model_construct(); the paid boundary
+        # must not let that turn a 100k explanation into an accepted trace.
+        try:
+            decision = AgentLLMDecision.model_validate(decision.model_dump(mode="python"))
+        except (AttributeError, ValidationError) as exc:
+            if billable and resolved_max_output_tokens is not None:
+                self._record_attempt(
+                    self._usage_for(
+                        request_text,
+                        decision=None,
+                        max_output_tokens=resolved_max_output_tokens,
+                    ),
+                    billable=True,
+                    reserved_usd=reservation_usd,
+                )
+            raise LLMProviderError(
+                "invalid_output",
+                f"provider 返回的结构化决策超过安全边界：{exc}",
+            ) from exc
+
+        usage = self._usage_for(
+            request_text,
+            decision=decision,
+            max_output_tokens=resolved_max_output_tokens,
+        )
+        if (
+            billable
+            and resolved_max_output_tokens is not None
+            and usage.output_tokens > resolved_max_output_tokens
+        ):
+            self._record_attempt(
+                usage,
+                billable=True,
+                reserved_usd=reservation_usd,
+            )
+            raise LLMProviderError(
+                "provider_error",
+                (
+                    f"provider 报告 output_tokens={usage.output_tokens}，超过声明上限 "
+                    f"{resolved_max_output_tokens}；拒绝接受该决策"
+                ),
+            )
+
+        self._record_attempt(
+            usage,
+            billable=billable,
+            reserved_usd=reservation_usd,
+        )
+        return decision
+
+    def _record_attempt(
+        self,
+        usage: TokenUsage,
+        *,
+        billable: bool,
+        reserved_usd: float | None = None,
+    ) -> None:
         self.guard.record_call(
             self.correlation_id,
-            usage=self._usage_for(request_text, decision),
+            usage=usage,
             model=self.model,
             provider=self.provider_name,
             billable=billable,
+            reserved_usd=reserved_usd,
         )
-        return decision
 
     # --- 内部 ---------------------------------------------------------------
 
     def _resolve_max_output_tokens(self) -> int:
-        if self._max_output_tokens is not None:
-            return self._max_output_tokens
-        declared = getattr(self.inner, "max_tokens", None)
-        if isinstance(declared, int) and declared > 0:
-            return declared
-        return self.guard.default_max_output_tokens
+        declared_limits: list[int] = []
+        for provider in self._provider_chain():
+            for attribute in ("max_output_tokens", "max_tokens"):
+                declared = getattr(provider, attribute, None)
+                if isinstance(declared, int) and not isinstance(declared, bool) and declared > 0:
+                    declared_limits.append(declared)
 
-    def _usage_for(self, request_text: str, decision: AgentLLMDecision) -> TokenUsage:
+        if not declared_limits:
+            # A wrapper-side default does not constrain what the remote provider
+            # can actually emit. Sending here would make the preflight fictional.
+            raise LLMProviderError(
+                "provider_error",
+                (
+                    f"付费 provider {self.provider_name!r} 未声明可执行的输出 token 上限；"
+                    "为避免预算低估，本次调用已在发出前拒绝"
+                ),
+            )
+
+        declared_limit = max(declared_limits)
+        if self._max_output_tokens is None:
+            return declared_limit
+        # An override is only a budgeting bound; it cannot silently lower the
+        # provider's independently enforced cap. Use the safer larger value.
+        return max(self._max_output_tokens, declared_limit)
+
+    def _provider_chain(self) -> list[Any]:
+        """Return wrappers plus the concrete provider without importing internals."""
+
+        chain: list[Any] = []
+        seen: set[int] = set()
+        current: Any = self.inner
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            chain.append(current)
+            if isinstance(current, RunScopedRecordedProvider):
+                current = current.resolve()
+                continue
+            current = getattr(current, "inner", None)
+        return chain
+
+    @staticmethod
+    def _conservative_input_token_bound(request_text: str) -> int:
+        return len(request_text.encode("utf-8"))
+
+    def _reported_usage(self) -> TokenUsage | None:
+        for provider in self._provider_chain():
+            reported = getattr(provider, "last_usage", None)
+            if isinstance(reported, TokenUsage):
+                return reported
+            if isinstance(reported, Mapping):
+                parsed = parse_usage(reported)
+                if parsed is not None:
+                    return parsed
+        return None
+
+    def _clear_reported_usage(self) -> None:
+        for provider in self._provider_chain():
+            if not hasattr(provider, "last_usage"):
+                continue
+            try:
+                setattr(provider, "last_usage", None)
+            except (AttributeError, TypeError):
+                # Read-only telemetry properties cannot carry mutable stale state.
+                continue
+
+    def _usage_for(
+        self,
+        request_text: str,
+        *,
+        decision: AgentLLMDecision | None,
+        max_output_tokens: int | None,
+    ) -> TokenUsage:
         """先读 provider 报的账，读不到再估。
 
-        ``inner.last_usage`` 是给真 provider 留的接口：把回包里的 usage 块原样挂上来
-        （dict 或 TokenUsage 都认）。裸 provider 现在还不挂，于是走估算——估算会偏，
-        但偏了也带着 ``usage_sources={"estimated": n}`` 的自述，而不是假装精确。
+        付费 provider 没给 usage 时不能用平均字符比率补账：预检依赖的是最坏上界，
+        记账若又缩回均值，后续调用仍可能越过 episode 预算。因此付费路径按输入字节数 +
+        provider 的硬输出上限记一笔保守账；mock/replay 仍可按实际载荷估算。
         """
 
-        reported = getattr(self.inner, "last_usage", None)
-        if isinstance(reported, TokenUsage):
+        reported = self._reported_usage()
+        if reported is not None:
             return reported
-        if isinstance(reported, Mapping):
-            parsed = parse_usage(reported)
-            if parsed is not None:
-                return parsed
 
+        if max_output_tokens is not None:
+            return TokenUsage(
+                input_tokens=self._conservative_input_token_bound(request_text),
+                output_tokens=max_output_tokens,
+                source=UsageSource.ESTIMATED,
+            )
+
+        if decision is None:
+            return TokenUsage(source=UsageSource.ESTIMATED)
         response_text = json.dumps(
             decision.model_dump(mode="json"), ensure_ascii=False, sort_keys=True
         )

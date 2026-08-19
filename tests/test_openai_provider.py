@@ -39,9 +39,11 @@ async def test_openai_provider_parses_responses_api_payload():
         payload = json.loads(request.content.decode("utf-8"))
         assert payload["model"] == "gpt-5.4"
         assert payload["reasoning"]["effort"] == "medium"
+        assert payload["max_output_tokens"] == 1200
         return httpx.Response(
             200,
             json={
+                "usage": {"input_tokens": 321, "output_tokens": 87},
                 "output": [
                     {
                         "content": [
@@ -82,6 +84,35 @@ async def test_openai_provider_parses_responses_api_payload():
 
     assert decision.intent == "light occupied room"
     assert decision.proposed_commands[0].value == 70
+    assert provider.last_usage == {"input_tokens": 321, "output_tokens": 87}
+
+
+@pytest.mark.anyio
+async def test_openai_provider_clears_previous_usage_before_a_failed_request():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    provider = OpenAIResponsesProvider(
+        api_key="test-key",
+        transport=httpx.MockTransport(handler),
+    )
+    provider.last_usage = {"input_tokens": 999, "output_tokens": 999}
+
+    with pytest.raises(LLMProviderError):
+        await provider.generate_decision(_request())
+
+    assert provider.last_usage is None
+
+
+def test_openai_provider_reads_and_validates_output_cap_from_env(monkeypatch):
+    monkeypatch.setenv("OPENAI_MAX_OUTPUT_TOKENS", "640")
+    provider = OpenAIResponsesProvider.from_env()
+
+    assert provider.max_output_tokens == 640
+    assert provider.max_tokens == 640
+
+    with pytest.raises(ValueError):
+        OpenAIResponsesProvider(api_key="test-key", max_output_tokens=0)
 
 
 @pytest.mark.anyio

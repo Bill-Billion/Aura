@@ -2,12 +2,13 @@ import asyncio
 import os
 import time
 import uuid
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from typing import Any, Callable, Coroutine, Literal
 
 from pydantic import BaseModel, Field
 
 from backend.core.logging import log
+from backend.models.versioning import SUPPORTED_EVENT_SCHEMA_VERSION
 
 # §4.5 事件生成模式：**根事件是怎么进这个世界的**。规格定义三种"被生成"的模式
 # （scripted/rule_based/stochastic）；system 是本实现补的一种——引擎自己发的
@@ -46,6 +47,7 @@ class WorldEvent(BaseModel):
 
 
 class SimEvent(WorldEvent):
+    event_schema_version: str = SUPPORTED_EVENT_SCHEMA_VERSION
     event_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
     wall_time: float = Field(default_factory=time.time)
     correlation_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
@@ -114,9 +116,15 @@ class EventBus:
         # 因果深度索引（event_id → depth），与 _history 同寿命：环形历史挤掉谁，
         # 这里也跟着删，否则一次长 run 会在这张表上无声地漏内存。
         self._depth_by_event_id: dict[str, int] = {}
+        # Rejected nodes are absent from public history, but their depth must
+        # remain as a bounded tombstone.  Otherwise a producer that uses the
+        # rejected event as the next causal parent resets to depth=0 and walks
+        # straight around the storm guard.
+        self._refused_depth_by_event_id: OrderedDict[str, int] = OrderedDict()
         self.max_causal_depth = _resolve_max_causal_depth(max_causal_depth)
         # 已经报过风暴抑制的 correlation：每条只报一条（防风暴自己不能变成风暴）。
         self._storm_suppressed: dict[str, int] = {}
+        self._storm_notice_by_correlation: dict[str, SimEvent] = {}
 
     # --- run 上下文 --------------------------------------------------------
 
@@ -158,8 +166,10 @@ class EventBus:
         self._history = []
         self._next_seq = 0
         self._depth_by_event_id.clear()
+        self._refused_depth_by_event_id.clear()
         # 深度额度跟着历史一起归零：新 run 不该继承上一个 run 的"已经报过风暴"。
         self._storm_suppressed.clear()
+        self._storm_notice_by_correlation.clear()
 
     # --- 订阅 --------------------------------------------------------------
 
@@ -186,18 +196,25 @@ class EventBus:
         唯一的生产用例是 main.py 的 UI 根事件：它必须是这条命令外发的第一条 WS 消息
         （否则前端先看到状态变更、后看到因果头），同时又必须带 seq——S5 的因果树按
         seq 排序，无号的根节点排不进自己的子节点之前。盖过章的事件随后照常 publish，
-        不会被重新编号（见 _stamp）。
-        """
-        return self._stamp(self.coerce_event(event))
+        不会被重新编号。
 
-    def _stamp(self, event: SimEvent) -> SimEvent:
-        """原地盖章 run 元数据与 seq。
+        超过因果深度上限的事件只补 run/时间/depth，不分配公开 seq。它随后进入
+        :meth:`publish` 时会被 suppression notice 取代；若这里先占号，recorder 看不到
+        被拒事件却会看到后一个号的 notice，finalized trace 就会留下永久缺口。
+        """
+        sim_event = self._prepare(self.coerce_event(event))
+        if self._exceeds_depth_cap(sim_event):
+            return sim_event
+        return self._assign_seq(sim_event)
+
+    def _prepare(self, event: SimEvent) -> SimEvent:
+        """原地补 run 元数据并解析 depth，但不消费公开 seq。
 
         run_id/scenario_id/sim_time_s 采用"缺失才填"：生产方显式给的值优先，
         否则旧 run 的在飞事件会被改写成当前 run，§2.2 的 stale_run 判定就废了。
-        seq 是总线的唯一权威，但只分配一次：生产方不填（约定），第一次进总线
-        （stamp() 或 publish()，谁先算谁）拿号，此后号码终身不变——否则先广播后
-        publish 的那条对象会带着两个不同的 seq 出现在 WS 与 events.jsonl 上。
+
+        depth 必须在 seq 之前算：depth-cap 拒绝是一条 admission decision，未获准进入
+        历史/订阅者/recorder 的事件不能先从公共序列里拿走一个永远不会出现的号。
         """
         if event.run_id is None:
             event.run_id = self._run_id
@@ -205,12 +222,20 @@ class EventBus:
             event.scenario_id = self._scenario_id
         if event.sim_time_s is None and self._sim_time_source is not None:
             event.sim_time_s = float(self._sim_time_source())
-        if event.seq is None:
-            event.seq = self._next_seq
-            self._next_seq += 1
         # depth 每次都现算：它是父事件的函数，重算是幂等的（同一个父给出同一个深度），
         # 而"只在 depth==0 时才算"会让先 stamp 后 publish 的那条路径永远停在 0。
         event.depth = self._resolve_depth(event)
+        return event
+
+    def _assign_seq(self, event: SimEvent) -> SimEvent:
+        """给一条已经通过 admission 的可见事件分配唯一公开序号。"""
+
+        # seq 是总线的唯一权威，但只分配一次：生产方不填（约定），第一次进总线
+        # （stamp() 或 publish()，谁先算谁）拿号，此后号码终身不变——否则先广播后
+        # publish 的那条对象会带着两个不同的 seq 出现在 WS 与 events.jsonl 上。
+        if event.seq is None:
+            event.seq = self._next_seq
+            self._next_seq += 1
         return event
 
     def _resolve_depth(self, event: SimEvent) -> int:
@@ -219,6 +244,8 @@ class EventBus:
         if not event.causal_parent:
             return 0
         parent_depth = self._depth_by_event_id.get(event.causal_parent)
+        if parent_depth is None:
+            parent_depth = self._refused_depth_by_event_id.get(event.causal_parent)
         if parent_depth is None:
             return 0
         return parent_depth + 1
@@ -252,6 +279,35 @@ class EventBus:
 
         return len(handlers)
 
+    async def _publish_visible(
+        self,
+        event: WorldEvent | SimEvent,
+        *,
+        before_fan_out: Handler | None = None,
+    ) -> tuple[int, SimEvent]:
+        """Admit one event and return the event that became publicly visible.
+
+        A depth-capped input is represented by its single suppression notice.
+        Returning that notice (including on later suppressed descendants) keeps
+        callers from extending a causal chain from an event that never existed
+        in history.  ``before_fan_out`` is used by the WebSocket boundary to
+        publish the exact admitted event before synchronous subscribers can
+        emit derived events.
+        """
+
+        sim_event = self._prepare(self.coerce_event(event))
+        if self._exceeds_depth_cap(sim_event):
+            return await self._suppress_event_storm(
+                sim_event,
+                before_fan_out=before_fan_out,
+            )
+        self._assign_seq(sim_event)
+        if before_fan_out is not None:
+            result = before_fan_out(sim_event)
+            if asyncio.iscoroutine(result):
+                await result
+        return await self._fan_out(sim_event), sim_event
+
     async def publish(self, event: WorldEvent | SimEvent) -> int:
         """Publish *event* to all matching subscribers (exact + wildcard).
 
@@ -260,13 +316,35 @@ class EventBus:
         一条 ``system.event_storm_suppressed``，见模块顶部 DEFAULT_MAX_CAUSAL_DEPTH 的说明。
         """
 
-        sim_event = self._stamp(self.coerce_event(event))
-        if self._exceeds_depth_cap(sim_event):
-            return await self._suppress_event_storm(sim_event)
-        return await self._fan_out(sim_event)
+        handler_count, _ = await self._publish_visible(event)
+        return handler_count
 
-    async def _suppress_event_storm(self, refused: SimEvent) -> int:
+    async def publish_visible(
+        self,
+        event: WorldEvent | SimEvent,
+        *,
+        before_fan_out: Handler | None = None,
+    ) -> SimEvent:
+        """Publish and return the accepted event or its suppression notice."""
+
+        _, visible = await self._publish_visible(
+            event,
+            before_fan_out=before_fan_out,
+        )
+        return visible
+
+    async def _suppress_event_storm(
+        self,
+        refused: SimEvent,
+        *,
+        before_fan_out: Handler | None = None,
+    ) -> tuple[int, SimEvent]:
         """拒发一条超深事件，并（每条 correlation 一次）把这件事发成事件。"""
+
+        self._refused_depth_by_event_id[refused.event_id] = refused.depth
+        self._refused_depth_by_event_id.move_to_end(refused.event_id)
+        while len(self._refused_depth_by_event_id) > self._max_history:
+            self._refused_depth_by_event_id.popitem(last=False)
 
         correlation_id = refused.correlation_id
         already = self._storm_suppressed.get(correlation_id)
@@ -282,7 +360,7 @@ class EventBus:
         )
         if already is not None:
             # 同一条链后续的超深事件继续拒发，但不再重复报告。
-            return 0
+            return 0, self._storm_notice_by_correlation[correlation_id]
 
         notice = SimEvent(
             event_type=EVENT_STORM_SUPPRESSED_EVENT_TYPE,
@@ -308,8 +386,15 @@ class EventBus:
         )
         # 走 _fan_out 而不是 publish：这条通知自己就在上限之外（它和被拒事件同父），
         # 再过一次闸门只会被自己刹掉，于是抑制变成静默丢弃——正是要避免的那件事。
-        self._stamp(notice)
-        return await self._fan_out(notice)
+        # suppression notice 是拒绝事件在公开流里的唯一替代品，因此由它消费下一号。
+        # 它的 depth 刻意仍保留为 cap + 1，以准确表达闸门触发位置。
+        self._assign_seq(self._prepare(notice))
+        self._storm_notice_by_correlation[correlation_id] = notice
+        if before_fan_out is not None:
+            result = before_fan_out(notice)
+            if asyncio.iscoroutine(result):
+                await result
+        return await self._fan_out(notice), notice
 
     def get_history(
         self,

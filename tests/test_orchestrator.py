@@ -220,6 +220,9 @@ async def test_llm_intent_refines_rule_intent_when_mocked_provider_configured():
     assert decision.plan.confidence_source in {ConfidenceSource.LLM, ConfidenceSource.BLENDED}
     assert decision.plan.fallback_reason is None
     assert decision.plan.agent_roles == ("lighting", "hvac")
+    intent_payload = decision.intent_event_data()
+    assert intent_payload["intent"] == decision.plan.intent
+    assert intent_payload["normalized_intent"] == "arrival_comfort"
 
 
 async def test_provider_error_falls_back_to_rule_intent_and_flags_fallback():

@@ -11,7 +11,12 @@ from backend.agents.hvac import HVACAgent
 from backend.agents.lighting import LightingAgent
 from backend.agents.runtime import AgentRuntime, build_default_agents
 from backend.api.ws import ConnectionManager
-from backend.engine.event_bus import EventBus, SimEvent
+from backend.engine.event_bus import (
+    EVENT_STORM_SUPPRESSED_EVENT_TYPE,
+    EventBus,
+    SimEvent,
+)
+from backend.engine.event_log import read_run_events
 from backend.engine.simulation import SimulationEngine
 from backend.engine.state import (
     AgentRuntimeState,
@@ -432,11 +437,8 @@ class TestSimulatorWriteInvariants:
 async def test_engine_path_sim_events_are_stamped_before_broadcast():
     """回归钉：引擎路径外发的 SIM_EVENT 必须已带 seq。
 
-    _publish_sim_event 刻意"先广播后 publish"（根事件要先于派生的 STATE_DELTA 到达
-    前端），而盖章原本只发生在 publish 里——于是 WS 上每条引擎事件都是 seq=null
-    （复核时实测 98/98），events.jsonl 副本却有号。S5 的因果树按 seq 排序，无号事件
-    排不进自己的子节点之前。现由 event_bus.stamp() 在广播前盖章；stamp 只分配一次号，
-    随后的 publish 不重编，所以两份副本必须是同一个 seq。
+    before-fan-out hook 让总线先完成 admission/盖章，再把同一对象广播，随后才运行
+    可能继续派生事件的同步订阅者。WS 与 events.jsonl 因此必须共享同一个 seq。
     """
     engine = _make_engine()
     engine.conn.broadcast = AsyncMock()
@@ -454,3 +456,61 @@ async def test_engine_path_sim_events_are_stamped_before_broadcast():
     assert broadcast_payloads[0]["seq"] is not None, "广播出去的引擎事件没有 seq"
     # 广播副本与总线里的那条必须同号，不能一份有号一份没号、更不能两个号
     assert broadcast_payloads[0]["seq"] == published.seq
+
+
+@pytest.mark.anyio
+async def test_engine_depth_cap_keeps_ws_history_and_finalized_artifact_identical():
+    engine = _make_engine()
+    engine.event_bus.max_causal_depth = 1
+    engine.event_bus.clear()
+    engine.conn.broadcast = AsyncMock()
+    run_id = engine.run_id
+    assert run_id is not None
+
+    root = SimEvent(
+        event_id="root",
+        event_type="test.root",
+        source="test",
+        timestamp=0.0,
+        correlation_id="corr",
+    )
+    allowed = SimEvent(
+        event_id="allowed",
+        event_type="test.allowed",
+        source="test",
+        timestamp=0.0,
+        correlation_id="corr",
+        causal_parent=root.event_id,
+    )
+    refused = SimEvent(
+        event_id="refused",
+        event_type="test.refused",
+        source="test",
+        timestamp=0.0,
+        correlation_id="corr",
+        causal_parent=allowed.event_id,
+    )
+
+    await engine._publish_sim_event(root)
+    await engine._publish_sim_event(allowed)
+    replacement = await engine._publish_sim_event(refused)
+    assert replacement.event_type == EVENT_STORM_SUPPRESSED_EVENT_TYPE
+    assert refused.seq is None
+
+    history = engine.event_bus.get_history()
+    ws_events = [
+        call.args[0].payload
+        for call in engine.conn.broadcast.await_args_list
+        if call.args[0].type == "SIM_EVENT"
+    ]
+    expected = [(event.event_id, event.event_type, event.seq) for event in history]
+    assert [
+        (event["event_id"], event["event_type"], event["seq"]) for event in ws_events
+    ] == expected
+
+    engine.run_manager.end_run("completed")
+    persisted, _ = read_run_events(run_id)
+    assert [
+        (event["event_id"], event["event_type"], event["seq"])
+        for event in persisted
+    ] == expected

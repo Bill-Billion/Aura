@@ -77,6 +77,44 @@ def _wait_for_events(client, run_id: str, *, generation_mode: str, timeout: floa
     )
 
 
+@pytest.mark.anyio
+async def test_post_commit_launch_failure_is_finalized_and_next_launch_can_retry(monkeypatch):
+    """A generation-source failure may not leave a stopped canonical lock behind."""
+
+    async with main_module.lifespan(app):
+        engine = main_module.simulation_engine
+        assert engine is not None
+        install = engine._install_generation_sources
+
+        def fail_install(*args, **kwargs):
+            raise RuntimeError("synthetic generation install failure")
+
+        monkeypatch.setattr(engine, "_install_generation_sources", fail_install)
+        with pytest.raises(RuntimeError, match="synthetic generation"):
+            await main_module.start_scenario_run(
+                main_module.RunScenarioPayload(
+                    scenario_id=SCENARIO_ID,
+                    seed=20260820,
+                )
+            )
+
+        assert engine.run_manager.current is None
+        assert engine.event_bus.run_id is None
+        assert engine.generation_sources is None
+        assert engine.run_manager.finished[-1].end_reason == "launch_failed"
+
+        monkeypatch.setattr(engine, "_install_generation_sources", install)
+        retry = await main_module.start_scenario_run(
+            main_module.RunScenarioPayload(
+                scenario_id=SCENARIO_ID,
+                seed=20260820,
+            )
+        )
+        assert retry["scenario_id"] == SCENARIO_ID
+        assert engine.run_manager.current is not None
+        assert engine.run_manager.current.run_id == retry["run_id"]
+
+
 # --------------------------------------------------------------- REST 启动路径
 
 
@@ -226,12 +264,8 @@ def test_ws_cmd_run_scenario_rejects_malformed_payload(live_client):
 # ------------------------------------------------- 场景 run 中途 Reset（手动门 1）
 
 
-def test_reset_mid_scenario_run_starts_a_clean_untagged_run(live_client):
-    """手动门 1 的后半段：跑着场景时点 Reset，事件流必须保持自洽。
-
-    换 run（新 run_id）、摘掉三条产线（新 run 不是那个场景的 run，不能继续按它发事件）、
-    旧 run 的事件不许出现在新 run 的工件里。
-    """
+def test_reset_mid_scenario_run_is_rejected_without_mutating_the_run(live_client):
+    """研究 run 的场景/seed/world 是不变量，交互式 Reset 必须 fail closed。"""
 
     engine = main_module.simulation_engine
     assert engine is not None
@@ -244,22 +278,19 @@ def test_reset_mid_scenario_run_starts_a_clean_untagged_run(live_client):
 
     with live_client.websocket_connect("/ws/simulation") as ws:
         assert ws.receive_json()["type"] == "STATE_FULL"
+        assert _read_until(ws, "SIMULATION_STATUS")["payload"]["run_id"] == scenario_run_id
         ws.send_json({"type": "CMD_SIM_RESET"})
-        _read_until(ws, "SIMULATION_STATUS", limit=40)
+        error = _read_until(ws, "ERROR", limit=40)
 
-    reset_run_id = engine.run_id
-    assert reset_run_id is not None and reset_run_id != scenario_run_id
-    # 重置回的是匿名 run：继续挂着上一个场景的产线，等于用旧场景驱动一个新实验。
-    assert engine.scenario_id is None
+    assert error["payload"]["code"] == "research_run_locked"
+    assert error["payload"]["details"]["run_id"] == scenario_run_id
+    assert error["payload"]["details"]["type"] == "CMD_SIM_RESET"
+    assert engine.run_id == scenario_run_id
+    assert engine.scenario_id == SCENARIO_ID
     assert engine.run_manager.current is not None
-    assert engine.run_manager.current.scenario_id is None
-    assert engine.generation_sources is None
+    assert engine.run_manager.current.scenario_id == SCENARIO_ID
+    assert engine.generation_sources is not None
 
     scenario_events = live_client.get(f"/api/runs/{scenario_run_id}/events").json()["events"]
-    reset_events = live_client.get(f"/api/runs/{reset_run_id}/events").json()["events"]
-    assert scenario_events and reset_events
+    assert scenario_events
     assert all(event["run_id"] == scenario_run_id for event in scenario_events)
-    assert all(event["run_id"] == reset_run_id for event in reset_events)
-    assert all(event["scenario_id"] is None for event in reset_events)
-    scenario_ids = {event["event_id"] for event in scenario_events}
-    assert scenario_ids.isdisjoint({event["event_id"] for event in reset_events})

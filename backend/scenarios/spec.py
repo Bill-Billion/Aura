@@ -20,15 +20,23 @@ from __future__ import annotations
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 from backend.engine.event_types import (
     ALLOWED_TIMELINE_EVENT_TYPES,
     COMPAT_ROOT_EVENT_TYPES,
     ROOT_EVENT_TYPES,
 )
+from backend.engine.rng import MAX_JSON_SAFE_SEED
 from backend.execution.validation import CommandErrorCode
-from backend.scenarios.versioning import SUPPORTED_SCENARIO_SCHEMA_VERSION
+from backend.models.versioning import SUPPORTED_SCENARIO_SCHEMA_VERSION
 
 # §10.2 失败码词表的字符串投影。场景层只需要"这个码是否合法"，不需要枚举成员本身；
 # 唯一来源仍是 backend/execution/validation.py::CommandErrorCode，这里绝不再抄一份。
@@ -135,9 +143,10 @@ class TimelineEvent(_StrictModel):
             )
         return value
 
-    @field_validator("at")
+    @field_validator("at", mode="before")
     @classmethod
-    def _check_at(cls, value: float) -> float:
+    def _check_at(cls, value: Any) -> float:
+        value = _require_finite_number(value, field_name="timeline.at")
         if value < 0:
             raise ValueError(f"timeline.at 不能为负，收到 {value}")
         return value
@@ -160,10 +169,19 @@ class ExpectedValue(_StrictModel):
     max: float | None = None
     one_of: list[Any] | None = None
 
+    @field_validator("min", "max", mode="before")
+    @classmethod
+    def _numeric_bounds(cls, value: Any, info: Any) -> float | None:
+        if value is None:
+            return None
+        return _require_finite_number(value, field_name=info.field_name)
+
     @model_validator(mode="after")
     def _not_empty(self) -> "ExpectedValue":
         if self.equals is None and self.min is None and self.max is None and self.one_of is None:
             raise ValueError("expected 约束为空：至少给出精确值、min/max 或 one_of 之一")
+        if self.min is not None and self.max is not None and self.min > self.max:
+            raise ValueError("expected 区间必须满足 min <= max")
         return self
 
     def matches(self, actual: Any) -> bool:
@@ -192,6 +210,11 @@ class ExpectedDeviceEffect(_StrictModel):
     device_id: str
     within_seconds: float = Field(default=10.0, ge=0)
     expected: dict[str, ExpectedValue]
+
+    @field_validator("within_seconds", mode="before")
+    @classmethod
+    def _numeric_within_seconds(cls, value: Any) -> float:
+        return _require_finite_number(value, field_name="within_seconds")
 
     @model_validator(mode="before")
     @classmethod
@@ -231,11 +254,12 @@ class ExpectedDeviceEffect(_StrictModel):
 
 
 class SuccessCriteria(_StrictModel):
-    """§5.1 success_criteria（§5.2 四项）。S4 评估器按这些阈值判 pass/fail。"""
+    """§5.1 success_criteria plus typed S4 metric thresholds."""
 
     require_complete_episode: bool = True
     max_first_action_latency_ms: int | None = Field(default=None, ge=0)
     max_command_failures: int | None = Field(default=None, ge=0)
+    min_conflict_count: int | None = Field(default=None, ge=0, strict=True)
     allow_fallback: bool = True
 
 
@@ -324,6 +348,70 @@ class GroundTruth(_StrictModel):
     safety_constraints: list[str] = Field(default_factory=list)
 
 
+# --------------------------------------------------------- generation config
+
+
+def _require_finite_number(value: Any, *, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field_name} 必须是有限数值")
+    resolved = float(value)
+    if resolved != resolved or resolved in {float("inf"), float("-inf")}:
+        raise ValueError(f"{field_name} 必须是有限数值")
+    return resolved
+
+
+class DeviceOfflineInjection(_StrictModel):
+    """Typed stochastic device availability contract consumed by generator.py."""
+
+    device_ids: list[str] = Field(default_factory=list)
+    probability: float = Field(default=0.0, ge=0.0, le=1.0)
+    recovery_probability: float = Field(default=0.25, ge=0.0, le=1.0)
+
+    @field_validator("probability", "recovery_probability", mode="before")
+    @classmethod
+    def _numeric_probability(cls, value: Any, info: Any) -> float:
+        return _require_finite_number(value, field_name=info.field_name)
+
+    @field_validator("device_ids")
+    @classmethod
+    def _non_empty_device_ids(cls, value: list[str]) -> list[str]:
+        if any(not item.strip() for item in value):
+            raise ValueError("device_ids 不能包含空字符串")
+        if len(set(value)) != len(value):
+            raise ValueError("device_ids 不能重复")
+        return value
+
+
+class NoiseModelContract(_StrictModel):
+    temperature_comfort: tuple[float, float] | None = None
+    light_level_threshold: float | None = Field(default=None, ge=0.0)
+    device_offline: DeviceOfflineInjection | None = None
+
+    @field_validator("temperature_comfort", mode="before")
+    @classmethod
+    def _comfort_pair(cls, value: Any) -> tuple[float, float] | None:
+        if value is None:
+            return None
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            raise ValueError("temperature_comfort 必须是 [min, max]")
+        lower = _require_finite_number(value[0], field_name="temperature_comfort[0]")
+        upper = _require_finite_number(value[1], field_name="temperature_comfort[1]")
+        if lower >= upper:
+            raise ValueError("temperature_comfort 必须满足 min < max")
+        return (lower, upper)
+
+    @field_validator("light_level_threshold", mode="before")
+    @classmethod
+    def _numeric_light_threshold(cls, value: Any) -> float | None:
+        if value is None:
+            return None
+        return _require_finite_number(value, field_name="light_level_threshold")
+
+
+class FailureInjectionContract(_StrictModel):
+    device_offline: DeviceOfflineInjection | None = None
+
+
 # ------------------------------------------------------------------- ScenarioSpec
 
 
@@ -337,7 +425,7 @@ class ScenarioSpec(_StrictModel):
     id: str = Field(min_length=1)
     name: str = Field(min_length=1)
     description: str = Field(min_length=1)
-    seed: int
+    seed: StrictInt = Field(ge=0, le=MAX_JSON_SAFE_SEED)
     initial_state: InitialState
     timeline: list[TimelineEvent]
     expected_device_effects: list[ExpectedDeviceEffect]
@@ -367,6 +455,25 @@ class ScenarioSpec(_StrictModel):
         # YAML 未加引号时 1.0 会是 float——统一成字符串，真正的兼容判定在 versioning.py
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             return str(value)
+        return value
+
+    @field_validator("duration_seconds", mode="before")
+    @classmethod
+    def _numeric_duration_seconds(cls, value: Any) -> float | None:
+        if value is None:
+            return None
+        return _require_finite_number(value, field_name="duration_seconds")
+
+    @field_validator("noise_model", mode="before")
+    @classmethod
+    def _validate_noise_model(cls, value: Any) -> Any:
+        NoiseModelContract.model_validate(value)
+        return value
+
+    @field_validator("failure_injection", mode="before")
+    @classmethod
+    def _validate_failure_injection(cls, value: Any) -> Any:
+        FailureInjectionContract.model_validate(value)
         return value
 
     @field_validator("timeline")

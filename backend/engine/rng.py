@@ -38,9 +38,10 @@ import re
 from enum import Enum
 from typing import Any, Iterator, Mapping
 
-# 子流 seed 与 run seed 的取值域：64 位无符号。Mersenne Twister 接受任意大整数，
-# 但限定域让 seed 可以安全地进 YAML / JSON / URL 而不丢精度。
+# RNG 内部仍能消费 64 位无符号 seed；公开的 Scenario/API 契约另收窄到
+# ``MAX_JSON_SAFE_SEED``，因为 JavaScript JSON number 超过 2**53-1 会静默丢精度。
 MAX_SEED = 2**64 - 1
+MAX_JSON_SAFE_SEED = 2**53 - 1
 
 # 流名进事件元数据、run 工件文件名与前端筛选器，故限制为可安全序列化的窄字符集。
 # 允许 ':' 是给未来的分片流留口（如 "stochastic_events:light_1"）。
@@ -114,7 +115,8 @@ def derive_stream_seed(seed: int, name: Any) -> int:
 def new_seed() -> int:
     """给没写 seed 的 run 生成一个可记录的 seed（§11：每个 run 都必须有 seed）。"""
 
-    return int.from_bytes(os.urandom(8), "big")
+    # 所有自动生成的 run metadata 都可能进入浏览器；只生成 JSON 可精确往返的整数。
+    return int.from_bytes(os.urandom(8), "big") & MAX_JSON_SAFE_SEED
 
 
 class SimStream(random.Random):

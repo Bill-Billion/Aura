@@ -10,6 +10,7 @@ export const useUIStore = defineStore('ui', () => {
   const activeDevice = ref<string | null>(null)
   const sidebarOpen = ref(false)
   const sceneSelectorOpen = ref(false)
+  const researchWorkspaceOpen = ref(false)
   const sceneLoadStatus = ref<SceneLoadStatus>('loading')
 
   function setActiveRoom(roomId: string) {
@@ -36,6 +37,14 @@ export const useUIStore = defineStore('ui', () => {
     sceneSelectorOpen.value = !sceneSelectorOpen.value
   }
 
+  function openResearchWorkspace() {
+    researchWorkspaceOpen.value = true
+  }
+
+  function closeResearchWorkspace() {
+    researchWorkspaceOpen.value = false
+  }
+
   function setSceneLoadStatus(status: SceneLoadStatus) {
     sceneLoadStatus.value = status
   }
@@ -47,6 +56,7 @@ export const useUIStore = defineStore('ui', () => {
     activeDevice,
     sidebarOpen,
     sceneSelectorOpen,
+    researchWorkspaceOpen,
     sceneLoadStatus,
     setActiveRoom,
     setActiveFloor,
@@ -54,6 +64,8 @@ export const useUIStore = defineStore('ui', () => {
     setActiveDevice,
     toggleSidebar,
     toggleSceneSelector,
+    openResearchWorkspace,
+    closeResearchWorkspace,
     setSceneLoadStatus,
   }
 })

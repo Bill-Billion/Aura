@@ -34,7 +34,7 @@ from backend.agents.llm import LLMProvider
 from backend.api.ws import ConnectionManager
 from backend.core.logging import log
 from backend.engine.event_bus import EventBus, SimEvent
-from backend.engine.rng import SimRandom
+from backend.engine.rng import SimRandom, validate_seed
 from backend.engine.run_manager import RunMetadata
 from backend.engine.simulation import SimulationEngine
 from backend.engine.state_manager import StateManager
@@ -54,6 +54,8 @@ __all__ = [
     "ScenarioRunError",
     "ScenarioRunResult",
     "ScenarioRunner",
+    "scenario_duration_seconds",
+    "scenario_world_mode",
     "run_scenario",
 ]
 
@@ -67,12 +69,22 @@ DEFAULT_MAX_TICKS = 5000
 EPISODE_SETTLE_TIMEOUT_S = 30.0
 
 
+def scenario_duration_seconds(spec: ScenarioSpec) -> float:
+    """canonical run 时长的唯一解析规则；网络客户端不能覆盖它。"""
+
+    if spec.duration_seconds is not None:
+        return float(spec.duration_seconds)
+    last_at = max((entry.at for entry in spec.timeline), default=0.0)
+    return max(DEFAULT_DURATION_SECONDS, float(last_at))
+
+
 class ScenarioRunErrorCode(str, Enum):
     """场景运行期失败词表（面向研究者：这次 run 为什么没有结果）。"""
 
     SCENARIO_NOT_FOUND = "scenario_not_found"
     INITIAL_STATE_INVALID = "initial_state_invalid"
     ENGINE_ERROR = "engine_error"
+    EPISODE_SETTLE_TIMEOUT = "episode_settle_timeout"
     TICK_BUDGET_EXCEEDED = "tick_budget_exceeded"
 
 
@@ -143,11 +155,20 @@ class ScenarioRunner:
         live: bool = False,
         tick_interval: float | None = None,
         episode_timeout_ms: int | None = None,
+        episode_settle_timeout_s: float = EPISODE_SETTLE_TIMEOUT_S,
         stochastic_overrides: dict[str, Any] | None = None,
+        seed: int | None = None,
     ) -> None:
         self.spec = spec
+        self.seed = validate_seed(spec.seed if seed is None else seed)
         self.live = live
         self.max_ticks = max_ticks
+        if (
+            not math.isfinite(float(episode_settle_timeout_s))
+            or float(episode_settle_timeout_s) <= 0
+        ):
+            raise ValueError("episode_settle_timeout_s 必须是有限正数")
+        self.episode_settle_timeout_s = float(episode_settle_timeout_s)
         self.stochastic_overrides = stochastic_overrides
         self._collected: list[SimEvent] = []
 
@@ -196,10 +217,7 @@ class ScenarioRunner:
 
     @property
     def duration_seconds(self) -> float:
-        if self.spec.duration_seconds is not None:
-            return float(self.spec.duration_seconds)
-        last_at = max((entry.at for entry in self.spec.timeline), default=0.0)
-        return max(DEFAULT_DURATION_SECONDS, float(last_at))
+        return scenario_duration_seconds(self.spec)
 
     async def run(self) -> ScenarioRunResult:
         engine = self.engine
@@ -214,64 +232,97 @@ class ScenarioRunner:
         await engine.reset(
             new_state_manager=self.state_manager,
             scenario=self.spec,
-            seed=self.spec.seed,
+            seed=self.seed,
             stochastic_overrides=self.stochastic_overrides,
+            duration_seconds=duration,
         )
-        engine.mode = _world_mode(self.spec.mode)
+        engine.mode = scenario_world_mode(self.spec.mode)
 
-        rng = engine.run_manager.rng or SimRandom(self.spec.seed)
+        rng = engine.run_manager.rng or SimRandom(self.seed)
         sources: GenerationSources = engine.generation_sources or GenerationSources()
+        run_id = engine.run_manager.run_id
+        assert run_id is not None  # reset 已成功开启本场景 run
 
         # 全量收事件：总线历史是 1000 条环形缓冲，长场景会把开头挤掉。
         self.event_bus.subscribe("*", self._collect)
         self._collected = []
-        total_ticks = int(math.floor(duration / float(engine.simulated_dt_seconds))) + 1
-        total_ticks = min(total_ticks, self.max_ticks)
 
         try:
+            simulated_dt = float(engine.simulated_dt_seconds)
+            total_ticks = int(math.floor(duration / simulated_dt)) + 1
+            # Tick 1 is t=0.  For a non-integral deadline (25s at dt=10s), the
+            # first covering tick is therefore t=30, not the preceding t=20 tick.
+            if (total_ticks - 1) * simulated_dt < duration:
+                total_ticks += 1
+            if total_ticks > self.max_ticks:
+                raise ScenarioRunError(
+                    ScenarioRunErrorCode.TICK_BUDGET_EXCEEDED,
+                    f"场景 {self.spec.id} 需要 {total_ticks} 拍，超过 runner 上限",
+                    details={
+                        "scenario_id": self.spec.id,
+                        "required_ticks": total_ticks,
+                        "max_ticks": self.max_ticks,
+                        "duration_seconds": duration,
+                        "simulated_dt_seconds": simulated_dt,
+                    },
+                )
             await engine.start(drive_timer=self.live)
             if self.live:
                 await self._drive_live(total_ticks)
             else:
                 await self._drive_headless(total_ticks)
+
+            # Pause first so no new ticks can open more episodes, then drain every
+            # episode before sealing.  The collector deliberately remains attached
+            # through both phases so the in-memory trace cannot lose late evidence.
+            await engine.pause()
+            await self._wait_for_idle_or_raise(phase="final_drain")
+            self._raise_if_engine_died()
+
+            metadata = engine.run_manager.current
+            if metadata is None or metadata.run_id != run_id:
+                raise ScenarioRunError(
+                    ScenarioRunErrorCode.ENGINE_ERROR,
+                    f"场景 {self.spec.id} 的活跃 run 在收尾前被替换",
+                    details={"scenario_id": self.spec.id, "run_id": run_id},
+                )
+
+            result = ScenarioRunResult(
+                run_id=run_id,
+                scenario_id=self.spec.id,
+                seed=metadata.seed,
+                ticks=engine.timer.current_tick,
+                sim_time_s=engine.sim_time_s,
+                duration_seconds=duration,
+                completed=sources.scripted is not None and sources.scripted.exhausted,
+                events=tuple(self._collected),
+                run_metadata=metadata,
+                initial_state=self.initial_state_application,
+                rng_metadata=rng.metadata(),
+                fired_timeline_event_types=tuple(
+                    entry.type
+                    for entry in self.spec.timeline[
+                        : (sources.scripted.fired_count if sources.scripted else 0)
+                    ]
+                ),
+            )
+            engine.run_manager.end_run("completed")
+            log.info(
+                "scenario_run_completed",
+                scenario_id=result.scenario_id,
+                run_id=result.run_id,
+                seed=result.seed,
+                ticks=result.ticks,
+                events=len(result.events),
+            )
+            return result
+        except BaseException as exc:
+            await self._finalize_failed_run(run_id, self._failure_end_reason(exc))
+            raise
         finally:
+            # Success: pause + natural drain. Failure: pause + explicit cancel.
+            # Only now is it safe to stop observing this run's final evidence.
             self.event_bus.unsubscribe("*", self._collect)
-
-        await engine.pause()
-        await engine.agent_runtime.wait_for_idle(timeout=EPISODE_SETTLE_TIMEOUT_S)
-        self._raise_if_engine_died()
-
-        metadata = engine.run_manager.current
-        assert metadata is not None  # reset 刚开过 run，除非被外部结束
-        run_id = metadata.run_id
-        engine.run_manager.end_run("completed")
-
-        result = ScenarioRunResult(
-            run_id=run_id,
-            scenario_id=self.spec.id,
-            seed=metadata.seed,
-            ticks=engine.timer.current_tick,
-            sim_time_s=engine.sim_time_s,
-            duration_seconds=duration,
-            completed=sources.scripted is not None and sources.scripted.exhausted,
-            events=tuple(self._collected),
-            run_metadata=metadata,
-            initial_state=self.initial_state_application,
-            rng_metadata=rng.metadata(),
-            fired_timeline_event_types=tuple(
-                entry.type
-                for entry in self.spec.timeline[: (sources.scripted.fired_count if sources.scripted else 0)]
-            ),
-        )
-        log.info(
-            "scenario_run_completed",
-            scenario_id=result.scenario_id,
-            run_id=result.run_id,
-            seed=result.seed,
-            ticks=result.ticks,
-            events=len(result.events),
-        )
-        return result
 
     async def _drive_headless(self, total_ticks: int) -> None:
         engine = self.engine
@@ -281,7 +332,9 @@ class ScenarioRunner:
             except Exception as exc:  # noqa: BLE001 - 转成结构化失败，绝不吞
                 raise self._engine_error(exc) from exc
             # 每拍等因果链跑完：headless 的确定性前提（同一场景两次运行事件顺序一致）。
-            await engine.agent_runtime.wait_for_idle(timeout=EPISODE_SETTLE_TIMEOUT_S)
+            await self._wait_for_idle_or_raise(
+                phase=f"tick_{engine.timer.current_tick}"
+            )
             self._raise_if_engine_died()
 
     async def _drive_live(self, total_ticks: int) -> None:
@@ -303,12 +356,67 @@ class ScenarioRunner:
                     details={"scenario_id": self.spec.id, "tick": engine.timer.current_tick},
                 )
             await asyncio.sleep(interval / 4)
-        await engine.agent_runtime.wait_for_idle(timeout=EPISODE_SETTLE_TIMEOUT_S)
+        await self._wait_for_idle_or_raise(phase="live_final_tick")
 
     # -- 内部工具 -------------------------------------------------------
 
     async def _collect(self, event: SimEvent) -> None:
         self._collected.append(event)
+
+    async def _wait_for_idle_or_raise(self, *, phase: str) -> None:
+        settled = await self.engine.agent_runtime.wait_for_idle(
+            timeout=self.episode_settle_timeout_s
+        )
+        if settled:
+            return
+        raise ScenarioRunError(
+            ScenarioRunErrorCode.EPISODE_SETTLE_TIMEOUT,
+            f"场景 {self.spec.id} 的 agent episode 未在收尾期限内完成",
+            details={
+                "scenario_id": self.spec.id,
+                "phase": phase,
+                "tick": self.engine.timer.current_tick,
+                "timeout_s": self.episode_settle_timeout_s,
+            },
+        )
+
+    @staticmethod
+    def _failure_end_reason(exc: BaseException) -> str:
+        if isinstance(exc, ScenarioRunError):
+            return exc.code.value
+        if isinstance(exc, asyncio.CancelledError):
+            return "cancelled"
+        return "runner_failed"
+
+    async def _finalize_failed_run(self, run_id: str, reason: str) -> None:
+        """Best-effort drain/cancel, then seal the partial artifact as non-completed."""
+
+        cleanup_steps = (
+            ("pause", self.engine.pause),
+            (
+                "cancel_episodes",
+                lambda: self.engine.agent_runtime.cancel_active_episodes(reason),
+            ),
+            (
+                "cancel_commands",
+                lambda: self.engine.command_executor.cancel_pending(reason),
+            ),
+        )
+        for phase, cleanup in cleanup_steps:
+            try:
+                await cleanup()
+            except BaseException as cleanup_error:  # best effort; preserve root error
+                log.warning(
+                    "scenario_run_cleanup_failed",
+                    scenario_id=self.spec.id,
+                    run_id=run_id,
+                    phase=phase,
+                    error=repr(cleanup_error),
+                )
+
+        current = self.engine.run_manager.current
+        if current is not None and current.run_id == run_id:
+            self.engine.run_manager.end_run(reason)
 
     def _raise_if_engine_died(self) -> None:
         detail = self.engine.last_engine_error
@@ -346,7 +454,7 @@ class _DisabledProvider(LLMProvider):
         raise LLMProviderError("provider_error", "LLM provider is disabled for headless runs")
 
 
-def _world_mode(scenario_mode: str) -> str:
+def scenario_world_mode(scenario_mode: str) -> str:
     """§5.1 场景模式 → 世界运行模式。
 
     世界只有 observe|demo 两档；``stress`` 是场景层语义（更密的事件/更狠的注入），

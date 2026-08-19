@@ -112,7 +112,7 @@ success_criteria:
 metrics:
   - first_action_latency_ms
   - command_failure_count
-  - unnecessary_command_count
+  - user_intent_satisfied
   - device_state_match_rate
 
 ground_truth:
@@ -127,6 +127,7 @@ ground_truth:
   forbidden_device_ids: ["light_living_01"]
   required_agent_roles: ["lighting", "hvac"]
   acceptable_noop: false
-  expected_intent: "morning_wake_routine"
+  # waking_up 没有专用活动行，运行时按基础标签附加 activity 后缀。
+  expected_intent: "activity_comfort:waking_up"
   safety_constraints:
     - "no_abrupt_full_brightness_at_wake_up"

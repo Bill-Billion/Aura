@@ -436,6 +436,9 @@ class OrchestrationDecision(BaseModel):
 
         return {
             "orchestrator_id": self.plan.orchestrator_id,
+            # Stable rule-classifier label for canonical evaluation. ``intent`` may be
+            # refined into free text by live/recorded providers and must not bias A/B.
+            "normalized_intent": self.rule_intent.intent,
             "intent": self.plan.intent,
             "domain": self.rule_intent.domain,
             "confidence": self.plan.confidence,

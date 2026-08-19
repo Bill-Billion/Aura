@@ -18,15 +18,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
+import httpx
 import pytest
 
 from backend.agents.contracts import RootEventContext
 from backend.agents.hvac import HVACAgent
 from backend.agents.lighting import LightingAgent
-from backend.agents.llm import LLMProvider, LLMProviderError
+from backend.agents.llm import LLMProvider, LLMProviderError, OpenAIResponsesProvider
 from backend.agents.llm_modes import (
     BUDGET_EXCEEDED_REASON,
     DEFAULT_EPISODE_BUDGET_USD,
@@ -35,6 +37,7 @@ from backend.agents.llm_modes import (
     EpisodeCostGuard,
     LLMMode,
     MockedLLMProvider,
+    canonical_request_payload,
     llm_mode_health,
     resolve_episode_budget_usd,
     resolve_mode_for_provider,
@@ -55,7 +58,12 @@ from backend.agents.llm_pricing import (
 )
 from backend.agents.memory import AgentMemoryStore
 from backend.agents.orchestrator import DomainAgentBinding, HomeOrchestratorAgent
-from backend.agents.types import AgentLLMDecision, LLMDecisionRequest
+from backend.agents.types import (
+    MAX_EXPLANATION_CHARS,
+    MAX_WORLD_SUMMARY_CHARS,
+    AgentLLMDecision,
+    LLMDecisionRequest,
+)
 from backend.engine.event_bus import SimEvent
 from backend.engine.run_manager import canonical_json
 from backend.main import _init_default_state
@@ -114,10 +122,12 @@ class _BillableStubProvider(LLMProvider):
         self.max_tokens = 1200
         self.calls: list[LLMDecisionRequest] = []
         # provider 侧回包里的 usage 块（None = 这家不给用量，走字符估算）
-        self.last_usage = usage
+        self._usage = usage
+        self.last_usage = None
 
     async def generate_decision(self, request: LLMDecisionRequest) -> AgentLLMDecision:
         self.calls.append(request)
+        self.last_usage = self._usage
         return AgentLLMDecision(
             intent="stub intent",
             confidence=0.9,
@@ -296,7 +306,7 @@ def test_budget_env_override_and_default():
 async def test_budget_breach_mid_episode_switches_remaining_agents_to_rule_fallback_with_budget_exceeded_reason():
     """预算在 episode 中途咬下去：后续 agent 走规则回退，且理由是 budget_exceeded。"""
 
-    inner = _BillableStubProvider(usage={"input_tokens": 20_000, "output_tokens": 4_000})
+    inner = _BillableStubProvider(usage={"input_tokens": 20_000, "output_tokens": 1_000})
     guard = EpisodeCostGuard(budget_usd=0.05)
     provider = BudgetGuardedLLMProvider(inner, guard, correlation_id="corr-arrive-home")
 
@@ -368,7 +378,7 @@ async def test_first_call_of_an_episode_is_never_blocked_by_worst_case_alone():
 async def test_budget_is_per_episode_not_global():
     """一条 episode 用超，不能连带把另一条 episode 判死。"""
 
-    inner = _BillableStubProvider(usage={"input_tokens": 40_000, "output_tokens": 8_000})
+    inner = _BillableStubProvider(usage={"input_tokens": 40_000, "output_tokens": 1_000})
     guard = EpisodeCostGuard(budget_usd=0.05)
     hot = BudgetGuardedLLMProvider(inner, guard, correlation_id="corr-hot")
 
@@ -424,10 +434,156 @@ async def test_reported_usage_wins_over_estimate():
     assert guard.episode("a").usage_sources == {UsageSource.REPORTED.value: 1}
 
     estimated = _BillableStubProvider(usage=None)
-    await BudgetGuardedLLMProvider(estimated, guard, correlation_id="b").generate_decision(_request())
-    assert guard.episode("b").usage_sources == {UsageSource.ESTIMATED.value: 1}
-    assert guard.episode("b").input_tokens > 0
-    assert guard.episode("b").cost_usd > 0.0
+    request = _request()
+    await BudgetGuardedLLMProvider(estimated, guard, correlation_id="b").generate_decision(request)
+    estimated_episode = guard.episode("b")
+    request_text = canonical_json(canonical_request_payload(request))
+    assert estimated_episode.usage_sources == {UsageSource.ESTIMATED.value: 1}
+    assert estimated_episode.input_tokens == len(request_text.encode("utf-8"))
+    assert estimated_episode.output_tokens == estimated.max_tokens
+    assert estimated_episode.cost_usd > 0.0
+
+
+async def test_preflight_counts_utf8_bytes_as_the_non_underestimating_input_bound(monkeypatch):
+    request = _request().model_copy(update={"world_summary": "温度与照明" * 100})
+    request_text = canonical_json(canonical_request_payload(request))
+    inner = _BillableStubProvider(usage={"input_tokens": 100, "output_tokens": 20})
+    guard = EpisodeCostGuard(budget_usd=10.0)
+    captured: dict[str, int] = {}
+    real_check = guard.check_affordable
+
+    def capture_check(*args, **kwargs):
+        captured["prompt_tokens"] = kwargs["prompt_tokens"]
+        return real_check(*args, **kwargs)
+
+    monkeypatch.setattr(guard, "check_affordable", capture_check)
+    await BudgetGuardedLLMProvider(inner, guard, correlation_id="utf8").generate_decision(request)
+
+    assert captured["prompt_tokens"] == len(request_text.encode("utf-8"))
+    assert captured["prompt_tokens"] > estimate_tokens(request_text)
+
+
+async def test_billable_provider_without_enforced_output_cap_fails_before_call():
+    class UnboundedProvider(LLMProvider):
+        provider_name = "unbounded_live"
+        llm_mode = LLMMode.LIVE
+        model = "gpt-4o-mini"
+        api_key = "test-key"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def generate_decision(self, request: LLMDecisionRequest) -> AgentLLMDecision:
+            self.calls += 1
+            return AgentLLMDecision(intent="x", confidence=1.0, explanation="x")
+
+    inner = UnboundedProvider()
+    guard = EpisodeCostGuard(budget_usd=1.0)
+    provider = BudgetGuardedLLMProvider(inner, guard, correlation_id="unbounded")
+
+    with pytest.raises(LLMProviderError) as excinfo:
+        await provider.generate_decision(_request())
+
+    assert excinfo.value.reason == "provider_error"
+    assert inner.calls == 0
+    assert guard.episode("unbounded").calls == 0
+
+
+async def test_billed_invalid_response_is_recorded_and_failed_retry_does_not_reuse_usage():
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "usage": {"input_tokens": 100, "output_tokens": 50},
+                    "output_text": json.dumps({"intent": "missing required fields"}),
+                },
+            )
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    inner = OpenAIResponsesProvider(
+        api_key="test-key",
+        model="gpt-4o-mini",
+        transport=httpx.MockTransport(handler),
+    )
+    guard = EpisodeCostGuard(budget_usd=1.0)
+    provider = BudgetGuardedLLMProvider(inner, guard, correlation_id="invalid-billed")
+
+    with pytest.raises(LLMProviderError) as first_error:
+        await provider.generate_decision(_request())
+    assert first_error.value.reason == "invalid_output"
+    first = guard.episode("invalid-billed")
+    assert (first.calls, first.input_tokens, first.output_tokens) == (1, 100, 50)
+    assert first.usage_sources == {UsageSource.REPORTED.value: 1}
+
+    request = _request()
+    request_text = canonical_json(canonical_request_payload(request))
+    with pytest.raises(LLMProviderError) as second_error:
+        await provider.generate_decision(request)
+    assert second_error.value.reason == "timeout"
+    assert inner.last_usage is None
+
+    after_retry = guard.episode("invalid-billed")
+    assert after_retry.calls == 2
+    assert after_retry.input_tokens == 100 + len(request_text.encode("utf-8"))
+    assert after_retry.output_tokens == 50 + inner.max_output_tokens
+    assert after_retry.usage_sources == {
+        UsageSource.REPORTED.value: 1,
+        UsageSource.ESTIMATED.value: 1,
+    }
+
+
+async def test_100k_explanation_is_never_returned_even_if_provider_bypasses_validation():
+    class OversizedProvider(LLMProvider):
+        provider_name = "oversized_live"
+        llm_mode = LLMMode.LIVE
+        model = "gpt-4o-mini"
+        api_key = "test-key"
+        max_tokens = 1200
+        last_usage = {"input_tokens": 100, "output_tokens": 1200}
+
+        async def generate_decision(self, request: LLMDecisionRequest) -> AgentLLMDecision:
+            self.last_usage = {"input_tokens": 100, "output_tokens": 1200}
+            return AgentLLMDecision.model_construct(
+                intent="malicious",
+                confidence=1.0,
+                task_steps=[],
+                proposed_commands=[],
+                explanation="x" * 100_000,
+                needs_coordination=False,
+            )
+
+    guard = EpisodeCostGuard(budget_usd=1.0)
+    provider = BudgetGuardedLLMProvider(
+        OversizedProvider(),
+        guard,
+        correlation_id="oversized",
+    )
+
+    with pytest.raises(LLMProviderError) as excinfo:
+        await provider.generate_decision(_request())
+
+    assert excinfo.value.reason == "invalid_output"
+    assert guard.episode("oversized").calls == 1
+    assert guard.episode("oversized").output_tokens == 1200
+
+    with pytest.raises(ValueError):
+        AgentLLMDecision(
+            intent="malicious",
+            confidence=1.0,
+            explanation="x" * (MAX_EXPLANATION_CHARS + 1),
+        )
+
+
+def test_request_free_text_has_a_hard_size_limit():
+    payload = _request().model_dump(mode="python")
+    payload["world_summary"] = "x" * (MAX_WORLD_SUMMARY_CHARS + 1)
+    with pytest.raises(ValueError):
+        LLMDecisionRequest.model_validate(payload)
 
 
 def test_worst_case_call_cost_is_monotonic_in_output_budget():
@@ -444,7 +600,7 @@ async def test_episode_cost_payload_is_serializable_for_coordination_decision_an
 ):
     """花费要能进 coordination_decision 的 data，也要能落到 run 目录下的成本工件。"""
 
-    inner = _BillableStubProvider(usage={"input_tokens": 20_000, "output_tokens": 4_000})
+    inner = _BillableStubProvider(usage={"input_tokens": 20_000, "output_tokens": 1_000})
     guard = EpisodeCostGuard(budget_usd=0.05)
     provider = BudgetGuardedLLMProvider(inner, guard, correlation_id="corr-arrive-home")
 
@@ -594,6 +750,144 @@ async def test_runtime_attaches_the_cost_guard_so_a_real_episode_falls_back_with
     assert payload["budget_usd"] == pytest.approx(0.0)
     assert payload["totals"]["blocked_calls"] > 0
     assert payload["totals"]["budget_exceeded_episodes"] >= 1
+
+
+async def test_concurrent_calls_reserve_worst_case_before_provider_await():
+    """One in-flight call must consume budget capacity before peers preflight."""
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    request = _request()
+    request_text = canonical_json(canonical_request_payload(request))
+    provider = _BillableStubProvider(
+        model="stub-priced-1",
+        usage={
+            "input_tokens": len(request_text.encode("utf-8")),
+            "output_tokens": 1200,
+        },
+    )
+    original_generate = provider.generate_decision
+
+    async def blocked_generate(call_request):
+        entered.set()
+        await release.wait()
+        return await original_generate(call_request)
+
+    provider.generate_decision = blocked_generate  # type: ignore[method-assign]
+    one_call_worst = worst_case_call_cost_usd(
+        model=provider.model,
+        provider=provider.provider_name,
+        prompt_tokens=len(request_text.encode("utf-8")),
+        max_output_tokens=provider.max_tokens,
+    )
+    guard = EpisodeCostGuard(budget_usd=one_call_worst * 1.5)
+    first = BudgetGuardedLLMProvider(provider, guard, correlation_id="shared")
+    second = BudgetGuardedLLMProvider(provider, guard, correlation_id="shared")
+
+    first_task = asyncio.create_task(first.generate_decision(request))
+    await entered.wait()
+    with pytest.raises(LLMProviderError) as blocked:
+        await second.generate_decision(_request("hvac_agent"))
+    assert blocked.value.reason == BUDGET_EXCEEDED_REASON
+    assert len(provider.calls) == 0, "first call is still awaiting the synthetic response"
+
+    release.set()
+    await first_task
+    assert len(provider.calls) == 1
+    episode = guard.episode("shared")
+    assert episode.billable_calls == 1
+    assert episode.blocked_calls == 1
+
+
+async def test_concurrent_failure_cannot_charge_a_sibling_calls_reported_usage():
+    """Usage telemetry must belong to the task that made the provider call.
+
+    The order is intentional: A is in flight, B succeeds with a tiny reported
+    usage, then A fails without a usage payload.  A must settle its reservation
+    using the conservative maximum instead of inheriting B's report.  That
+    conservative settlement must leave too little capacity for C.
+    """
+
+    a_entered = asyncio.Event()
+    release_a = asyncio.Event()
+    small_usage = {"input_tokens": 1, "output_tokens": 1}
+    request = _request("agent-a")
+    request_text = canonical_json(canonical_request_payload(request))
+
+    class InterleavingProvider(LLMProvider):
+        provider_name = "stub_billable"
+        llm_mode = LLMMode.RECORDED
+        model = "stub-priced-1"
+        api_key = "stub"
+        max_tokens = 1200
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+            self.last_usage = None
+
+        async def generate_decision(
+            self,
+            call_request: LLMDecisionRequest,
+        ) -> AgentLLMDecision:
+            self.calls.append(call_request.agent_id)
+            self.last_usage = None
+            if call_request.agent_id == "agent-a":
+                a_entered.set()
+                await release_a.wait()
+                raise LLMProviderError("timeout", "A timed out without usage")
+
+            self.last_usage = small_usage
+            return AgentLLMDecision(
+                intent="stub intent",
+                confidence=0.9,
+                explanation="stub explanation",
+            )
+
+    inner = InterleavingProvider()
+    worst_case = worst_case_call_cost_usd(
+        model=inner.model,
+        provider=inner.provider_name,
+        prompt_tokens=len(request_text.encode("utf-8")),
+        max_output_tokens=inner.max_tokens,
+    )
+    small_cost = call_cost_usd(
+        TokenUsage(
+            input_tokens=small_usage["input_tokens"],
+            output_tokens=small_usage["output_tokens"],
+            source=UsageSource.REPORTED,
+        ),
+        model=inner.model,
+        provider=inner.provider_name,
+    )
+    # Two worst-case reservations fit while A and B overlap.  After B settles,
+    # A's conservative settlement makes C unaffordable; mischarging A with B's
+    # tiny report would incorrectly admit C.
+    guard = EpisodeCostGuard(budget_usd=(2 * worst_case) + (small_cost / 2))
+    wrappers = {
+        agent_id: BudgetGuardedLLMProvider(inner, guard, correlation_id="shared")
+        for agent_id in ("agent-a", "agent-b", "agent-c")
+    }
+
+    a_task = asyncio.create_task(wrappers["agent-a"].generate_decision(request))
+    await a_entered.wait()
+    await wrappers["agent-b"].generate_decision(_request("agent-b"))
+    release_a.set()
+    with pytest.raises(LLMProviderError) as a_error:
+        await a_task
+    assert a_error.value.reason == "timeout"
+
+    episode = guard.episode("shared")
+    assert episode.usage_sources == {
+        UsageSource.REPORTED.value: 1,
+        UsageSource.ESTIMATED.value: 1,
+    }
+    assert episode.input_tokens == 1 + len(request_text.encode("utf-8"))
+    assert episode.output_tokens == 1 + inner.max_tokens
+
+    with pytest.raises(LLMProviderError) as c_error:
+        await wrappers["agent-c"].generate_decision(_request("agent-c"))
+    assert c_error.value.reason == BUDGET_EXCEEDED_REASON
+    assert inner.calls == ["agent-a", "agent-b"]
 
 
 async def test_a_generous_budget_lets_the_same_episode_through_and_still_books_the_cost(

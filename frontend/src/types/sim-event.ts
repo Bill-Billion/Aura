@@ -7,6 +7,7 @@ export type KnownSimEventType =
   | 'system.simulation_started'
   | 'system.simulation_paused'
   | 'system.simulation_reset'
+  | 'system.episode_cancelled'
   | 'environment.state_refresh'
   | 'user.command'
   | 'user.activity_change'
@@ -32,6 +33,15 @@ export interface SimEventBase<
   causal_parent: string | null
   priority: SimEventPriority
   data: TData
+  event_schema_version?: string
+  run_id?: string | null
+  scenario_id?: string | null
+  seq?: number | null
+  sim_time_s?: number | null
+  depth?: number
+  event_generation_mode?: string | null
+  generation_rule_id?: string | null
+  rng_stream?: string | null
 }
 
 export interface SystemTimerTickData {
@@ -232,7 +242,7 @@ export interface EpisodeSummary {
   primaryAgentId: string | null
   agentIds: string[]
   hasFallback: boolean
-  /** episode 被 reasoning.decision_discarded 显式取消 */
+  /** episode 被 system.episode_cancelled 显式取消 */
   hasCancelled: boolean
   isActive: boolean
   categories: EventCategory[]

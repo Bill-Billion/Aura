@@ -39,6 +39,10 @@ export function useWebSocket() {
       return // already connected or connecting
     }
 
+    // A new socket has not proved which run owns its events yet. Drop the
+    // previous identity before waiting for STATE_FULL + SIMULATION_STATUS.
+    simulationStore.clearRunIdentity()
+    eventStore.synchronizeRun(null, true)
     intentionalClose = false
     simulationStore.setConnectionStatus('connecting')
     connectionStatus.value = 'connecting'
@@ -63,6 +67,8 @@ export function useWebSocket() {
     ws.onclose = () => {
       simulationStore.setConnectionStatus('disconnected')
       connectionStatus.value = 'disconnected'
+      simulationStore.clearRunIdentity()
+      eventStore.synchronizeRun(null, true)
 
       if (!intentionalClose) {
         scheduleReconnect(url)
@@ -86,6 +92,8 @@ export function useWebSocket() {
     }
     simulationStore.setConnectionStatus('disconnected')
     connectionStatus.value = 'disconnected'
+    simulationStore.clearRunIdentity()
+    eventStore.synchronizeRun(null, true)
   }
 
   // ---- Send ----
@@ -109,6 +117,7 @@ export function useWebSocket() {
     switch (msg.type) {
       case 'STATE_FULL': {
         const snap = msg.payload as WorldStateSnapshot
+        simulationStore.clearCommandError()
         worldStore.applyFullState(snap)
         agentStore.setAllAgents(snap.agents)
         simulationStore.setRunning(snap.is_running)
@@ -159,6 +168,9 @@ export function useWebSocket() {
 
       case 'SIMULATION_STATUS': {
         const p = msg.payload as SimulationStatusPayload
+        simulationStore.clearCommandError()
+        simulationStore.applySimulationStatus(p)
+        eventStore.synchronizeRun(simulationStore.currentRunId)
         if (typeof p?.is_running === 'boolean') {
           simulationStore.setRunning(p.is_running)
           worldStore.isRunning = p.is_running
@@ -184,6 +196,7 @@ export function useWebSocket() {
 
       case 'ERROR': {
         const error = msg.payload as ErrorPayload
+        simulationStore.setCommandError(error)
         console.warn('[WebSocket] Command rejected:', {
           code: error.code,
           message: error.message,

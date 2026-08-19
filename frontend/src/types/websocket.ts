@@ -1,4 +1,5 @@
 import type { SimEvent } from '@/types/sim-event'
+import type { BaselinePolicy, EffectiveLLMMode } from '@/types/research-run'
 import type { AgentState, DeltaChange, WorldStateSnapshot } from '@/types/world-state'
 
 export type CommandMessageType =
@@ -42,6 +43,16 @@ export interface AgentStatusPayload {
 }
 
 export interface SimulationStatusPayload {
+  run_id?: string | null
+  scenario_id?: string | null
+  seed?: number | null
+  baseline_policy?: BaselinePolicy | null
+  llm_mode?: EffectiveLLMMode | null
+  duration_seconds?: number | null
+  recording_source_run_id?: string | null
+  finalized?: boolean | null
+  ended_at?: string | null
+  end_reason?: string | null
   is_running?: boolean
   speed?: number
   mode?: 'observe' | 'demo'

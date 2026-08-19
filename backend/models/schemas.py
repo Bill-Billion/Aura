@@ -3,7 +3,9 @@ from typing import Any, Literal
 import time
 import uuid
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
+
+from backend.engine.rng import MAX_JSON_SAFE_SEED
 
 
 MessageType = Literal[
@@ -48,6 +50,15 @@ class CmdDeviceControlPayload(BaseModel):
     value: Any = None
 
 
+class BaselinePolicy(str, Enum):
+    """研究 run 的声明策略；与实际生效的 ``llm_mode`` 刻意使用两套词表。"""
+
+    RULE_BASED = "rule_based"
+    LLM_MOCKED = "llm_mocked"
+    LLM_RECORDED = "llm_recorded"
+    LLM_LIVE = "llm_live"
+
+
 class RunScenarioPayload(BaseModel):
     """启动一个场景 run 的载荷（``POST /api/runs`` 与 WS ``CMD_RUN_SCENARIO`` 共用）。
 
@@ -56,8 +67,34 @@ class RunScenarioPayload(BaseModel):
     （§11 要求每个 run 都有 seed，"没设 seed"不是合法状态）。
     """
 
+    model_config = ConfigDict(extra="forbid")
+
     scenario_id: str = Field(min_length=1)
-    seed: int | None = Field(default=None, ge=0)
+    seed: StrictInt | None = Field(default=None, ge=0, le=MAX_JSON_SAFE_SEED)
+    # 网络入口缺省必须是零成本且确定的策略；服务端 ambient run 是否使用其他
+    # provider 是独立配置，不能让省略字段的 POST 意外继承为 live。
+    baseline_policy: BaselinePolicy = BaselinePolicy.RULE_BASED
+    # 客户端为一次“启动意图”生成并在网络重试间复用；服务端不会把它当 run_id，
+    # 也不接受路径/任意字符串，避免丢失 201 后重复创建付费实验。
+    idempotency_key: str | None = Field(
+        default=None,
+        pattern=(
+            r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-"
+            r"[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+        ),
+    )
+    # recorded 回放只接受 run 身份。文件路径与 provider 凭证均为服务端配置，不能由
+    # REST/WS 客户端注入。
+    recording_source_run_id: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def validate_recording_source(self) -> "RunScenarioPayload":
+        if (
+            self.recording_source_run_id is not None
+            and self.baseline_policy is not BaselinePolicy.LLM_RECORDED
+        ):
+            raise ValueError("recording_source_run_id 仅适用于 llm_recorded 策略")
+        return self
 
 
 class ScenarioLaunchErrorCode(str, Enum):
@@ -68,6 +105,13 @@ class ScenarioLaunchErrorCode(str, Enum):
     INITIAL_STATE_INVALID = "initial_state_invalid"
     INVALID_SEED = "invalid_seed"
     ENGINE_UNAVAILABLE = "engine_unavailable"
+    RUN_ALREADY_ACTIVE = "run_already_active"
+    IDEMPOTENCY_CONFLICT = "idempotency_conflict"
+    BASELINE_POLICY_UNAVAILABLE = "baseline_policy_unavailable"
+    RECORDING_SOURCE_NOT_FOUND = "recording_source_not_found"
+    RECORDING_SOURCE_NOT_FINALIZED = "recording_source_not_finalized"
+    RECORDING_SOURCE_MISMATCH = "recording_source_mismatch"
+    RECORDING_SOURCE_INVALID = "recording_source_invalid"
 
 
 class ScenarioLaunchError(Exception):

@@ -6,6 +6,7 @@ import {
   buildEpisodeSummaries,
   buildEventDetailView,
   categorizeSimEvent,
+  compareSimEvents,
   deriveObservabilityState,
   pickDefaultEpisode,
 } from '../src/utils/observability.ts'
@@ -48,6 +49,43 @@ test('categorizeSimEvent 会把结构化事件归到六类里', () => {
     categorizeSimEvent(makeEvent({ event_id: 'evt-2', event_type: 'feedback.state_delta', correlation_id: 'ep-1' })),
     'feedback',
   )
+})
+
+test('canonical seq 优先于可能回拨的 timestamp 和 wall_time', () => {
+  const publishedFirst = makeEvent({
+    event_id: 'evt-first',
+    event_type: 'reasoning.intent_recognized',
+    correlation_id: 'ep-1',
+    seq: 10,
+    timestamp: 100,
+    wall_time: 100,
+  })
+  const publishedSecond = makeEvent({
+    event_id: 'evt-second',
+    event_type: 'reasoning.execution_plan',
+    correlation_id: 'ep-1',
+    seq: 11,
+    timestamp: 1,
+    wall_time: 1,
+  })
+
+  expect(compareSimEvents(publishedFirst, publishedSecond)).toBeLessThan(0)
+  expect(buildEpisodeSummaries([publishedSecond, publishedFirst])[0].events.map((event) => event.event_id))
+    .toEqual(['evt-first', 'evt-second'])
+
+  const episodes = buildEpisodeSummaries([
+    publishedFirst,
+    publishedSecond,
+    makeEvent({
+      event_id: 'evt-newest',
+      event_type: 'user.command',
+      correlation_id: 'ep-2',
+      seq: 12,
+      timestamp: 0,
+      wall_time: 0,
+    }),
+  ])
+  expect(episodes.map((episode) => episode.correlationId)).toEqual(['ep-2', 'ep-1'])
 })
 
 test('buildEpisodeSummaries 会按 correlation_id 分组并优先选择 causal_parent 为空的根事件', () => {
@@ -138,6 +176,35 @@ test('pickDefaultEpisode 会优先选择最新活跃 episode，否则回退到�
   ], makeAgents('ep-3'))
 
   expect(pickDefaultEpisode(active)?.correlationId).toBe('ep-3')
+})
+
+test('episode cancellation 只由 system.episode_cancelled 标记，stale decision discard 不是取消', () => {
+  const summaries = buildEpisodeSummaries([
+    makeEvent({
+      event_id: 'cancel-root',
+      event_type: 'user.command',
+      correlation_id: 'cancelled-episode',
+      wall_time: 10,
+    }),
+    makeEvent({
+      event_id: 'cancel-event',
+      event_type: 'system.episode_cancelled',
+      correlation_id: 'cancelled-episode',
+      causal_parent: 'cancel-root',
+      wall_time: 11,
+      data: { reason: 'simulation_reset' },
+    }),
+    makeEvent({
+      event_id: 'discard-root',
+      event_type: 'reasoning.decision_discarded',
+      correlation_id: 'discarded-decision',
+      wall_time: 20,
+      data: { reason: 'stale' },
+    }),
+  ])
+
+  expect(summaries.find((episode) => episode.correlationId === 'cancelled-episode')?.hasCancelled).toBe(true)
+  expect(summaries.find((episode) => episode.correlationId === 'discarded-decision')?.hasCancelled).toBe(false)
 })
 
 test('buildEpisodeNodes 会按因果关系展开单条 episode，并给出稳定层级', () => {

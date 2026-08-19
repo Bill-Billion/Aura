@@ -18,6 +18,7 @@ from typing import Any, Awaitable, Callable
 from pydantic import BaseModel, Field
 
 from backend.engine.event_bus import SimEvent
+from backend.models.versioning import SUPPORTED_COMMAND_SCHEMA_VERSION
 
 # 生命周期事件复用既有 SIM_EVENT 通道（schemas.py 不新增 WS 消息类型），
 # 前端 useWebSocket.ts 已有 case 'SIM_EVENT'，零改动即可见。
@@ -135,6 +136,7 @@ class DeviceCommand(BaseModel):
     归因回落到 ``source.value``（绝不伪造 agent 身份字段）。
     """
 
+    command_schema_version: str = SUPPORTED_COMMAND_SCHEMA_VERSION
     command_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
     source: CommandSource
     actor: str | None = None
@@ -260,6 +262,7 @@ class CommandRecord:
         correlation_id / causal_parent 继承命令所属根事件（§4.4）。
         """
         data: dict[str, Any] = {
+            "command_schema_version": self.command.command_schema_version,
             "command_id": self.command.command_id,
             "device_id": self.command.device_id,
             "capability": self.command.capability,

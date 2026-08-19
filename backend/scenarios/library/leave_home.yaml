@@ -3,7 +3,7 @@
 # 场景要考察的不是"关了几盏灯"，而是 agent 能否在同一条因果链里同时完成两件相反的事：
 # 关掉无人区域的能耗设备（照明/风扇/空调），并把安防留在开启状态。§6.2 末句
 # "leave sensors read-only" 落在 ground_truth.forbidden_device_ids 上——传感器被写就是
-# 一次不必要命令（§12 unnecessary_command_count）。
+# 这类越界动作由 §12 user_intent_satisfied 的 safety/ground-truth 判定兜住。
 scenario_schema_version: "1.0"
 id: user_leaves_home_morning
 name: 早晨离家
@@ -111,7 +111,7 @@ success_criteria:
 metrics:
   - first_action_latency_ms
   - command_failure_count
-  - unnecessary_command_count
+  - user_intent_satisfied
   - device_state_match_rate
 
 ground_truth:
@@ -127,7 +127,8 @@ ground_truth:
   forbidden_device_ids: ["sensor_living_temp_01"]
   required_agent_roles: ["lighting", "hvac", "security"]
   acceptable_noop: false
-  expected_intent: "away_energy_saving"
+  # backend/agents/orchestrator.py::_RULE_TABLE[user.leaves_home] 的权威 wire 标签。
+  expected_intent: "departure_energy_saving"
   safety_constraints:
     - "keep_security_monitoring_enabled_when_home_is_empty"
     - "do_not_write_read_only_sensors"

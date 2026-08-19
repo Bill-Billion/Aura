@@ -4,12 +4,25 @@ import json
 import os
 import re
 from abc import ABC, abstractmethod
+from contextvars import ContextVar
 from typing import Any
 
 import httpx
 
 from backend.core.logging import log
-from backend.agents.types import AgentLLMDecision, LLMDecisionRequest
+from backend.agents.llm_pricing import DEFAULT_MAX_OUTPUT_TOKENS
+from backend.agents.types import (
+    MAX_COMMAND_REASON_CHARS,
+    MAX_DEVICE_ID_CHARS,
+    MAX_EXPLANATION_CHARS,
+    MAX_INTENT_CHARS,
+    MAX_PROPERTY_CHARS,
+    MAX_PROPOSED_COMMANDS,
+    MAX_TASK_STEP_CHARS,
+    MAX_TASK_STEPS,
+    AgentLLMDecision,
+    LLMDecisionRequest,
+)
 
 DEFAULT_AGENT_SYSTEM_PROMPT = (
     "You are a smart-home orchestration planner. "
@@ -30,27 +43,29 @@ AGENT_DECISION_SCHEMA: dict[str, Any] = {
         "needs_coordination",
     ],
     "properties": {
-        "intent": {"type": "string"},
-        "confidence": {"type": "number"},
+        "intent": {"type": "string", "maxLength": MAX_INTENT_CHARS},
+        "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
         "task_steps": {
             "type": "array",
-            "items": {"type": "string"},
+            "maxItems": MAX_TASK_STEPS,
+            "items": {"type": "string", "maxLength": MAX_TASK_STEP_CHARS},
         },
         "proposed_commands": {
             "type": "array",
+            "maxItems": MAX_PROPOSED_COMMANDS,
             "items": {
                 "type": "object",
                 "additionalProperties": False,
                 "required": ["device_id", "property", "value", "reason"],
                 "properties": {
-                    "device_id": {"type": "string"},
-                    "property": {"type": "string"},
+                    "device_id": {"type": "string", "maxLength": MAX_DEVICE_ID_CHARS},
+                    "property": {"type": "string", "maxLength": MAX_PROPERTY_CHARS},
                     "value": {},
-                    "reason": {"type": "string"},
+                    "reason": {"type": "string", "maxLength": MAX_COMMAND_REASON_CHARS},
                 },
             },
         },
-        "explanation": {"type": "string"},
+        "explanation": {"type": "string", "maxLength": MAX_EXPLANATION_CHARS},
         "needs_coordination": {"type": "boolean"},
     },
 }
@@ -88,6 +103,33 @@ class LLMProvider(ABC):
     # 一个属性，就不会出现"接了新 provider 忘了登记模式"这种静默错标。
     llm_mode = "live"
 
+    @property
+    def last_usage(self) -> Any:
+        """Usage reported by the current task's most recent provider call.
+
+        Providers are shared by the orchestrator's concurrently-running domain
+        agents.  A normal instance attribute lets one task overwrite another
+        task's telemetry between the provider await and budget settlement.  A
+        per-instance ``ContextVar`` preserves the existing provider API while
+        binding each usage report to the task that made the call.
+        """
+
+        context = self.__dict__.get("_last_usage_context")
+        if context is None:
+            return None
+        return context.get()
+
+    @last_usage.setter
+    def last_usage(self, value: Any) -> None:
+        context = self.__dict__.get("_last_usage_context")
+        if context is None:
+            context = ContextVar(
+                f"llm_last_usage_{type(self).__name__}_{id(self)}",
+                default=None,
+            )
+            self.__dict__["_last_usage_context"] = context
+        context.set(value)
+
     @abstractmethod
     async def generate_decision(self, request: LLMDecisionRequest) -> AgentLLMDecision:
         raise NotImplementedError
@@ -103,15 +145,26 @@ class OpenAIResponsesProvider(LLMProvider):
         model: str = "gpt-5.4",
         reasoning_effort: str = "medium",
         timeout_ms: int = 12000,
+        max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
         base_url: str = "https://api.openai.com/v1",
         transport: httpx.AsyncBaseTransport | httpx.BaseTransport | None = None,
     ) -> None:
+        if max_output_tokens <= 0:
+            raise ValueError("max_output_tokens 必须为正整数")
         self.api_key = api_key
         self.model = model
         self.reasoning_effort = reasoning_effort
         self.timeout_ms = timeout_ms
+        self.max_output_tokens = max_output_tokens
         self.base_url = base_url.rstrip("/")
         self.transport = transport
+        self.last_usage: Any = None
+
+    @property
+    def max_tokens(self) -> int:
+        """Budget wrapper compatibility; Responses names this max_output_tokens."""
+
+        return self.max_output_tokens
 
     @classmethod
     def from_env(cls) -> "OpenAIResponsesProvider":
@@ -120,15 +173,21 @@ class OpenAIResponsesProvider(LLMProvider):
             model=os.getenv("OPENAI_MODEL", "gpt-5.4"),
             reasoning_effort=os.getenv("OPENAI_REASONING_EFFORT", "medium"),
             timeout_ms=int(os.getenv("LLM_TIMEOUT_MS", "12000")),
+            max_output_tokens=int(
+                os.getenv("OPENAI_MAX_OUTPUT_TOKENS", str(DEFAULT_MAX_OUTPUT_TOKENS))
+            ),
             base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
         )
 
     async def generate_decision(self, request: LLMDecisionRequest) -> AgentLLMDecision:
+        # A failed/timeout request must never inherit the preceding call's bill.
+        self.last_usage = None
         if not self.api_key:
             raise LLMProviderError("provider_error", "OPENAI_API_KEY 未配置")
 
         payload = {
             "model": self.model,
+            "max_output_tokens": self.max_output_tokens,
             "reasoning": {"effort": self.reasoning_effort},
             "input": [
                 {
@@ -187,7 +246,9 @@ class OpenAIResponsesProvider(LLMProvider):
         except httpx.HTTPError as exc:
             raise LLMProviderError("provider_error", str(exc)) from exc
 
-        text = self._extract_text(response.json())
+        response_payload = response.json()
+        self.last_usage = response_payload.get("usage")
+        text = self._extract_text(response_payload)
         if not text:
             raise LLMProviderError("invalid_output", "Responses API 返回空文本")
 
@@ -223,6 +284,8 @@ class AnthropicCompatibleProvider(LLMProvider):
         anthropic_version: str = "2023-06-01",
         transport: httpx.AsyncBaseTransport | httpx.BaseTransport | None = None,
     ) -> None:
+        if max_tokens <= 0:
+            raise ValueError("max_tokens 必须为正整数")
         self.api_key = api_key
         self.model = model
         self.timeout_ms = self._effective_timeout_ms(timeout_ms, base_url=base_url, model=model)
@@ -230,6 +293,7 @@ class AnthropicCompatibleProvider(LLMProvider):
         self.base_url = base_url.rstrip("/")
         self.anthropic_version = anthropic_version
         self.transport = transport
+        self.last_usage: Any = None
 
     @classmethod
     def from_env(cls) -> "AnthropicCompatibleProvider":
@@ -248,6 +312,8 @@ class AnthropicCompatibleProvider(LLMProvider):
         )
 
     async def generate_decision(self, request: LLMDecisionRequest) -> AgentLLMDecision:
+        # Clear before every attempt so timeout/HTTP errors cannot reuse old usage.
+        self.last_usage = None
         if not self.api_key:
             raise LLMProviderError("provider_error", "ANTHROPIC_COMPAT_API_KEY 未配置")
 
@@ -294,7 +360,9 @@ class AnthropicCompatibleProvider(LLMProvider):
         except httpx.HTTPError as exc:
             raise LLMProviderError("provider_error", str(exc)) from exc
 
-        text = self._extract_text(response.json())
+        response_payload = response.json()
+        self.last_usage = response_payload.get("usage")
+        text = self._extract_text(response_payload)
         if not text:
             raise LLMProviderError("invalid_output", "Anthropic-compatible API 返回空文本")
 
@@ -371,7 +439,7 @@ def _normalize_agent_decision_payload(payload: dict[str, Any]) -> dict[str, Any]
         if isinstance(normalized.get("proposed_commands"), list) and normalized["proposed_commands"]:
             normalized["task_steps"] = [
                 f"set {command.get('device_id', 'device')} {command.get('property', 'state')}"
-                for command in normalized["proposed_commands"]
+                for command in normalized["proposed_commands"][:MAX_TASK_STEPS]
                 if isinstance(command, dict)
             ] or ["apply proposed commands"]
         else:

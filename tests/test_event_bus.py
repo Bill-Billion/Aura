@@ -3,7 +3,24 @@ from typing import get_args
 import pytest
 from pydantic import ValidationError
 
-from backend.engine.event_bus import EventBus, EventGenerationMode, SimEvent, WorldEvent
+from backend.engine.event_bus import (
+    EVENT_STORM_SUPPRESSED_EVENT_TYPE,
+    EventBus,
+    EventGenerationMode,
+    SimEvent,
+    WorldEvent,
+)
+from backend.engine.event_log import (
+    attach_run_artifacts,
+    read_run_events,
+    verify_finalized_event_log,
+)
+from backend.engine.run_manager import RunManager
+from backend.engine.state import WorldState
+from backend.evaluation.evaluator import EvalOutcome, evaluate_run
+from backend.scenarios.fingerprint import scenario_contract_fingerprint
+from backend.scenarios.loader import get_scenario
+from backend.scenarios.trace import export_canonical_trace
 
 
 @pytest.mark.anyio
@@ -259,6 +276,152 @@ async def test_publish_stamps_run_context_and_monotonic_seq():
     # seq 从 0 起、每条 +1，且与 timestamp（tick 计数）无关——同 tick 内也严格有序。
     assert [event.seq for event in (first, second, third)] == [0, 1, 2]
     assert bus.next_seq == 3
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("pre_stamp", [False, True])
+async def test_depth_cap_rejection_does_not_leave_a_public_seq_gap(pre_stamp: bool):
+    bus = EventBus(max_causal_depth=1)
+    bus.set_run_context(run_id="run-a", scenario_id="storm")
+
+    root = _sim_event(
+        event_id="root",
+        event_type="user.command",
+        correlation_id="corr",
+    )
+    allowed = _sim_event(
+        event_id="allowed",
+        event_type="feedback.state_delta",
+        correlation_id="corr",
+        causal_parent=root.event_id,
+    )
+    refused = _sim_event(
+        event_id="refused",
+        event_type="feedback.state_delta",
+        correlation_id="corr",
+        causal_parent=allowed.event_id,
+    )
+
+    await bus.publish(root)
+    await bus.publish(allowed)
+    if pre_stamp:
+        # 引擎在 WS 外发前会先 stamp；闸门在这条路径上也不能预占幽灵序号。
+        assert bus.stamp(refused).seq is None
+    await bus.publish(refused)
+
+    visible = bus.get_history()
+    assert refused.event_id not in {event.event_id for event in visible}
+    assert refused.seq is None, "被 depth-cap 拒绝的事件不应占用公开序号"
+    assert [event.seq for event in visible] == [0, 1, 2]
+    assert bus.next_seq == 3
+
+    notice = visible[-1]
+    assert notice.event_type == EVENT_STORM_SUPPRESSED_EVENT_TYPE
+    assert notice.run_id == "run-a"
+    assert notice.scenario_id == "storm"
+    assert notice.correlation_id == root.correlation_id
+    assert notice.causal_parent == allowed.event_id
+    assert notice.depth == 2
+
+
+@pytest.mark.anyio
+async def test_publish_visible_broadcasts_only_admitted_notice_and_keeps_descendants_blocked():
+    bus = EventBus(max_causal_depth=2)
+    broadcast: list[SimEvent] = []
+
+    async def before_fan_out(event: SimEvent) -> None:
+        broadcast.append(event)
+
+    parent_id: str | None = None
+    inputs: list[SimEvent] = []
+    returned: list[SimEvent] = []
+    for index in range(8):
+        event = _sim_event(
+            event_id=f"event-{index}",
+            event_type=f"test.depth_{index}",
+            correlation_id="corr",
+            causal_parent=parent_id,
+        )
+        inputs.append(event)
+        returned.append(
+            await bus.publish_visible(event, before_fan_out=before_fan_out)
+        )
+        # Deliberately keep extending from the producer's refused ID.  The bus
+        # tombstone must retain its depth instead of resetting the next child
+        # to a fresh root.
+        parent_id = event.event_id
+
+    visible = bus.get_history()
+    assert [event.event_id for event in visible[:3]] == [
+        "event-0",
+        "event-1",
+        "event-2",
+    ]
+    assert visible[3].event_type == EVENT_STORM_SUPPRESSED_EVENT_TYPE
+    assert [event.event_id for event in broadcast] == [
+        event.event_id for event in visible
+    ]
+    assert [event.seq for event in visible] == [0, 1, 2, 3]
+    assert all(event.seq is None for event in inputs[3:])
+    assert all(event is visible[3] for event in returned[3:])
+    assert bus.storm_suppressed_count("corr") == 5
+
+
+@pytest.mark.anyio
+async def test_depth_cap_trace_finalizes_and_remains_exportable_and_evaluable(tmp_path):
+    """真实 recorder 不应因被拒事件的幽灵 seq 留下不可评估的 trace。"""
+
+    bus = EventBus(max_causal_depth=1)
+    bus.set_sim_time_source(lambda: 0.0)
+    run_manager = RunManager(
+        event_bus=bus,
+        sim_version="test",
+        source_revision="test",
+    )
+    recorder = attach_run_artifacts(run_manager, root=tmp_path, enabled=True)
+    bus.subscribe("*", recorder.record)
+
+    scenario = get_scenario("morning_wake_up")
+    assert scenario is not None
+    metadata = run_manager.start_run(
+        world=WorldState(scene_id="test"),
+        scenario_id=scenario.id,
+        scenario_schema_version=scenario.scenario_schema_version,
+        scenario_contract_hash=scenario_contract_fingerprint(scenario),
+        seed=7,
+    )
+
+    root = _sim_event(
+        event_id="root",
+        event_type="user.command",
+        correlation_id="corr",
+    )
+    allowed = _sim_event(
+        event_id="allowed",
+        event_type="feedback.state_delta",
+        correlation_id="corr",
+        causal_parent=root.event_id,
+    )
+    refused = _sim_event(
+        event_id="refused",
+        event_type="feedback.state_delta",
+        correlation_id="corr",
+        causal_parent=allowed.event_id,
+    )
+    await bus.publish(root)
+    await bus.publish(allowed)
+    await bus.publish(refused)
+    run_manager.end_run("completed")
+
+    events, total = read_run_events(metadata.run_id, root=tmp_path)
+    assert total == 3
+    assert [event["seq"] for event in events] == [0, 1, 2]
+    assert verify_finalized_event_log(metadata.run_id, root=tmp_path)["final_seq"] == 2
+
+    exported = export_canonical_trace(metadata.run_id, root=tmp_path)
+    assert len(exported.splitlines()) == 3
+    report = evaluate_run(metadata.run_id, data_root=tmp_path)
+    assert report.outcome is not EvalOutcome.ERROR
 
 
 @pytest.mark.anyio

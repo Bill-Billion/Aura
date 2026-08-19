@@ -39,6 +39,7 @@ async def test_anthropic_provider_parses_messages_payload_and_code_fence_json():
         assert request.url.path.endswith("/v1/messages")
         payload = json.loads(request.content.decode("utf-8"))
         assert payload["model"] == "MiniMax-M2.5"
+        assert payload["max_tokens"] == 1200
         assert payload["messages"][0]["role"] == "user"
         assert payload["system"].startswith("You are a smart-home orchestration planner. Return strict JSON only.")
         return httpx.Response(
@@ -48,6 +49,7 @@ async def test_anthropic_provider_parses_messages_payload_and_code_fence_json():
                 "type": "message",
                 "role": "assistant",
                 "model": "MiniMax-M2.5",
+                "usage": {"input_tokens": 456, "output_tokens": 98},
                 "content": [
                     {
                         "type": "text",
@@ -84,6 +86,30 @@ async def test_anthropic_provider_parses_messages_payload_and_code_fence_json():
 
     assert decision.intent == "light occupied room"
     assert decision.proposed_commands[0].value == 70
+    assert provider.last_usage == {"input_tokens": 456, "output_tokens": 98}
+
+
+@pytest.mark.anyio
+async def test_anthropic_provider_clears_previous_usage_before_a_failed_request():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    provider = AnthropicCompatibleProvider(
+        api_key="test-key",
+        base_url="https://api.minimax.io/anthropic",
+        transport=httpx.MockTransport(handler),
+    )
+    provider.last_usage = {"input_tokens": 999, "output_tokens": 999}
+
+    with pytest.raises(LLMProviderError):
+        await provider.generate_decision(_request())
+
+    assert provider.last_usage is None
+
+
+def test_anthropic_provider_rejects_non_positive_output_cap():
+    with pytest.raises(ValueError):
+        AnthropicCompatibleProvider(api_key="test-key", max_tokens=0)
 
 
 @pytest.mark.anyio

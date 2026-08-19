@@ -2,6 +2,49 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **S3 multi-agent orchestration**: 加入 `HomeOrchestratorAgent`、Security / Energy / Scene 域 Agent、结构化任务分解、统一仲裁门、能源约束否决、显式用户覆盖与 stale-decision 丢弃证据。
+- **Per-run LLM policies**: canonical run 现在可显式选择 `rule_based / llm_mocked / llm_recorded / llm_live` baseline；服务端单独记录实际 `llm_mode`，recorded 支持受控首次录制与契约一致的原始来源回放，客户端不能提交 key、provider URL 或文件路径。
+- **Recording integrity manifest**: recorded capture 同步保存请求数、成功数与内容 hash；不完整录制、写入失败、回放 miss、链式 source、契约/代码版本漂移，或同一请求 key 对应互相矛盾的 decision，都不能作为可复现来源。
+- **Versioned run provenance**: `run.json` 增加 baseline/source、场景时长、场景评估契约 hash 和 scenario/event/command/device-registry 四个 schema version；事件与命令生命周期也携带对应版本。
+- **Source revision provenance**: run 同时持久化构建注入的 commit/image revision，或本地后端源码与配置的稳定 SHA-256；A/B 比较与 recorded source admission 不再把相同手工版本号误当成相同代码。
+- **Finalized trace seal**: event writer 在 flush/fsync/close 后持久化 event count、final seq 与 byte-exact SHA-256；finalized JSON、报告和 raw/canonical 导出统一验证，删尾与篡改明确失败。
+- **Research Workspace**: 主界面新增 Setup / Live / Compare 完整入口，支持 canonical scenario 启动、可复制 seed、A/B 独立状态与重试、同 scenario+seed 硬约束、策略 provenance、七指标表和双轨因果时间线。
+- **Stable experiment exports**: finalized run 可导出 byte-exact raw JSONL 或 canonical JSONL；前端可导出包含两侧 provenance、报告和按 `seq` 排序原始事件的 comparison bundle。
+- **S5 backend lifecycle**: REST 与 WebSocket 共用场景启动契约；并发启动只有一个请求成功，客户端可用 UUID `idempotency_key` 在同一进程的 1024 条有界缓存内从丢失的 201 恢复同一个 active/finalized run（不承诺跨重启恢复），canonical run 按场景模拟时长自动 finalized，报告与稳定 trace 在结束前返回结构化 `run_not_finalized`。
+
+### Changed
+
+- **S4 metric contract repaired**: 评估报告改为 `episode_complete`、`first_action_latency_ms`、`command_failure_count`、`fallback_count`、`conflict_count`、`user_intent_satisfied`、`device_state_match_rate` 七项 canonical 指标，替换此前语义不一致的替代指标。
+- **Evidence-grounded evaluation**: episode 的同一条 feedback 祖先链必须完整穿过 perception、intent、decomposition、coordination、plan、approved 与 action，不能用 root 的 sibling 事件拼出假完整链；延迟使用 root 到首个动作的 wall time；命令按最终态去重；预期失败必须真实发生；设备效果读取 flat `path/new_value` 并按字段与 deadline 计算，数值区间拒绝非有限数和倒置边界；禁止设备、归一化 intent、必需 Agent role 与未知安全约束全部 fail closed。
+- **Single report path**: API、离线评估与 suite 都从 run metadata 解析同一份 ScenarioSpec 和 persisted events，输出 `report_schema_version`、`failed_metrics` 与 provenance；suite 的 seed override 不再改变场景契约 hash，三条入口不会对同一 run 给出不同结论。动态历史报告另记当前 `evaluator_source_revision`，不再把运行代码版本冒充成报告生成代码版本。
+- **Observability truth**: episode cancellation 只由 `system.episode_cancelled` 标记，不再把 stale `reasoning.decision_discarded` 错当成整条 episode 取消；3D 设备点击继续联动 Live/Compare 过滤。
+- **Frontend unit runner**: README 和 CI 口径统一为 Vitest `npm test`；Research Workspace 关闭后保留运行状态并把焦点还给入口。
+- **Typed generation configuration**: scenario 的噪声与设备掉线注入改为严格嵌套契约，非法概率、未知字段和反向舒适区在换 run 前拒绝；罕见 post-commit 失败也会以 `launch_failed` 收尾，不再永久锁住控制面。
+
+### Fixed
+
+- **Rule-based isolation**: 显式 `rule_based` 即使服务器配置了真实 LLM key 也不会构造 live provider，消除基线静默打网和计费风险。
+- **Run/report race boundaries**: active canonical run 不再被第二个启动静默 supersede；旧 finalizer 不能结束新 run；raw/canonical trace 不再读取仍在追加的事件文件。
+- **Experiment isolation**: canonical run 期间拒绝会改写世界或时钟的交互命令；交互 mutation 与场景启动共用原子边界，事件 recorder 也拒绝跨 run 追加。
+- **Finalization and reconnect ordering**: timer tick 会完整 drain 后再关闭工件；finalizer 自身异常会把 run 标成 `finalization_failed` 并释放 active slot；连续 engine-error run 不会卡死后续 finalizer；WebSocket 重连的 `STATE_FULL + SIMULATION_STATUS` 作为有序批次先于后续增量发送。
+- **Exact duration boundary**: live 与 headless 统一使用 `tick 1 = t0` 的截止语义；非整拍时长运行到首个覆盖 deadline 的完整 tick，当前 fan-out/工件写入排空后立即停止，不会漏掉 deadline 事件或随负载多跑一拍。
+- **Event admission consistency**: 深度风暴中被拒事件不再占用 `seq`、从未知 parent 重启深度或先泄漏到 WebSocket；Live、EventBus history 与 finalized JSONL 只看到同一条 accepted event / suppression notice，前端也以 canonical `seq` 排序。
+- **WebSocket slow-client isolation**: 每个 socket 的发送有界超时；失败连接进入不可复活终态、唤醒 receive loop 并 best-effort 关闭，初始化和 canonical 锁定错误的实际网络发送不再占用全局场景锁。
+- **Cross-runtime seed safety**: 公开场景与启动 API 的 seed 收窄到 JavaScript JSON 安全整数域，避免相邻大 seed 在浏览器折成同一个实验。
+- **Paid-provider access boundary**: API key 不再隐式开启 live；`AURA_ALLOW_LIVE_LLM=1` 才授权外部调用，本机浏览器 Origin 缺省可信，远程付费启动额外要求显式 Origin allowlist 与 Bearer token，REST/WS 均在修改状态前校验。
+- **Hard LLM cost boundary**: OpenAI Responses 与 Anthropic-compatible provider 强制声明/发送输出 token 上限并记录真实 usage；同 episode 并发 Agent 会先原子预留 worst-case cost，已计费但解析失败的响应仍入账，缺 usage 时使用保守上界，无硬 cap 的付费 provider 在网络调用前拒绝，request/decision 同时限制字符串、列表与 JSON 总大小。
+- **Per-call usage and recording cancellation**: 共享 provider 的 usage 改为 task-local，失败调用不会误读并发兄弟请求的账；recorded capture 被 timeout/reset 取消时会写入失败 manifest、标记 run 工件无效并阻止后续报告或 source admission。
+
+### Testing
+
+- 后端 `pytest tests/ --timeout=120` 通过。
+- 前端 `npm test` 与 `npm run build` 通过。
+- 前端构建仍有既有主 chunk 大于 500 kB 的提示；本条目不声明 Playwright 或 Docker 容器冒烟结果。
+
 ## [0.1.3.12] - 2026-04-28
 
 ### Fixed

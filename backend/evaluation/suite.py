@@ -7,17 +7,30 @@
 from __future__ import annotations
 
 import json
-import statistics
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from backend.engine.event_log import run_dir
-from backend.evaluation.evaluator import EvalOutcome, EvalReport, ScenarioEvaluator, evaluate_run
-from backend.scenarios.loader import get_scenario
+from backend.engine.event_log import runs_root
+from backend.evaluation.evaluator import EvalOutcome, EvalReport, evaluate_run
+from backend.scenarios.loader import get_scenario, load_library
 from backend.scenarios.runner import ScenarioRunResult, run_scenario
-from backend.scenarios.spec import ScenarioSpec
+
+
+_OUTCOME_SEVERITY = {
+    EvalOutcome.PASS: 0,
+    EvalOutcome.FAIL: 1,
+    EvalOutcome.ERROR: 2,
+}
+
+
+def _merge_outcome(current: EvalOutcome, candidate: EvalOutcome) -> EvalOutcome:
+    """Aggregate without ever downgrading ERROR to FAIL or FAIL to PASS."""
+
+    if _OUTCOME_SEVERITY[candidate] > _OUTCOME_SEVERITY[current]:
+        return candidate
+    return current
 
 
 class SeedSet(str, Enum):
@@ -115,12 +128,18 @@ class SuiteRunner:
         self.suite_name = suite_name
         self.seed_set = seed_set
         self._scenario_ids = scenario_ids
-        self._scenario_dirs = [Path(d) for d in (scenario_dirs or [])]
+        self._scenario_dirs = (
+            None if scenario_dirs is None else [Path(d) for d in scenario_dirs]
+        )
 
     async def run(self) -> SuiteReport:
         """跑完全部场景 × 种子，汇总报告。"""
 
-        scenario_ids = self._scenario_ids or self._default_scenario_ids()
+        scenario_ids = (
+            self._default_scenario_ids()
+            if self._scenario_ids is None
+            else self._scenario_ids
+        )
         seeds = self.seed_set.seeds()
 
         report = SuiteReport(
@@ -129,6 +148,7 @@ class SuiteRunner:
             total_scenarios=len(scenario_ids),
             total_runs=len(scenario_ids) * len(seeds),
         )
+        artifact_root = runs_root()
 
         for sid in scenario_ids:
             entry = ScenarioSuiteEntry(
@@ -136,7 +156,7 @@ class SuiteRunner:
                 seed_set=self.seed_set,
             )
             try:
-                spec = get_scenario(sid)
+                spec = get_scenario(sid, dirs=self._scenario_dirs)
                 if spec is None:
                     entry.errors.append(f"scenario {sid} not found")
                     entry.aggregate_outcome = EvalOutcome.ERROR
@@ -150,51 +170,31 @@ class SuiteRunner:
                 report.errors += 1
                 continue
 
-            evaluator = ScenarioEvaluator(
-                success_criteria=spec.success_criteria.model_dump()
-                if spec.success_criteria
-                else None
-            )
-
             for seed in seeds:
                 try:
-                    # 用指定 seed 覆盖场景内置 seed
-                    spec_with_seed = spec.model_copy(update={"seed": seed})
-                    result = await run_scenario(spec_with_seed)
+                    # Seed 是一次实验的运行参数，不得复制并篡改 ScenarioSpec；否则
+                    # run.json 会把 suite seed 写进场景契约指纹，离线重评时必然漂移。
+                    result = await run_scenario(spec, seed=seed)
                     entry.runs.append(result)
 
-                    # 评估
-                    eval_report = evaluator.evaluate(
-                        list(result.events),
-                        run_id=result.run_id,
-                        scenario_id=spec.id,
-                        seed=seed,
-                        expected_failure_device_ids=set(
-                            f.device_id for f in (spec.expected_failures or []) if f.device_id
-                        ),
-                        expected_failure_categories=set(
-                            f.category for f in (spec.expected_failures or [])
-                        ),
-                        expected_device_effects=[
-                            {
-                                "device_id": e.device_id,
-                                "expected": {
-                                    k: v.model_dump() if hasattr(v, "model_dump") else v
-                                    for k, v in (e.expected or {}).items()
-                                },
-                            }
-                            for e in spec.expected_device_effects
-                        ],
+                    # Suite、离线 CLI 与 API 都只评持久化且已封口的工件。这样版本、
+                    # 完整性、场景指纹及 provenance 只有 evaluate_run 一条真相来源。
+                    eval_report = evaluate_run(
+                        result.run_id,
+                        data_root=artifact_root,
+                        scenario_dirs=self._scenario_dirs,
                     )
                     entry.reports.append(eval_report)
 
-                    if eval_report.outcome == EvalOutcome.FAIL:
-                        entry.aggregate_outcome = EvalOutcome.FAIL
-                    elif eval_report.outcome == EvalOutcome.ERROR:
-                        entry.aggregate_outcome = EvalOutcome.ERROR
+                    entry.aggregate_outcome = _merge_outcome(
+                        entry.aggregate_outcome, eval_report.outcome
+                    )
 
                 except Exception as exc:
                     entry.errors.append(f"seed={seed}: {exc}")
+                    entry.aggregate_outcome = _merge_outcome(
+                        entry.aggregate_outcome, EvalOutcome.ERROR
+                    )
 
             report.entries.append(entry)
             if entry.aggregate_outcome == EvalOutcome.PASS:
@@ -206,16 +206,10 @@ class SuiteRunner:
 
         return report
 
-    @staticmethod
-    def _default_scenario_ids() -> list[str]:
-        """Canonical 场景库的 ID 列表（S2-T8 八场景 + S3 两项增量）。
+    def _default_scenario_ids(self) -> list[str]:
+        """Enumerate the configured production library instead of importing tests."""
 
-        与 tests/test_canonical_scenarios.py 的 CANONICAL_SCENARIO_IDS 共用同一词表。
-        """
-
-        from tests.test_canonical_scenarios import CANONICAL_SCENARIO_IDS
-
-        return list(CANONICAL_SCENARIO_IDS)
+        return list(load_library(self._scenario_dirs))
 
 
 async def run_suite(
@@ -223,6 +217,7 @@ async def run_suite(
     seed_set: SeedSet = SeedSet.DEV,
     *,
     scenario_ids: list[str] | None = None,
+    scenario_dirs: list[Path | str] | None = None,
     output_dir: Path | str | None = None,
 ) -> SuiteReport:
     """便利入口：跑一次 suite 并保存报告。
@@ -230,7 +225,12 @@ async def run_suite(
     S4-T4 CLI: ``aura run-suite canonical-v1 --seed-set dev`` 调的就是这里。
     """
 
-    runner = SuiteRunner(suite_name, seed_set, scenario_ids=scenario_ids)
+    runner = SuiteRunner(
+        suite_name,
+        seed_set,
+        scenario_ids=scenario_ids,
+        scenario_dirs=scenario_dirs,
+    )
     report = await runner.run()
 
     if output_dir is not None:

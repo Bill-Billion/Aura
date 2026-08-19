@@ -116,7 +116,7 @@ success_criteria:
 metrics:
   - first_action_latency_ms
   - command_failure_count
-  - unnecessary_command_count
+  - user_intent_satisfied
   - device_state_match_rate
 
 ground_truth:
@@ -128,7 +128,7 @@ ground_truth:
     # 事件的观测来源，S4 判"相关设备"时它算相关，但它不是可写落点。
     - sensor_utility_air_01
   # 疏散响应应当收在着火房间：把全屋灯当成"顺手也调一下"的对象是 §6.5 同款的
-  # unnecessary_command_count 失分点。
+  # user_intent_satisfied 的安全约束失分点。
   forbidden_device_ids:
     - light_bedroom_01
     - light_loft_01

@@ -1,18 +1,13 @@
 # §6.9 Device Offline —— 主空调在需要它之前就已经掉线。
 #
-# 【schema 1.1 声明】本文件顶层带 `expected_failures`，那是 §13 恢复要求的落点。该字段
-# 是 schema 1.1 的 §14 MINOR 增量（"Minor versions may add optional fields"），后端已支持
-# 1.1：loader 走严格分支把它校验成 ScenarioSpec.expected_failures，S4 评估器直接消费。
-# 不要把它退回 1.0 —— 那会让高 MINOR 容忍分支把整块声明丢掉，S4 读到的是空。
-#
 # 【为什么本文件刻意不含 timeline 设备直控项】
 # tests/test_s1_acceptance.py::_library_scenario_with_device_command 按 **id 升序** 取库里
 # 第一个带 `payload.capability/value` 的场景，并断言它在整个 run 里只有一条场景来源命令
 # 且必须成功。本场景 id（device_offline_fallback）排在 user_arrives_home_evening 之前，
 # 在这里加一条注定失败的直控项，会把 §15-2 的被测对象换成它并让那条验收挂掉。
-# 掉线设备的失败路径由 S4-T3 的 scenarios/failures/fail_device_offline_mid_execution.yaml
-# 专门覆盖；本场景负责的是"掉线**在先**"这一类。
-scenario_schema_version: "1.1"
+# 掉线设备的命令失败路径由 S4-T3 的 scenarios/failures/fail_device_offline_mid_execution.yaml
+# 专门覆盖；本场景负责的是"掉线在先，agent 从 wire 状态预判避让并选择替代设备"。
+scenario_schema_version: "1.0"
 id: device_offline_fallback
 name: 设备掉线降级
 description: 客厅主空调在高温前已掉线，期望 agent 避开不可用设备、改用备用空调与风扇。
@@ -96,8 +91,7 @@ involved_agents:
 success_criteria:
   require_complete_episode: true
   max_first_action_latency_ms: 6000
-  # 掉线设备上的失败是**预期内**的（见 expected_failures），不计入回归；这里的上限
-  # 约束的是预期之外的失败。
+  # runtime 会从 device.offline wire 状态预判避让，canonical 路径不应制造命令失败。
   max_command_failures: 2
   allow_fallback: true
 
@@ -110,15 +104,6 @@ failure_injection:
     probability: 0.3
     recovery_probability: 0.5
 
-# §13 恢复要求：本场景**预期**会出现哪一类失败。S4-T2 的评估器据此把"预期内失败"
-# 与"回归"分开——没有这条声明，一次正确处理掉线的 run 会被记成命令失败率上升。
-expected_failures:
-  - category: device_offline_before_command
-    device_id: ac_living_01
-    error_code: device_offline
-    description: "主空调在任何命令下发之前已离线，针对它的写命令必须以 device_offline 失败"
-    expected_recovery: fallback_to_alternative_device
-
 metrics:
   - first_action_latency_ms
   - command_failure_count
@@ -129,14 +114,15 @@ ground_truth:
   user_goal: "主空调不可用时仍把客厅降到舒适温度"
   primary_room_ids: ["living_room"]
   relevant_device_ids:
+    - ac_living_01
     - ac_living_02
     - fan_living_01
     - curtain_living_01
-  # §6.9 "avoid issuing commands to unavailable devices"：掉线设备是禁区，不是候选。
-  forbidden_device_ids:
-    - ac_living_01
+  # 主空调是 fallback 决策的相关输入，不是 forbidden 动作目标；runtime 应在执行前从
+  # device.offline wire 证据预判避让，后续重复尝试由 safety predicate 禁止。
+  forbidden_device_ids: []
   required_agent_roles: ["hvac"]
   acceptable_noop: false
-  expected_intent: "degraded_mode_comfort"
+  expected_intent: "device_offline_failover"
   safety_constraints:
     - "do_not_retry_commands_to_a_device_known_offline"
