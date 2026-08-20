@@ -15,6 +15,13 @@
 :func:`test_two_root_events_both_emit_grouped_in_root_event_order` 与
 :func:`test_compute_latency_does_not_reorder_the_canonical_trace` 会立刻变红，而不是等到
 某天有人发现两次运行的 trace 对不上。
+
+**S3-T10 追加的重新断言**（本文件末尾一节，binding critic）：上面那些绊线证明的是"机制
+还在"，但它们证明不了"机制在**新流水线上**仍然有效"。S3 把编排器插进派发循环、又注册了
+SecurityAgent / EnergyAgent / SceneAgent 三个并发 agent —— 这是整个 S3 里最可能**悄无声息**
+毁掉 S2 阶段门的一处改动（毁掉的方式是"偶尔红一次"，最容易被当成 flaky 关掉）。因此末尾
+一节在**编排器打开 + 三个新 agent 全部注册**的姿态下重跑字节一致性，并附一条阴性对照：
+关掉编排器必须让 trace **改变**（否则"编排器在链路里"本身就是假的，正向断言随之空转）。
 """
 
 from __future__ import annotations
@@ -24,7 +31,15 @@ import asyncio
 import pytest
 
 from backend.agents.llm import LLMProvider, LLMProviderError
-from backend.agents.runtime import AgentRuntime, SerialEmissionGate
+from backend.agents.orchestrator import (
+    DEFAULT_ORCHESTRATOR_ID,
+    ORCHESTRATOR_ENABLED_ENV,
+)
+from backend.agents.runtime import (
+    AgentRuntime,
+    SerialEmissionGate,
+    register_default_agents,
+)
 from backend.api.ws import ConnectionManager
 from backend.engine.event_bus import EventBus, SimEvent
 from backend.engine.simulation import SimulationEngine
@@ -364,3 +379,93 @@ async def test_serial_emission_gate_serves_tickets_in_order_not_arrival_order():
     async with gate.turn(b):
         pass
     assert gate.now_serving == 2
+
+
+# ------------------------------- S3-T10：编排器 + 三个新域 agent 上线后的重新断言
+#
+# 这一节存在的唯一理由是 binding critic 那条修正：S2 的字节一致性门依赖 runtime
+# ``_run_episode`` 里"并发算 / 串行发"的那把闸门，而 S3 恰好重写了那段派发循环并把
+# 并发 agent 从 2 个加到 5 个。上面的正向门（八/九场景 × 两遍）虽然天然覆盖到了新流水线，
+# 但它读的是**环境默认值**——一旦哪天默认值翻转，门会在无人察觉的情况下退回旧路径。
+# 下面三条把"编排器确实开着、三个新 agent 确实在跑、而且 trace 仍然字节一致"钉成显式断言。
+
+
+def test_default_agent_registry_contains_the_three_new_domain_agents():
+    """结构钉：SecurityAgent / EnergyAgent / SceneAgent 必须在默认注册表里，且顺序确定。
+
+    顺序即契约（``DEFAULT_AGENT_FACTORIES`` 的注释写着三条后果）：它决定
+    ``TaskPlan.domain_tasks`` 的顺序、episode 内事件的发射顺序，以及 canonical trace 的行序。
+    改这张表的顺序 = 改 canonical trace，因此顺序本身要有一条断言盯着。
+    """
+
+    from backend.agents.energy import EnergyAgent
+    from backend.agents.runtime import DEFAULT_AGENT_FACTORIES, build_default_agents
+    from backend.agents.scene import SceneAgent
+    from backend.agents.security import SecurityAgent
+
+    agents = build_default_agents()
+    assert [type(agent) for agent in agents] == list(DEFAULT_AGENT_FACTORIES)
+    assert {SecurityAgent, EnergyAgent, SceneAgent} <= set(DEFAULT_AGENT_FACTORIES)
+
+    runtime = AgentRuntime()
+    registered = register_default_agents(runtime)
+    assert [agent.agent_id for agent in runtime.agents] == [
+        agent.agent_id for agent in registered
+    ]
+    # 注册序 = 发射序的 tie-break：五个 agent 全在，且顺序与工厂表逐位一致
+    assert len(runtime.agents) == 5
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("scenario_id", CANONICAL_SCENARIO_IDS)
+async def test_byte_identity_holds_with_orchestrator_and_new_agents(
+    monkeypatch, scenario_id
+):
+    """S2 门在**编排器打开 + 五个域 agent 全注册**的姿态下逐场景重新成立。
+
+    与文件开头那条正向门的区别只有一个：这里把 ``ORCHESTRATOR_ENABLED`` 显式钉成 1，
+    因此它测的永远是 S3 的新流水线，而不是"当前默认值恰好是什么"。
+    """
+
+    monkeypatch.setenv(ORCHESTRATOR_ENABLED_ENV, "1")
+
+    first = await run_scenario(scenario_id)
+    second = await run_scenario(scenario_id)
+
+    assert first.run_id != second.run_id
+    assert canonical_trace_text(first.events) == canonical_trace_text(second.events), (
+        f"{scenario_id}: 编排器开启后两次同 seed 运行的 canonical trace 不一致\n"
+        f"digest={trace_digest(first.events)} vs {trace_digest(second.events)}"
+    )
+    # 编排器真的在链路里：前三环归它，而且一条 episode 只有一套
+    orchestrator_events = [
+        event
+        for event in first.events
+        if event.source == DEFAULT_ORCHESTRATOR_ID
+    ]
+    assert orchestrator_events, f"{scenario_id}: 编排器开着却一条事件都没发"
+
+
+@pytest.mark.anyio
+async def test_orchestrator_actually_changes_the_trace(monkeypatch):
+    """阴性对照：关掉编排器必须让 canonical trace **改变**。
+
+    没有这一条，上面那条"开着编排器也字节一致"可能只是因为编排器根本没接进链路——
+    一个不参与的组件当然不会破坏确定性。这条测试证明被测的确实是新流水线。
+    """
+
+    scenario_id = "user_arrives_home_evening"
+
+    monkeypatch.setenv(ORCHESTRATOR_ENABLED_ENV, "1")
+    orchestrated = canonical_trace_text((await run_scenario(scenario_id)).events)
+
+    monkeypatch.setenv(ORCHESTRATOR_ENABLED_ENV, "0")
+    bypassed = canonical_trace_text((await run_scenario(scenario_id)).events)
+    # 逃生阀本身也必须是确定的（否则"关掉编排器"会变成一条不可复现的对照）
+    bypassed_again = canonical_trace_text((await run_scenario(scenario_id)).events)
+
+    assert bypassed == bypassed_again
+    assert orchestrated != bypassed, (
+        "开/关编排器产出了同一份 trace —— 编排器没有真正接进派发循环，"
+        "上面那条确定性重新断言随之空转"
+    )

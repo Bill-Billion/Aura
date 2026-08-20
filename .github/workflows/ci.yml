@@ -43,5 +43,5 @@ jobs:
       - run: npm ci
       # vue-tsc -b && vite build
       - run: npm run build
-      # node --test over the ts unit suites (strip-types)
-      - run: npm run test --if-present
+      # Vitest unit suites
+      - run: npm test

@@ -57,6 +57,35 @@ async def test_timer_tick_payload_reflects_speed_and_reset():
     assert timer.current_tick == 0
 
 
+@pytest.mark.anyio
+async def test_duration_stop_request_drains_current_publish_without_next_tick():
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    received = []
+    timer = None
+
+    async def publish(event):
+        received.append(event)
+        assert timer is not None
+        timer.request_stop_after_current_tick()
+        entered.set()
+        await release.wait()
+        return event
+
+    timer = SimulatorTimer(publish_event=publish, tick_interval=0.005)
+    await timer.start()
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+    # The current publish remains alive, but the armed stop blocks tick 2.
+    await asyncio.sleep(0.03)
+    assert timer.current_tick == 1
+    assert [event.data["tick"] for event in received] == [1]
+
+    release.set()
+    await timer.pause()
+    assert [event.data["tick"] for event in received] == [1]
+
+
 def test_timer_defaults_to_slower_observe_mode():
     async def publish(event):
         return event

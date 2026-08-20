@@ -10,6 +10,12 @@ import ObservabilityHeader from './observability/ObservabilityHeader.vue'
 import EventTimeline from './observability/EventTimeline.vue'
 import ReasoningDetail from './observability/ReasoningDetail.vue'
 
+withDefaults(defineProps<{
+  embedded?: boolean
+}>(), {
+  embedded: false,
+})
+
 const eventStore = useEventStore()
 const agentStore = useAgentStore()
 const simulationStore = useSimulationStore()
@@ -29,6 +35,12 @@ const {
 } = storeToRefs(eventStore)
 
 const visibleEpisodes = computed(() => episodes.value.slice(0, 20))
+const currentRunLabel = computed(() => {
+  if (!simulationStore.currentRunId) return '未同步 run 身份'
+  const id = simulationStore.currentRunId
+  const shortId = id.length > 20 ? `${id.slice(0, 12)}…${id.slice(-6)}` : id
+  return `${simulationStore.currentRunFinalized ? '已归档' : '当前'} ${shortId}`
+})
 
 const agentOptions = computed(() => {
   const fromAgents = Object.values(agentStore.agents).map((agent) => ({
@@ -36,13 +48,15 @@ const agentOptions = computed(() => {
     label: agent.name || agent.id,
   }))
 
-  const fromEpisodes = visibleEpisodes.value
-    .flatMap((episode) => episode.agentIds)
-    .filter((agentId) => !fromAgents.some((agent) => agent.id === agentId))
-    .map((agentId) => ({
-      id: agentId,
-      label: agentId,
-    }))
+  const knownIds = new Set(fromAgents.map((agent) => agent.id))
+  const fromEpisodes: Array<{ id: string; label: string }> = []
+  for (const episode of visibleEpisodes.value) {
+    for (const agentId of episode.agentIds) {
+      if (knownIds.has(agentId)) continue
+      knownIds.add(agentId)
+      fromEpisodes.push({ id: agentId, label: agentId })
+    }
+  }
 
   return [...fromAgents, ...fromEpisodes]
 })
@@ -54,13 +68,14 @@ function retryConnection() {
 </script>
 
 <template>
-  <section class="observability-panel">
+  <section class="observability-panel" :class="{ 'is-embedded': embedded }">
     <ObservabilityHeader
       :connection-state="connectionStateDerived"
       :current-episode="selectedEpisode"
       :episodes="visibleEpisodes"
       :filters="filters"
       :agent-options="agentOptions"
+      :show-close="!embedded"
       @close="uiStore.sidebarOpen = false"
       @retry="retryConnection"
       @select-episode="eventStore.selectEpisode"
@@ -82,6 +97,7 @@ function retryConnection() {
     </div>
 
     <div class="observability-panel__footer">
+      <span class="footer-chip">{{ currentRunLabel }}</span>
       <span class="footer-chip">
         {{ selectedEpisode ? `链路 ${selectedEpisode.correlationId}` : '等待链路' }}
       </span>
@@ -103,6 +119,26 @@ function retryConnection() {
   background: rgba(7, 9, 13, 0.98);
   border-left: 1px solid rgba(255, 255, 255, 0.08);
   box-shadow: -24px 0 40px rgba(0, 0, 0, 0.28);
+}
+
+.observability-panel.is-embedded {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 6px;
+  box-shadow: none;
+  overflow: hidden;
+}
+
+.observability-panel.is-embedded :deep(button),
+.observability-panel.is-embedded :deep(select),
+.observability-panel.is-embedded :deep(.fallback-toggle) {
+  min-height: 40px;
+}
+
+.observability-panel.is-embedded :deep(button:focus-visible),
+.observability-panel.is-embedded :deep(select:focus-visible),
+.observability-panel.is-embedded :deep(input:focus-visible) {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
 }
 
 .observability-panel__body {

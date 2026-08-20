@@ -1,0 +1,63 @@
+# §13 fail_activity_change_after_action
+# 用户在 agent 执行完命令后立即改变活动 → agent 提案因世界版本变化被丢弃
+# category: user_activity_change_after_action
+# expected: reasoning.decision_discarded (reason=stale)
+
+scenario_schema_version: "1.1"
+
+id: fail_activity_change_after_action
+name: "用户活动在命令执行后立即改变"
+description: >
+  验证 §13 "User changes activity shortly after an action"：
+  agent 提出灯光调整后用户立刻切换到"睡眠"活动，灯光命令被陈旧决策丢弃，
+  系统产生 reasoning.decision_discarded 事件。
+
+seed: 4201
+
+initial_state:
+  time_of_day: "22:00"
+  users:
+    user_01:
+      location: living_room
+      activity: relaxing
+      presence_state: home
+  devices:
+    light_living_01:
+      state:
+        power: true
+        extra:
+          brightness: 30
+
+timeline:
+  - at: 0.0
+    type: user.arrives_home
+    user_id: user_01
+    room_id: living_room
+
+  # agent 在 5s 后提出舒适灯光提案（已入仲裁/executor 队列）
+  # 紧接着用户立即切换活动（t=5.5），产生新的 user.activity_change 根事件
+  - at: 5.5
+    type: user.activity_change
+    user_id: user_01
+    room_id: living_room
+    activity: sleeping
+
+expected_device_effects: []
+
+involved_agents:
+  - lighting_agent
+  - home_orchestrator
+
+success_criteria:
+  require_complete_episode: true
+  max_first_action_latency_ms: 30000
+  allow_fallback: true
+
+expected_failures:
+  - category: user_activity_change_after_action
+    error_code: discarded_stale
+    description: "用户切换睡眠活动后灯光调整命令因世界版本变化被丢弃"
+    expected_recovery: "产生 reasoning.decision_discarded 事件，不做状态变更"
+
+mode: demo
+duration_seconds: 30

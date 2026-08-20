@@ -18,8 +18,9 @@ import pytest
 from backend.agents.llm import LLMProvider, LLMProviderError
 from backend.api.ws import ConnectionManager
 from backend.engine.event_bus import EventBus
+from backend.engine.event_log import read_run_events, read_run_metadata
 from backend.engine.simulation import ENGINE_ERROR_WS_TYPE, SimulationEngine
-from backend.engine.event_types import ENGINE_ERROR_EVENT_TYPE
+from backend.engine.event_types import ALL_ROOT_EVENT_TYPES, ENGINE_ERROR_EVENT_TYPE
 from backend.engine.state import Location3D, RoomState, WorldState
 from backend.engine.state_manager import StateManager
 from backend.execution.command import LIFECYCLE_EVENT_TYPE
@@ -53,6 +54,26 @@ class _DisabledProvider(LLMProvider):
 
     async def generate_decision(self, request):  # type: ignore[override]
         raise LLMProviderError("provider_error", "LLM provider is disabled")
+
+
+class _HangingProvider(LLMProvider):
+    provider_name = "hanging_test"
+    model = "never_returns"
+    api_key = "test-only"
+    max_output_tokens = 1200
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    async def generate_decision(self, request):  # type: ignore[override]
+        del request
+        self.started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
 
 
 def _spec():
@@ -111,6 +132,27 @@ async def test_rich_root_event_triggers_agent_episode():
     ]
     assert any(e.event_type == "reasoning.perception_snapshot" for e in episode_events)
     assert any(e.event_type == "reasoning.intent_recognized" for e in episode_events)
+
+
+@pytest.mark.anyio
+async def test_every_real_agent_episode_has_one_causal_none_rich_root():
+    """Generated schedule events remain episode roots, not timer children."""
+
+    result = await run_scenario("cooking_dinner")
+    reasoning_correlations = {
+        event.correlation_id
+        for event in result.events
+        if event.event_type.startswith("reasoning.")
+    }
+    for correlation_id in reasoning_correlations:
+        roots = [
+            event
+            for event in result.events
+            if event.correlation_id == correlation_id
+            and event.event_type in ALL_ROOT_EVENT_TYPES
+            and event.causal_parent is None
+        ]
+        assert len(roots) == 1, correlation_id
 
 
 @pytest.mark.anyio
@@ -217,6 +259,57 @@ async def test_headless_and_live_modes_produce_same_generated_event_sequence():
     assert headless.ticks == live.ticks
 
 
+@pytest.mark.anyio
+async def test_non_integral_duration_stops_both_drivers_after_first_covering_tick():
+    """duration=25/dt=10 means complete t=0,10,20,30 fan-out, never tick 5."""
+
+    spec = _spec().model_copy(update={"duration_seconds": 25.0})
+    headless = await run_scenario(spec, seed=4242)
+    live = await run_scenario(spec, seed=4242, live=True, tick_interval=0.005)
+
+    def tick_events(result):
+        return sorted(
+            result.events_of_type("system.timer_tick"),
+            key=lambda event: int(event.seq or 0),
+        )
+
+    def generated_signature(result):
+        return [
+            (event.event_type, event.sim_time_s, event.generation_rule_id, event.rng_stream)
+            for event in result.events
+            if event.event_generation_mode in {"scripted", "rule_based", "stochastic"}
+        ]
+
+    for result in (headless, live):
+        ticks = tick_events(result)
+        assert result.seed == 4242
+        assert result.ticks == 4
+        assert result.sim_time_s == 30.0
+        assert [event.data["tick"] for event in ticks] == [1, 2, 3, 4]
+        assert [event.sim_time_s for event in ticks] == [0.0, 10.0, 20.0, 30.0]
+        final_tick = ticks[-1]
+        assert any(
+            event.event_type == "environment.state_refresh"
+            and event.causal_parent == final_tick.event_id
+            for event in result.events
+        )
+
+    assert generated_signature(headless) == generated_signature(live)
+
+
+@pytest.mark.anyio
+async def test_tick_budget_cannot_silently_finalize_before_duration_boundary():
+    spec = _spec().model_copy(update={"duration_seconds": 25.0})
+    runner = ScenarioRunner(spec, max_ticks=3)
+
+    with pytest.raises(ScenarioRunError) as excinfo:
+        await runner.run()
+
+    assert excinfo.value.code is ScenarioRunErrorCode.TICK_BUDGET_EXCEEDED
+    assert excinfo.value.details["required_ticks"] == 4
+    assert runner.engine.run_manager.finished[-1].end_reason == "tick_budget_exceeded"
+
+
 # ------------------------------------------- critic 修正③：引擎假活（fake-alive）
 
 
@@ -291,6 +384,41 @@ async def test_scenario_runner_fails_fast_when_engine_dies_mid_run():
     assert error.details["scenario_id"] == SCENARIO_ID
     assert "env sim died mid run" in error.details["error"]
     assert runner.engine.is_running is False
+
+
+@pytest.mark.anyio
+async def test_scenario_runner_rejects_and_seals_hung_episode_as_incomplete(
+    monkeypatch,
+):
+    """A settle timeout must cancel the episode before sealing a non-completed run."""
+
+    monkeypatch.setenv("LLM_MODE", "live")
+    provider = _HangingProvider()
+    runner = ScenarioRunner(
+        _spec(),
+        llm_provider=provider,
+        episode_timeout_ms=60_000,
+        episode_settle_timeout_s=0.02,
+    )
+
+    with pytest.raises(ScenarioRunError) as excinfo:
+        await runner.run()
+
+    assert excinfo.value.code is ScenarioRunErrorCode.EPISODE_SETTLE_TIMEOUT
+    assert provider.started.is_set()
+    assert provider.cancelled.is_set()
+    assert runner.engine.is_running is False
+
+    metadata = runner.engine.run_manager.finished[-1]
+    assert metadata.end_reason == "episode_settle_timeout"
+    persisted = read_run_metadata(metadata.run_id)
+    assert persisted["end_reason"] == "episode_settle_timeout"
+    assert persisted["events_integrity"] is not None
+
+    events, _ = read_run_events(metadata.run_id)
+    event_types = [event["event_type"] for event in events]
+    assert "system.episode_cancelled" in event_types
+    assert "system.episode_cancelled" in [event.event_type for event in runner._collected]
 
 
 # ------------------------------------- S1 遗留：真实的在飞窗口（不再靠 _propose 造）

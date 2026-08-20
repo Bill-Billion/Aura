@@ -1,0 +1,372 @@
+# S3-T9 —— 意图分类评测集（§8.3 意图识别 + §7 事件→设备映射 + §12.2 标注规则）。
+#
+# ============================ 先读这三条，再改本文件 ============================
+#
+# 1. **这是一份冒烟评测集，不是 benchmark。**
+#    17 条 case、单一 dev split，规模上没有统计意义；而且 expected_intent 标签取自
+#    spec §7 的映射表，规则路径（classify_intent_rule_based）正是同一张表的实现——
+#    它在这里拿到的准确率是一次**一致性检查**，不是模型能力。scripts/eval_intent.py
+#    因此**不断言任何准确率阈值**，报告里也写死了这句话。真要做能力声明，先扩到有
+#    统计意义的规模，并划一个与规则实现无关的 held-out split（§12.2 禁止在 benchmark
+#    split 上调参）。
+#
+# 2. **本文件同时是一份合法 ScenarioSpec。**
+#    backend/scenarios/eval/ 与 library/ 共用 S2 的同一个 loader（load_library(dirs)），
+#    目录里放一份 loader 读不懂的 YAML，以后任何"整库加载"都会炸在这里。所以每条 case
+#    是一条 timeline 根事件，评测元数据挂在该条目的 `payload.eval_case` 命名空间下。
+#
+# 3. **`payload.eval_case` 是评估侧的东西，agent 永远看不到它。**
+#    scripts/eval_intent.py 在构造根事件**之前**就把整个 `eval_case` 从 payload 里摘掉，
+#    标签只经 RootEventContext.ground_truth_labels 传给评估侧（§2.3 可观测/真值分离）。
+#    tests/test_intent_eval.py::test_ground_truth_labels_never_reach_the_orchestrator
+#    钉死这条。`eval_case.world` 是本 case 的**可观测**世界覆盖（叠在下面的
+#    initial_state 之上），不是真值，只是"这条 case 发生在什么样的家里"。
+#
+# 覆盖面：§7 八条根事件行 × 占用/时段变体。刻意成对的两组是判别力所在——
+#   * environment.temperature_threshold：有人 → comfort，空屋 → energy（§7 唯一一条
+#     随占用翻领域的行）；
+#   * environment.light_level_threshold：有人/空屋都 → ambience（占用**不该**翻它，
+#     这两条是防止"把占用当万能特征"的负例）。
+scenario_schema_version: "1.1"
+id: intent_eval_set_v1
+name: 意图分类评测集 v1（dev split）
+description: §7 八条根事件 × 占用/时段变体的 17 条带标签 case，用于 §8.3 意图分类的冒烟基线。
+seed: 9001
+duration_seconds: 600
+mode: observe
+
+# 集合级的默认世界；每条 case 再用 eval_case.world 覆盖自己需要的那几项。
+initial_state:
+  time_of_day: "18:30"
+  weather: clear
+  outdoor_temp: 22.0
+  outdoor_humidity: 0.55
+
+timeline:
+  # ---------------------------------------------------------- user.arrives_home
+  - at: 0
+    type: user.arrives_home
+    user_id: user_01
+    room_id: living_room
+    payload:
+      significant_change_reasons: ["user_presence_transition"]
+      eval_case:
+        case_id: arrives_home_evening
+        expected_intent: arrival_comfort
+        expected_domain: comfort
+        note: "§7 user.arrives_home → light/hvac，policy=comfort and presence transition"
+        world:
+          time_of_day: "18:40"
+          users:
+            user_01: {location: living_room, activity: idle, presence_state: home}
+
+  - at: 1
+    type: user.arrives_home
+    user_id: user_01
+    room_id: living_room
+    payload:
+      significant_change_reasons: ["user_presence_transition"]
+      eval_case:
+        case_id: arrives_home_midday
+        expected_intent: arrival_comfort
+        expected_domain: comfort
+        note: "同一行的时段变体：回家意图不随白天/傍晚变化"
+        world:
+          time_of_day: "12:10"
+          users:
+            user_01: {location: living_room, activity: idle, presence_state: home}
+
+  # ---------------------------------------------------------- user.leaves_home
+  - at: 2
+    type: user.leaves_home
+    user_id: user_01
+    payload:
+      significant_change_reasons: ["user_presence_transition"]
+      eval_case:
+        case_id: leaves_home_morning
+        expected_intent: departure_energy_saving
+        expected_domain: energy
+        note: "§7 policy=energy saving and security：离家首要目标是省电"
+        world:
+          time_of_day: "08:05"
+          users:
+            user_01: {location: outside, presence_state: away}
+
+  - at: 3
+    type: user.leaves_home
+    user_id: user_01
+    payload:
+      significant_change_reasons: ["user_presence_transition"]
+      eval_case:
+        case_id: leaves_home_night
+        expected_intent: departure_energy_saving
+        expected_domain: energy
+        note: "夜间离家：领域仍是 energy（安防是同时发生的次目标，不改意图标签）"
+        world:
+          time_of_day: "21:40"
+          users:
+            user_01: {location: outside, presence_state: away}
+
+  # ------------------------------------------- user.starts_activity:sleeping
+  - at: 4
+    type: user.starts_activity
+    user_id: user_01
+    room_id: bedroom
+    activity: sleeping
+    payload:
+      significant_change_reasons: ["user_activity_change"]
+      eval_case:
+        case_id: sleep_start_night
+        expected_intent: sleep_comfort
+        expected_domain: comfort
+        note: "§7 活动限定行 user.starts_activity:sleeping，room_scope=bedroom"
+        world:
+          time_of_day: "22:45"
+          users:
+            user_01: {location: bedroom, activity: sleeping, presence_state: sleeping}
+
+  - at: 5
+    type: user.starts_activity
+    user_id: user_01
+    room_id: bedroom
+    activity: sleeping
+    payload:
+      significant_change_reasons: ["user_activity_change"]
+      eval_case:
+        case_id: sleep_start_after_midnight
+        expected_intent: sleep_comfort
+        expected_domain: comfort
+        note: "跨零点的时段变体：活动限定行不随钟点漂移"
+        world:
+          time_of_day: "01:10"
+          users:
+            user_01: {location: bedroom, activity: sleeping, presence_state: sleeping}
+
+  # -------------------------------------------- user.starts_activity:cooking
+  - at: 6
+    type: user.starts_activity
+    user_id: user_01
+    room_id: kitchen
+    activity: cooking
+    payload:
+      significant_change_reasons: ["user_activity_change"]
+      eval_case:
+        case_id: cooking_dinner
+        expected_intent: cooking_task_lighting
+        expected_domain: comfort
+        note: "§7 活动限定行 user.starts_activity:cooking，policy=task lighting and air monitoring"
+        world:
+          time_of_day: "18:10"
+          users:
+            user_01: {location: kitchen, activity: cooking, presence_state: home}
+
+  - at: 7
+    type: user.starts_activity
+    user_id: user_01
+    room_id: kitchen
+    activity: cooking
+    payload:
+      significant_change_reasons: ["user_activity_change"]
+      eval_case:
+        case_id: cooking_breakfast
+        expected_intent: cooking_task_lighting
+        expected_domain: comfort
+        note: "早餐时段变体"
+        world:
+          time_of_day: "07:20"
+          users:
+            user_01: {location: kitchen, activity: cooking, presence_state: home}
+
+  # ------------------------------------ environment.temperature_threshold（判别对）
+  - at: 8
+    type: environment.temperature_threshold
+    room_id: living_room
+    payload:
+      value: 29.5
+      direction: high
+      comfort_min: 18.0
+      comfort_max: 28.0
+      significant_change_reasons: ["room_temperature_threshold"]
+      eval_case:
+        case_id: temperature_threshold_occupied
+        expected_intent: temperature_comfort
+        expected_domain: comfort
+        note: "§7「comfort if occupied」——判别对的正例"
+        world:
+          time_of_day: "14:20"
+          rooms:
+            living_room: {temperature: 29.5}
+          users:
+            user_01: {location: living_room, activity: relaxing, presence_state: home}
+
+  - at: 9
+    type: environment.temperature_threshold
+    room_id: living_room
+    payload:
+      value: 29.5
+      direction: high
+      comfort_min: 18.0
+      comfort_max: 28.0
+      significant_change_reasons: ["room_temperature_threshold"]
+      eval_case:
+        case_id: temperature_threshold_empty_house
+        expected_intent: temperature_energy_saving
+        expected_domain: energy
+        note: "§7「energy if empty」——同一条事件、同一个读数，只有占用不同"
+        world:
+          time_of_day: "14:20"
+          rooms:
+            living_room: {temperature: 29.5}
+          users:
+            user_01: {location: outside, presence_state: away}
+
+  - at: 10
+    type: environment.temperature_threshold
+    room_id: bedroom
+    payload:
+      value: 16.5
+      direction: low
+      comfort_min: 18.0
+      comfort_max: 28.0
+      significant_change_reasons: ["room_temperature_threshold"]
+      eval_case:
+        case_id: temperature_threshold_occupied_night
+        expected_intent: temperature_comfort
+        expected_domain: comfort
+        note: "低温方向 + 夜间：方向与时段都不改领域，占用才改"
+        world:
+          time_of_day: "23:30"
+          rooms:
+            bedroom: {temperature: 16.5}
+          users:
+            user_01: {location: bedroom, activity: sleeping, presence_state: sleeping}
+
+  # ----------------------------- environment.light_level_threshold（占用不翻领域）
+  - at: 11
+    type: environment.light_level_threshold
+    room_id: living_room
+    payload:
+      value: 12.0
+      direction: low
+      threshold: 30.0
+      significant_change_reasons: ["room_light_level_threshold"]
+      eval_case:
+        case_id: light_level_threshold_dusk_occupied
+        expected_intent: preserve_target_light_level
+        expected_domain: ambience
+        note: "§7 policy=preserve target light level"
+        world:
+          time_of_day: "17:50"
+          rooms:
+            living_room: {light_level: 12.0}
+          users:
+            user_01: {location: living_room, activity: reading, presence_state: home}
+
+  - at: 12
+    type: environment.light_level_threshold
+    room_id: living_room
+    payload:
+      value: 12.0
+      direction: low
+      threshold: 30.0
+      significant_change_reasons: ["room_light_level_threshold"]
+      eval_case:
+        case_id: light_level_threshold_empty_house
+        expected_intent: preserve_target_light_level
+        expected_domain: ambience
+        note: "负例：空屋**不**把光照阈值翻成 energy——只有温度那一行随占用翻领域"
+        world:
+          time_of_day: "12:30"
+          rooms:
+            living_room: {light_level: 12.0}
+          users:
+            user_01: {location: outside, presence_state: away}
+
+  # ------------------------------------------------------ security.presence_detected
+  - at: 13
+    type: security.presence_detected
+    room_id: living_room
+    device_id: camera_entry_01
+    payload:
+      confidence: 0.93
+      zone: entry
+      significant_change_reasons: ["security_presence_detected"]
+      eval_case:
+        case_id: presence_detected_empty_house_night
+        expected_intent: security_presence_response
+        expected_domain: security
+        note: "§7 policy=security first：空屋深夜的检出"
+        world:
+          time_of_day: "02:15"
+          users:
+            user_01: {location: outside, presence_state: away}
+
+  - at: 14
+    type: security.presence_detected
+    room_id: living_room
+    device_id: camera_living_02
+    payload:
+      confidence: 0.71
+      zone: living
+      significant_change_reasons: ["security_presence_detected"]
+      eval_case:
+        case_id: presence_detected_while_home
+        expected_intent: security_presence_response
+        expected_domain: security
+        note: "有人在家时的检出：意图仍是安防响应（是否误报由域 agent 判，不由编排层）"
+        world:
+          time_of_day: "19:30"
+          users:
+            user_01: {location: living_room, activity: relaxing, presence_state: home}
+
+  # ------------------------------------------------------------------ device.offline
+  - at: 15
+    type: device.offline
+    room_id: living_room
+    device_id: light_living_01
+    payload:
+      device_type: light
+      online: false
+      reason: "网关心跳丢失"
+      significant_change_reasons: ["device_availability"]
+      eval_case:
+        case_id: device_offline_light
+        expected_intent: device_offline_failover
+        expected_domain: maintenance
+        note: "§7 policy=fail closed and explain；搜索面按掉线设备类型现场解析"
+        world:
+          time_of_day: "20:05"
+          users:
+            user_01: {location: living_room, activity: relaxing, presence_state: home}
+          devices:
+            light_living_01:
+              state:
+                extra: {online: false}
+
+  - at: 16
+    type: device.offline
+    room_id: living_room
+    device_id: camera_entry_01
+    payload:
+      device_type: camera
+      online: false
+      reason: "摄像头失联"
+      significant_change_reasons: ["device_availability"]
+      eval_case:
+        case_id: device_offline_camera
+        expected_intent: device_offline_failover
+        expected_domain: maintenance
+        note: "设备类型变体：掉的是摄像头，意图不变、可派到的 agent 变"
+        world:
+          time_of_day: "20:05"
+          users:
+            user_01: {location: living_room, activity: relaxing, presence_state: home}
+          devices:
+            camera_entry_01:
+              state:
+                extra: {online: false}
+
+# 本文件不是行为场景：它只喂编排器的意图分类那一步，不跑设备效果断言。
+expected_device_effects: []
+involved_agents: []
+success_criteria: {}

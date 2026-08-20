@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { computed, ref, watch } from 'vue'
 import { useAgentStore } from '@/stores/agentStore'
 import { useSimulationStore } from '@/stores/simulationStore'
+import { useUIStore } from '@/stores/uiStore'
 import type {
   ConnectionStateDerived,
   EventFilters,
@@ -17,17 +18,28 @@ import {
   filterEpisodes,
   pickDefaultEpisode,
 } from '@/utils/observability'
+import { decideRunEvent } from '@/utils/runEventIsolation'
 
 const MAX_EVENTS = 500
 
 export const useEventStore = defineStore('events', () => {
   const agentStore = useAgentStore()
   const simulationStore = useSimulationStore()
+  const uiStore = useUIStore()
   const events = ref<SimEvent[]>([])
   const selectedEpisodeId = ref<string | null>(null)
   const selectedEventId = ref<string | null>(null)
   const filters = ref<EventFilters>(createDefaultEventFilters())
   const selectionPinned = ref(false)
+  const eventRunId = ref<string | null>(null)
+
+  // S5-T5：3D 设备点击 → 自动设置 deviceId 过滤
+  watch(
+    () => uiStore.activeDevice,
+    (deviceId) => {
+      filters.value = { ...filters.value, deviceId }
+    },
+  )
 
   const allEpisodes = computed(() => buildEpisodeSummaries(events.value, agentStore.agents))
   const episodes = computed(() => filterEpisodes(allEpisodes.value, filters.value))
@@ -73,12 +85,22 @@ export const useEventStore = defineStore('events', () => {
     }
   })
 
-  function appendEvent(event: SimEvent) {
+  function appendEvent(event: SimEvent): boolean {
+    const decision = decideRunEvent(simulationStore.currentRunId, event)
+    if (decision === 'ignore') return false
+    if (decision === 'switch') {
+      const nextRunId = event.run_id ?? null
+      synchronizeRun(nextRunId)
+      if (nextRunId) simulationStore.adoptRunFromEvent(nextRunId, event.scenario_id ?? null)
+    } else if (eventRunId.value !== simulationStore.currentRunId) {
+      synchronizeRun(simulationStore.currentRunId)
+    }
     events.value.push(event)
     if (events.value.length > MAX_EVENTS) {
       events.value = events.value.slice(-MAX_EVENTS)
     }
     syncSelection()
+    return true
   }
 
   function selectEpisode(correlationId: string | null) {
@@ -115,11 +137,22 @@ export const useEventStore = defineStore('events', () => {
   }
 
   function clear() {
+    clearRunEvents()
+    filters.value = createDefaultEventFilters()
+    eventRunId.value = null
+  }
+
+  function clearRunEvents() {
     events.value = []
     selectedEpisodeId.value = null
     selectedEventId.value = null
-    filters.value = createDefaultEventFilters()
     selectionPinned.value = false
+  }
+
+  function synchronizeRun(runId: string | null, forceClear = false) {
+    if (!forceClear && eventRunId.value === runId) return
+    clearRunEvents()
+    eventRunId.value = runId
   }
 
   function syncSelection(forceDefault = false) {
@@ -155,6 +188,7 @@ export const useEventStore = defineStore('events', () => {
 
   return {
     events,
+    eventRunId,
     filters,
     episodes,
     selectedEpisodeId,
@@ -169,6 +203,7 @@ export const useEventStore = defineStore('events', () => {
     selectEpisode,
     selectEvent,
     setFilters,
+    synchronizeRun,
     clear,
   }
 })

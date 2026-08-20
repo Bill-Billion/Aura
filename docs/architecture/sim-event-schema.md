@@ -23,6 +23,7 @@ Date: 2026-04-18
 - `correlation_id`: 同一条因果链共享的关联 ID。
 - `causal_parent`: 当前事件的直接父事件 ID。根事件填 `null`。
 - `priority`: 事件优先级。`0=background`，`1=normal`，`2=high`，`3=critical`。
+- `depth`: 因果树深度（S3）。根事件为 `0`，其余为父事件 `depth + 1`，由 `EventBus` 盖章，生产方不要自己填。见第 12 节。
 - `data`: 载荷。必须只放业务字段，不重复顶层元数据。
 
 S2 之后追加的可复现元数据字段见第 11 节。它们全部可选、默认 `null`，Phase 1 的事件构造式不受影响。
@@ -65,7 +66,9 @@ Agent 动作默认继承最近一个根事件的 `correlation_id`。如果当前
 - 根事件：`causal_parent = null`
 - Agent 动作：`causal_parent = root_event.event_id`
 - 设备反馈：`causal_parent = action_event.event_id`
-- 未来 reasoning 事件：挂在触发它的根事件或上一步 reasoning 事件下面
+- reasoning 事件：挂在上一环下面。S3 之后一条根事件只长**一棵**树：
+  `根 → reasoning.perception_snapshot → reasoning.intent_recognized → reasoning.task_decomposition →（reasoning.fallback_rule_based）→ reasoning.coordination_decision → reasoning.execution_plan → command.lifecycle / action.device_control → feedback.state_delta`
+  前三环由 `home_orchestrator` 独占，协调环由 `arbiter` 独占且每 episode 恰好一条，执行环每个参与的域 agent 一条。payload 形状见 `docs/architecture/ws-protocol.md`。
 
 前端要恢复完整链路时，只需要按 `correlation_id` 取全量事件，再用 `causal_parent` 重建树。
 
@@ -235,3 +238,27 @@ sim_time_s ≈ timestamp × SimulationEngine.simulated_dt_seconds
 ### 11.6 因果链不跨 run
 
 `get_causal_chain(root_event_id)` 只在与根事件同 `run_id` 的事件里找子节点。reset 之后新 run 可能复用 `correlation_id` 或 `causal_parent`（测试构造和录制回放都会），只按 `event_id` 认父会把两个 run 的链焊成一条。`get_history()` 同步新增 `run_id` 与 `event_generation_mode` 两个过滤维度。
+
+## 12. S3 因果深度与反事件风暴
+
+### 12.1 `depth` 的盖章规则
+
+`depth` 与 `seq` 一样由 `EventBus` 权威盖章，生产方不填：
+
+- `causal_parent` 为空 → `depth = 0`
+- 父事件在总线索引里 → `depth = 父.depth + 1`
+- 父事件不在索引里（从未发布，或已被 1000 条环形历史挤掉）→ `depth = 0`，从头起算
+
+最后一条是有意的取舍：一条正常 episode 的树深实测 ≤ 7，不可能触发；只有真的跑了上千条事件的失控链才会遇到，此时"重新起算"意味着闸门晚一点才刹住，不会失效。`stamp()` 与 `publish()` 都会重算 depth，重算是幂等的（同一个父给出同一个深度）。
+
+### 12.2 深度上限（`AGENT_MAX_CAUSAL_DEPTH`，默认 16）
+
+tick 循环自带一层限速：一拍最多推进一次世界，派生事件再多也被拍频压着。事件驱动之后这层保护没有了——`feedback → 新根事件 → 新 feedback` 的回环可以在毫秒级把总线、WS 和 `events.jsonl` 一起打满，而现场只留下"事件特别多"这一个症状。
+
+因此 `EventBus.publish()` 拒发 `depth > AGENT_MAX_CAUSAL_DEPTH` 的事件：不进历史、不派发给订阅者。设为 `0` 关闭闸门。
+
+拒发**不是**静默丢弃——静默丢弃只会把风暴变成一个更难查的故障（链在中途断掉，看起来像 agent 死了），正是 S1 全程根治的那类伤害。取而代之：每条 `correlation_id` 发一条 `system.event_storm_suppressed`（payload 见 ws-protocol.md），同一条链后续被拒的事件不再重复报告，真实拒发条数由 `EventBus.storm_suppressed_count(correlation_id)` 读出。抑制事件的 `causal_parent` 指向**被拒事件的父**，不指向被拒事件本身（那是个不存在的节点）。
+
+### 12.3 已知边界
+
+闸门装在 `EventBus.publish()` 这一处扇出点上。`SimulationEngine._publish_sim_event()` 是"先广播 WS、后入总线"，因此被拒的那一条仍会到达前端一次；它的子事件同样超深，会在总线上被逐条拦下，风暴不会扩散。要把这条缝也封死，需要引擎在广播前先问一次闸门——留给 S5 前端改造时一起做。

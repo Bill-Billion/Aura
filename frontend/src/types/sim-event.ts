@@ -7,6 +7,7 @@ export type KnownSimEventType =
   | 'system.simulation_started'
   | 'system.simulation_paused'
   | 'system.simulation_reset'
+  | 'system.episode_cancelled'
   | 'environment.state_refresh'
   | 'user.command'
   | 'user.activity_change'
@@ -32,6 +33,15 @@ export interface SimEventBase<
   causal_parent: string | null
   priority: SimEventPriority
   data: TData
+  event_schema_version?: string
+  run_id?: string | null
+  scenario_id?: string | null
+  seq?: number | null
+  sim_time_s?: number | null
+  depth?: number
+  event_generation_mode?: string | null
+  generation_rule_id?: string | null
+  rng_stream?: string | null
 }
 
 export interface SystemTimerTickData {
@@ -215,6 +225,8 @@ export interface EventFilters {
   category: EventCategoryFilter
   agentId: EventAgentFilter
   fallbackOnly: boolean
+  /** 按设备 ID 过滤——点击 3D 设备时置入，清空即取消过滤 */
+  deviceId: string | null
 }
 
 export interface EpisodeSummary {
@@ -225,9 +237,13 @@ export interface EpisodeSummary {
   lastEventId: string
   lastUpdatedAt: number
   eventCount: number
+  /** 不含 timer_tick 的有效事件数 */
+  nonTickEventCount: number
   primaryAgentId: string | null
   agentIds: string[]
   hasFallback: boolean
+  /** episode 被 system.episode_cancelled 显式取消 */
+  hasCancelled: boolean
   isActive: boolean
   categories: EventCategory[]
   events: SimEvent[]

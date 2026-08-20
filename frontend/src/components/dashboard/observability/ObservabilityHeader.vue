@@ -13,13 +13,16 @@ interface AgentOption {
   label: string
 }
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   connectionState: ConnectionStateDerived
   currentEpisode: EpisodeSummary | null
   episodes: EpisodeSummary[]
   filters: EventFilters
   agentOptions: AgentOption[]
-}>()
+  showClose?: boolean
+}>(), {
+  showClose: true,
+})
 
 const emit = defineEmits<{
   close: []
@@ -89,7 +92,7 @@ function updateFallbackOnly(event: Event) {
         >
           重试
         </button>
-        <button class="action-btn" type="button" aria-label="关闭观测侧栏" @click="emit('close')">
+        <button v-if="showClose" class="action-btn" type="button" aria-label="关闭观测侧栏" @click="emit('close')">
           关闭
         </button>
       </div>

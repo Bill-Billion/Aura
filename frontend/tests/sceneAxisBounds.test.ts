@@ -1,5 +1,3 @@
-import test from 'node:test'
-import assert from 'node:assert/strict'
 import * as THREE from 'three'
 
 import {
@@ -21,8 +19,8 @@ test('getObjectAxisBoundsInLocalSpace 会在节点自身坐标系里汇总整个
   const bounds = getObjectAxisBoundsInLocalSpace(track, 'z')
 
   assert.ok(bounds)
-  assert.ok(Math.abs(bounds.min - (-1.8515)) < 1e-6)
-  assert.ok(Math.abs(bounds.max - 1.8815) < 1e-6)
+  expect(Math.abs(bounds.min - (-1.8515))).toBeLessThan(1e-6)
+  expect(Math.abs(bounds.max - 1.8815)).toBeLessThan(1e-6)
 })
 
 test('getObjectAxisBoundsInParentSpace 会保留父节点本地 z 方向，不受世界坐标旋转影响', () => {
@@ -39,6 +37,6 @@ test('getObjectAxisBoundsInParentSpace 会保留父节点本地 z 方向，不�
   const bounds = getObjectAxisBoundsInParentSpace(panel, 'z')
 
   assert.ok(bounds)
-  assert.ok(Math.abs(bounds.min - 0.6405) < 1e-6)
-  assert.ok(Math.abs(bounds.max - 1.8815) < 1e-6)
+  expect(Math.abs(bounds.min - 0.6405)).toBeLessThan(1e-6)
+  expect(Math.abs(bounds.max - 1.8815)).toBeLessThan(1e-6)
 })

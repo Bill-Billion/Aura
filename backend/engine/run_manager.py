@@ -30,18 +30,27 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import uuid
+from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from backend.engine.event_bus import EventBus
 from backend.engine.rng import SimRandom, validate_seed
 from backend.engine.state import WorldState
+from backend.models.schemas import BaselinePolicy
+from backend.models.versioning import (
+    SUPPORTED_COMMAND_SCHEMA_VERSION,
+    SUPPORTED_DEVICE_REGISTRY_VERSION,
+    SUPPORTED_EVENT_SCHEMA_VERSION,
+    SUPPORTED_SCENARIO_SCHEMA_VERSION,
+)
 from backend.scenarios.loader import ScenarioLoadError, load_library
 from backend.scenarios.spec import ScenarioSpec
 
@@ -53,6 +62,7 @@ SPEC11_REQUIRED_FIELDS: tuple[str, ...] = (
     "seed",
     "started_at",
     "sim_version",
+    "source_revision",
     "agent_versions",
     "llm_provider",
     "llm_model",
@@ -73,7 +83,12 @@ STALE_RUN_DISCARD_REASON = "stale_run"
 _HASHED_WORLD_FIELDS = ("scene_id", "environment", "devices", "rooms", "users")
 
 _VERSION_FILE = Path(__file__).resolve().parents[2] / "VERSION"
+_REPOSITORY_ROOT = _VERSION_FILE.parent
+_BACKEND_SOURCE_ROOT = _REPOSITORY_ROOT / "backend"
 _UNKNOWN_VERSION = "0.0.0-unknown"
+SOURCE_REVISION_ENV = "AURA_SOURCE_REVISION"
+_SOURCE_SUFFIXES = frozenset({".py", ".json", ".txt", ".yaml", ".yml"})
+_SOURCE_EXCLUDED_PARTS = frozenset({".venv", "__pycache__"})
 
 
 class RunProvenanceErrorCode(str, Enum):
@@ -147,11 +162,54 @@ def resolve_run_scenario(
 
 
 class LLMMode(str, Enum):
-    """§11.1 三种 LLM 决定性模式；每份 run 工件都必须标注用的是哪种。"""
+    """§11.1 三种 LLM 决定性模式 + 一档"根本没有 LLM"；每份 run 工件都必须标注用的是哪种。
+
+    ``RULE_BASED`` 不在 §11.1 的三种之列，它记的是第四种实验条件：**这一份 run 从头到尾
+    没有任何 LLM 参与**（没配 key / provider 被禁用 → 全程规则回退）。它必须与 ``MOCKED``
+    分开，因为两者是**不同的实验条件**：mocked 跑的是确定性罐头决策（有决策载荷、有 LLM
+    契约的形状），rule_based 连罐头都没有。S3 review 之前两者共用 ``mocked`` 标签，于是
+    一份全程规则跑出来的 run 会被 S4 评估、S5 对比视图读成"用了固定 fixture 的 LLM 跑"，
+    而这正是 §11.1"每份 run 工件必须记下模式"要防的那种误读。
+    """
 
     MOCKED = "mocked"
     RECORDED = "recorded"
     LIVE = "live"
+    RULE_BASED = "rule_based"
+
+    @property
+    def calls_provider(self) -> bool:
+        """本模式下是否真的会向 provider 要一份决策。
+
+        ``mocked``（罐头）与 ``rule_based``（无 LLM）都不会——判"要不要打 provider"
+        的地方必须问这个属性，而不是拿 ``is not MOCKED`` 当近似，否则新加的
+        ``rule_based`` 会被当成"可以打"。
+        """
+
+        return self in {LLMMode.RECORDED, LLMMode.LIVE}
+
+
+BASELINE_POLICY_TO_LLM_MODE: dict[BaselinePolicy, LLMMode] = {
+    BaselinePolicy.RULE_BASED: LLMMode.RULE_BASED,
+    BaselinePolicy.LLM_MOCKED: LLMMode.MOCKED,
+    BaselinePolicy.LLM_RECORDED: LLMMode.RECORDED,
+    BaselinePolicy.LLM_LIVE: LLMMode.LIVE,
+}
+LLM_MODE_TO_BASELINE_POLICY: dict[LLMMode, BaselinePolicy] = {
+    mode: policy for policy, mode in BASELINE_POLICY_TO_LLM_MODE.items()
+}
+
+
+def effective_llm_mode_for_policy(policy: BaselinePolicy | str) -> LLMMode:
+    """把产品层 baseline 名映射为实际运行模式；服务端是唯一映射属主。"""
+
+    return BASELINE_POLICY_TO_LLM_MODE[BaselinePolicy(policy)]
+
+
+def baseline_policy_for_llm_mode(mode: LLMMode | str) -> BaselinePolicy:
+    """由实际模式生成可持久化的 baseline 标签（旧 payload 未显式给策略时使用）。"""
+
+    return LLM_MODE_TO_BASELINE_POLICY[LLMMode(mode)]
 
 
 @lru_cache(maxsize=1)
@@ -163,6 +221,43 @@ def read_sim_version() -> str:
     except OSError:
         return _UNKNOWN_VERSION
     return version or _UNKNOWN_VERSION
+
+
+@lru_cache(maxsize=1)
+def read_source_revision() -> str:
+    """Return an immutable revision for the backend code that produced a run.
+
+    Release builds may inject a commit/image digest through
+    ``AURA_SOURCE_REVISION``.  Local and dirty-tree runs instead hash every
+    runtime-relevant backend source/config file plus ``VERSION`` so two runs
+    cannot claim code equivalence merely because the human version was not
+    bumped between edits.
+    """
+
+    injected = os.environ.get(SOURCE_REVISION_ENV, "").strip()
+    if injected:
+        return f"build:{injected}"
+
+    digest = hashlib.sha256()
+    paths = [
+        path
+        for path in _BACKEND_SOURCE_ROOT.rglob("*")
+        if path.is_file()
+        and path.suffix.lower() in _SOURCE_SUFFIXES
+        and not _SOURCE_EXCLUDED_PARTS.intersection(path.parts)
+    ]
+    paths.append(_VERSION_FILE)
+    for path in sorted(set(paths), key=lambda item: item.as_posix()):
+        try:
+            relative = path.relative_to(_REPOSITORY_ROOT).as_posix().encode("utf-8")
+            content = path.read_bytes()
+        except (OSError, ValueError):
+            return "sha256:unavailable"
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return f"sha256:{digest.hexdigest()}"
 
 
 def canonical_json(payload: Any) -> str:
@@ -183,19 +278,25 @@ def compute_initial_state_hash(world: WorldState) -> str:
 
 
 def resolve_llm_mode(provider: Any) -> LLMMode:
-    """由 provider 推断 §11.1 模式（S3-T7 接入录制回放后会显式传 RECORDED）。
+    """由**裸** provider 推断 §11.1 模式（录制/罐头包装自己声明模式，见
+    :func:`backend.agents.llm_modes.resolve_mode_for_provider`）。
 
     鸭子类型而非 isinstance：本模块在 engine 层，不能反向依赖 backend.agents。
+
+    这里只认得出两档：**有 key 的真 provider = live**，其余一律是"这份 run 里没有
+    LLM"= :attr:`LLMMode.RULE_BASED`。刻意**不**再把它们折进 ``mocked``——
+    "没有 LLM"和"确定性罐头 LLM"是两种实验条件，run.json 是研究溯源工件，
+    读者拿 llm_mode 做分组时必须能把这两批分开（S3 review minor-3）。
     """
 
     if provider is None:
-        return LLMMode.MOCKED
+        return LLMMode.RULE_BASED
     provider_name = str(getattr(provider, "provider_name", "") or "")
     if provider_name in {"", "unknown", "disabled"}:
-        return LLMMode.MOCKED
+        return LLMMode.RULE_BASED
     if not getattr(provider, "api_key", None):
-        # 配了 provider 名但没有 key：实际走的是规则回退，不是 live 调用。
-        return LLMMode.MOCKED
+        # 配了 provider 名但没有 key：实际走的是规则回退，一次 LLM 调用都不会发生。
+        return LLMMode.RULE_BASED
     return LLMMode.LIVE
 
 
@@ -209,6 +310,17 @@ def new_run_id() -> str:
     return f"run-{stamp}-{uuid.uuid4().hex[:8]}"
 
 
+class EventLogIntegrity(BaseModel):
+    """Commitment to the exact finalized ``events.jsonl`` byte sequence."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    event_count: int = Field(ge=0)
+    # An empty trace has no last event; ``-1`` is an explicit, typed sentinel.
+    final_seq: int = Field(ge=-1)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class RunMetadata(BaseModel):
     """一次仿真 run 的不可变身份（§11 九字段 + §11.1 模式 + 结束信息）。"""
 
@@ -219,11 +331,27 @@ class RunMetadata(BaseModel):
     seed: int
     started_at: str  # ISO-8601 UTC
     sim_version: str
+    source_revision: str
     agent_versions: dict[str, str] = Field(default_factory=dict)
     llm_provider: str
     llm_model: str
     llm_mode: LLMMode = LLMMode.LIVE
+    # None 只用于加载没有该字段的 legacy 工件；RunManager.start_run 对所有新 run
+    # 都会按实际 llm_mode 显式写入，不能把旧 live 工件误标成 rule_based。
+    baseline_policy: BaselinePolicy | None = None
+    recording_source_run_id: str | None = None
+    duration_seconds: float | None = None
+    scenario_schema_version: str = SUPPORTED_SCENARIO_SCHEMA_VERSION
+    scenario_contract_hash: str | None = None
+    event_schema_version: str = SUPPORTED_EVENT_SCHEMA_VERSION
+    command_schema_version: str = SUPPORTED_COMMAND_SCHEMA_VERSION
+    device_registry_version: str = SUPPORTED_DEVICE_REGISTRY_VERSION
     initial_state_hash: str
+    artifact_error: str | None = None
+    # Finalized event-log seal.  ``None`` is valid only while a run is active (or
+    # for a legacy artifact, which the research/evaluation read paths reject as
+    # unsupported rather than silently trusting).
+    events_integrity: EventLogIntegrity | None = None
     ended_at: str | None = None
     end_reason: str | None = None
 
@@ -244,10 +372,12 @@ class RunManager:
         *,
         event_bus: EventBus | None = None,
         sim_version: str | None = None,
+        source_revision: str | None = None,
         max_finished: int = 50,
     ) -> None:
         self.event_bus = event_bus
         self.sim_version = sim_version or read_sim_version()
+        self.source_revision = source_revision or read_source_revision()
         self._current: RunMetadata | None = None
         self._rng: SimRandom | None = None
         self._finished: list[RunMetadata] = []
@@ -300,6 +430,11 @@ class RunManager:
         seed: int | None = None,
         llm_provider: Any = None,
         llm_mode: LLMMode | str | None = None,
+        baseline_policy: BaselinePolicy | str | None = None,
+        recording_source_run_id: str | None = None,
+        duration_seconds: float | None = None,
+        scenario_schema_version: str | None = None,
+        scenario_contract_hash: str | None = None,
         agent_versions: Mapping[str, str] | None = None,
         run_id: str | None = None,
         clear_event_history: bool = True,
@@ -310,20 +445,34 @@ class RunManager:
         "没设 seed" 不是一种合法状态，只是"没记下来"。
         """
 
+        resolved_seed = SimRandom(None).seed if seed is None else validate_seed(seed)
         if self._current is not None:
             self.end_run("superseded")
-
-        resolved_seed = SimRandom(None).seed if seed is None else validate_seed(seed)
+        effective_mode = (
+            LLMMode(llm_mode) if llm_mode is not None else resolve_llm_mode(llm_provider)
+        )
         metadata = RunMetadata(
             run_id=run_id or new_run_id(),
             scenario_id=scenario_id,
             seed=resolved_seed,
             started_at=datetime.now(timezone.utc).isoformat(),
             sim_version=self.sim_version,
+            source_revision=self.source_revision,
             agent_versions=dict(agent_versions or {}),
             llm_provider=str(getattr(llm_provider, "provider_name", "disabled") or "disabled"),
             llm_model=str(getattr(llm_provider, "model", "rule_based") or "rule_based"),
-            llm_mode=LLMMode(llm_mode) if llm_mode is not None else resolve_llm_mode(llm_provider),
+            llm_mode=effective_mode,
+            baseline_policy=(
+                BaselinePolicy(baseline_policy)
+                if baseline_policy is not None
+                else baseline_policy_for_llm_mode(effective_mode)
+            ),
+            recording_source_run_id=recording_source_run_id,
+            duration_seconds=duration_seconds,
+            scenario_schema_version=(
+                scenario_schema_version or SUPPORTED_SCENARIO_SCHEMA_VERSION
+            ),
+            scenario_contract_hash=scenario_contract_hash,
             initial_state_hash=compute_initial_state_hash(world),
         )
 
@@ -357,4 +506,9 @@ class RunManager:
             self._finished = self._finished[-self._max_finished :]
         self._current = None
         self._rng = None
+        if self.event_bus is not None:
+            # A finalized artifact is immutable.  Leaving the bus stamped with its
+            # identity lets a later ambient ``start`` publish into a closed writer
+            # while still claiming to belong to this run.
+            self.event_bus.set_run_context(None)
         return metadata

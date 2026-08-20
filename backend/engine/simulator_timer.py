@@ -50,32 +50,52 @@ class SimulatorTimer:
         self.is_running = False
         self.current_tick = 0
         self._task: asyncio.Task | None = None
+        self._stop_requested = asyncio.Event()
 
     async def start(self) -> None:
         if self.is_running:
             return
 
         self.is_running = True
+        self._stop_requested.clear()
         self._task = asyncio.create_task(self._run_loop())
         # 主循环非取消式退出必须留痕：不加这条回调，一个逃逸的异常只会变成解释器那句
         # "Task exception was never retrieved"，而仿真已经停了（critic 修正③）。
         self._task.add_done_callback(self._log_termination)
 
     async def pause(self) -> None:
-        if not self.is_running:
+        self.request_stop_after_current_tick()
+        task = self._task
+        if task is None:
             return
+        if task is asyncio.current_task():
+            # The loop will observe is_running=False as soon as this callback
+            # unwinds. Awaiting itself would deadlock.
+            return
+        # Graceful drain: if a tick is inside EventBus fan-out, let every exact
+        # and wildcard subscriber (especially the artifact writer) finish. The
+        # stop event also wakes an idle wall-clock sleep immediately.
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        if self._task is task:
+            self._task = None
+
+    def request_stop_after_current_tick(self) -> None:
+        """Prevent another tick without interrupting the current event fan-out.
+
+        This method is safe to call from inside a timer-tick subscriber.  The
+        in-progress ``_emit_tick`` continues through every exact and wildcard
+        subscriber; the run loop observes the flag only after it returns.
+        """
 
         self.is_running = False
-        if self._task is not None:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-            self._task = None
+        self._stop_requested.set()
 
     def reset(self) -> None:
         self.current_tick = 0
+        self._stop_requested.clear()
 
     def set_mode(self, mode: str) -> None:
         spec = self._mode_specs.get(mode, self._mode_specs["observe"])
@@ -150,8 +170,13 @@ class SimulatorTimer:
         try:
             while self.is_running:
                 # 设计意图：tick 永远按真实墙钟节拍走，mode 只控制每拍推进多少模拟时间。
-                await asyncio.sleep(self.tick_interval)
-                if not self.is_running:
+                try:
+                    await asyncio.wait_for(
+                        self._stop_requested.wait(), timeout=self.tick_interval
+                    )
+                except TimeoutError:
+                    pass
+                if not self.is_running or self._stop_requested.is_set():
                     break
 
                 try:
@@ -167,3 +192,6 @@ class SimulatorTimer:
                     break
         except asyncio.CancelledError:
             pass
+        finally:
+            self.is_running = False
+            self._stop_requested.set()

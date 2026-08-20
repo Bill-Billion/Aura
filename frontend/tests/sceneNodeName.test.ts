@@ -1,5 +1,3 @@
-import test from 'node:test'
-import assert from 'node:assert/strict'
 
 import {
   normalizeSceneNodeName,
@@ -7,8 +5,8 @@ import {
 } from '../src/utils/sceneNodeName.ts'
 
 test('normalizeSceneNodeName 会把 Blender 导出的重复节点名归一到 three 实际使用的 key', () => {
-  assert.equal(normalizeSceneNodeName('curtain01.001'), 'curtain01001')
-  assert.equal(normalizeSceneNodeName(' VisualCone1 '), 'visualcone1')
+  expect(normalizeSceneNodeName('curtain01.001')).toBe('curtain01001')
+  expect(normalizeSceneNodeName(' VisualCone1 ')).toBe('visualcone1')
 })
 
 test('normalizeSceneNodeNames 去重并过滤空值', () => {

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { nextTick, ref } from 'vue'
 import StatusBar from './StatusBar.vue'
 import FloorSelector from './FloorSelector.vue'
 import HomePanelGroup from './HomePanelGroup.vue'
@@ -7,10 +8,22 @@ import ObservabilityPanel from './ObservabilityPanel.vue'
 import SidebarToggle from './SidebarToggle.vue'
 import SceneSelector from './SceneSelector.vue'
 import ContextualDevicePanel from './ContextualDevicePanel.vue'
+import ResearchWorkspace from './ResearchWorkspace.vue'
 import { useUIStore } from '@/stores/uiStore'
 import { showroomVisualConfig } from '@/config/showroomVisualConfig'
 
 const uiStore = useUIStore()
+const researchLauncher = ref<HTMLButtonElement | null>(null)
+
+function openResearchWorkspace() {
+  uiStore.openResearchWorkspace()
+}
+
+async function closeResearchWorkspace() {
+  uiStore.closeResearchWorkspace()
+  await nextTick()
+  researchLauncher.value?.focus()
+}
 </script>
 
 <template>
@@ -18,24 +31,46 @@ const uiStore = useUIStore()
     class="overlay-root no-select"
     :style="{ '--showroom-panel-width': `${showroomVisualConfig.overlay.panelWidth}px` }"
   >
-    <FloorSelector class="zone-left" />
+    <FloorSelector class="zone-left" :inert="uiStore.researchWorkspaceOpen" />
 
-    <aside class="zone-right">
+    <aside class="zone-right" :inert="uiStore.researchWorkspaceOpen">
       <StatusBar class="zone-right__status" />
       <ContextualDevicePanel />
       <HomePanelGroup class="zone-right__content" />
     </aside>
 
-    <div class="zone-bottom-left">
+    <div class="zone-bottom-left" :inert="uiStore.researchWorkspaceOpen">
       <SimControlBar />
       <SidebarToggle />
+      <button
+        ref="researchLauncher"
+        class="research-launcher"
+        type="button"
+        :aria-expanded="uiStore.researchWorkspaceOpen"
+        aria-controls="research-workspace"
+        @click="openResearchWorkspace"
+      >
+        <span class="research-launcher__index">R·01</span>
+        <span>研究运行</span>
+      </button>
     </div>
 
     <Transition name="slide-right">
-      <ObservabilityPanel v-if="uiStore.sidebarOpen" class="zone-sidebar" />
+      <ObservabilityPanel
+        v-if="uiStore.sidebarOpen"
+        class="zone-sidebar"
+        :inert="uiStore.researchWorkspaceOpen"
+      />
     </Transition>
 
-    <SceneSelector v-if="uiStore.sceneSelectorOpen" />
+    <SceneSelector v-if="uiStore.sceneSelectorOpen" :inert="uiStore.researchWorkspaceOpen" />
+
+    <ResearchWorkspace
+      id="research-workspace"
+      v-show="uiStore.researchWorkspaceOpen"
+      :open="uiStore.researchWorkspaceOpen"
+      @close="closeResearchWorkspace"
+    />
   </div>
 </template>
 
@@ -92,6 +127,44 @@ const uiStore = useUIStore()
   pointer-events: auto;
 }
 
+.research-launcher {
+  min-height: 40px;
+  padding: 0 13px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid rgba(255, 231, 74, 0.28);
+  border-radius: 999px;
+  background: rgba(255, 231, 74, 0.08);
+  color: var(--color-primary);
+  cursor: pointer;
+  transition-property: border-color, background-color, color, transform;
+  transition-duration: var(--transition-fast);
+}
+
+.research-launcher__index {
+  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  color: var(--color-text-muted);
+}
+
+.research-launcher:active {
+  transform: scale(0.96);
+}
+
+.research-launcher:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+
+@media (hover: hover) {
+  .research-launcher:hover {
+    border-color: rgba(255, 231, 74, 0.5);
+    background: rgba(255, 231, 74, 0.12);
+  }
+}
+
 .slide-right-enter-active,
 .slide-right-leave-active {
   transition: transform var(--transition-slow), opacity var(--transition-slow);
@@ -145,6 +218,12 @@ const uiStore = useUIStore()
   .zone-bottom-left {
     right: var(--spacing-panel);
     justify-content: space-between;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .research-launcher {
+    transition-duration: 0.01ms;
   }
 }
 </style>

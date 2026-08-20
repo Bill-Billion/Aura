@@ -17,9 +17,9 @@
 2. **timeline 的设备变更必须走 CommandExecutor**（critic 修正①）。脚本直控产出的是
    ``DeviceCommand(source=scenario)``，与 UI 直控同一条六级校验 + 十态生命周期；
    **没有** state_manager 兜底路径，也没有 TODO 分支。
-3. **因果只认物理触发者**（critic 修正②）。规则事件的 ``causal_parent`` 指向真正把读数
-   推过阈值的那条事件（tick 或某条具体用户事件），绝不是"最近一条用户事件"——两个用户
-   先后动作时那条启发式必然张冠李戴，而多用户正是 S3 的门场景。
+3. **根事件与物理触发分栏**（critic 修正②）。§4.1 富事件会开启新的 agent episode，
+   所以 ``causal_parent`` 必须为空；真正把读数推过阈值的 tick / 用户事件记在
+   ``data.trigger_event_id``。这样既不把根伪装成别人的子节点，也不丢物理归因。
 4. **stochastic 只做 device.offline/recovered**（critic 修正④的 MVP 收缩）。传感器漂移
    归 S4-T3 的观测噪声，用户改主意归 S3。
 
@@ -408,7 +408,8 @@ class RuleBasedEventSource(EventSource):
 
     **因果**：``emit_threshold_events(trigger=...)`` 的 trigger 就是把读数推过阈值的那条
     事件——引擎在每条用户事件写回世界之后立刻评一次（此时 trigger 是那条用户事件），
-    tick 收尾再评一次（trigger 是 tick 事件）。因此不存在"最近一条用户事件"这种猜测。
+    tick 收尾再评一次（trigger 是 tick 事件）。富事件本身仍是 causal-none episode 根，
+    物理触发身份保存在 ``data.trigger_event_id``，不存在"最近一条用户事件"这种猜测。
     """
 
     mode: EventGenerationMode = "rule_based"
@@ -462,6 +463,8 @@ class RuleBasedEventSource(EventSource):
         generated: list[GeneratedEvent] = []
         for world_event in self.user_sim.step(world):
             data = dict(world_event.data)
+            if trigger is not None:
+                data["trigger_event_id"] = trigger.event_id
             from_room = str(data.get("from_room") or "")
             to_room = str(data.get("to_room") or "")
             activity = str(data.get("activity") or "")
@@ -473,8 +476,9 @@ class RuleBasedEventSource(EventSource):
                         data=data,
                         sim_time_s=sim_time_s,
                         tick=self._tick_of(trigger),
-                        # 日程推进的物理原因是"时钟走了"，父就是这一拍 tick 事件。
-                        causal_parent=trigger.event_id if trigger is not None else None,
+                        # §4.1 rich root starts a new episode; the clock trigger is
+                        # retained separately in data.trigger_event_id.
+                        causal_parent=None,
                         generation_rule_id=f"user_schedule.{activity or 'advance'}",
                     ),
                     device_command=None,
@@ -493,7 +497,7 @@ class RuleBasedEventSource(EventSource):
     ) -> list[GeneratedEvent]:
         generated: list[GeneratedEvent] = []
         low, high = self.temperature_comfort
-        parent = trigger.event_id if trigger is not None else None
+        trigger_event_id = trigger.event_id if trigger is not None else None
         tick = self._tick_of(trigger)
 
         for room_id in sorted(world.rooms):
@@ -517,10 +521,11 @@ class RuleBasedEventSource(EventSource):
                                 # significant_change_reasons 是既有 agent 相关性判定读的键，
                                 # 富事件带上它，旧订阅者不用改就能认这条事件"值得跑一轮"。
                                 "significant_change_reasons": ["room_temperature_threshold"],
+                                "trigger_event_id": trigger_event_id,
                             },
                             sim_time_s=sim_time_s,
                             tick=tick,
-                            causal_parent=parent,
+                            causal_parent=None,
                             generation_rule_id=f"temperature_threshold.{direction}",
                         )
                     )
@@ -544,10 +549,11 @@ class RuleBasedEventSource(EventSource):
                                 "threshold": self.light_level_threshold,
                                 "persons": list(room.persons),
                                 "significant_change_reasons": ["room_light_level_threshold"],
+                                "trigger_event_id": trigger_event_id,
                             },
                             sim_time_s=sim_time_s,
                             tick=tick,
-                            causal_parent=parent,
+                            causal_parent=None,
                             generation_rule_id="light_level_threshold.low",
                         )
                     )
@@ -617,7 +623,7 @@ class StochasticEventSource(EventSource):
             return []
 
         generated: list[GeneratedEvent] = []
-        parent = trigger.event_id if trigger is not None else None
+        trigger_event_id = trigger.event_id if trigger is not None else None
         tick = self._tick_of(trigger)
 
         for device_id in self.device_ids:
@@ -651,10 +657,11 @@ class StochasticEventSource(EventSource):
                             "room_id": device.location.room,
                             "online": next_online,
                             "significant_change_reasons": ["device_availability"],
+                            "trigger_event_id": trigger_event_id,
                         },
                         sim_time_s=sim_time_s,
                         tick=tick,
-                        causal_parent=parent,
+                        causal_parent=None,
                         priority=3 if not next_online else 2,
                         rng_stream=self.stream.name,
                     ),

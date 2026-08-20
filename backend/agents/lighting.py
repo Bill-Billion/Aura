@@ -43,8 +43,12 @@ class LightingAgent(BaseAgent):
         world_state: WorldState,
         root_event: SimEvent,
     ) -> str:
+        # §9.1 的 explicit_user 说的是"这条命令的**行为体**是用户"，不是"某个 agent 在
+        # 响应用户事件"。照明域被一条 user.command 叫醒时是在**替**用户做事，它仍然是
+        # agent：自称用户档会让它对真人占用免疫、并白拿 §9.2 三类单边拒绝的豁免
+        # （S3 复审 blocker）。替用户做事落在域内最高的那一档——comfort。
         if root_event.event_type == "user.command":
-            return "direct_user_command"
+            return "user_comfort"
 
         relevant_rooms = self.get_relevant_rooms(world_state, root_event)
         if any(world_state.rooms.get(room_id) and world_state.rooms[room_id].occupancy for room_id in relevant_rooms):

@@ -65,6 +65,12 @@ class RecordingExecutor(CommandExecutor):
         self.seen.append(f"{command.device_id}.{command.capability}")
         return await super().submit(command, **kwargs)
 
+    async def propose(self, command, **kwargs):  # type: ignore[override]
+        # S3-T5 起 agent 腿不再走 submit()：仲裁门先 propose（开仲裁窗口），
+        # 裁决之后再 execute_approved。要证明"用的是注入的那台"，这条入口也得记账。
+        self.seen.append(f"{command.device_id}.{command.capability}")
+        return await super().propose(command, **kwargs)
+
     async def submit_batch(self, commands, **kwargs):  # type: ignore[override]
         self.seen.extend(f"{c.device_id}.{c.capability}" for c in commands)
         return await super().submit_batch(commands, **kwargs)

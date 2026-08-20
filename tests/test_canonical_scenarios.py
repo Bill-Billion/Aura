@@ -27,13 +27,20 @@ from backend.scenarios.generator import scenario_timeline_device_entries
 from backend.scenarios.loader import load_library
 from backend.scenarios.runner import run_scenario
 
-# §6.1-6.9 的八个典型场景（§6.10 多用户冲突按计划留给 S3 自带的 multi_user_conflict.yaml）。
+# §6.1-6.10 的九个典型场景。前八个是 S2-T8 落地的 §6.1-6.9；
+# ``multi_user_conflict``（§6.10）由 S3-T10 补上——S2-T8 当时刻意留给 S3，因为它是
+# S3 阶段门的头号场景（仲裁必须真的选边并解释，见 tests/test_multi_user_conflict.py）。
+# ``safety_smoke_kitchen`` 不属于 §6，它是 §13「safety event interrupts comfort or
+# energy-saving behavior」的库内落点：S3 复审实测九个 §6 场景一次都没产出过 safety 档提案，
+# §9.1 的最高档因此只被合成夹具走过（见 tests/test_episode_completeness.py 的档位生产者门）。
 CANONICAL_SCENARIO_IDS = (
     "cooking_dinner",              # §6.5
     "device_offline_fallback",     # §6.9
     "hot_weather_afternoon",       # §6.6
     "morning_wake_up",             # §6.4
+    "multi_user_conflict",         # §6.10（S3-T10）
     "night_sleep_bedtime",         # §6.3
+    "safety_smoke_kitchen",        # §13 安全打断（S3 复审 minor）
     "security_presence_night",     # §6.8
     "user_arrives_home_evening",   # §6.1
     "user_leaves_home_morning",    # §6.2
@@ -46,7 +53,9 @@ SCENARIO_SIGNATURE_ROOT_EVENT = {
     "device_offline_fallback": "device.offline",
     "hot_weather_afternoon": "environment.temperature_threshold",
     "morning_wake_up": "user.starts_activity",
+    "multi_user_conflict": "user.starts_activity",
     "night_sleep_bedtime": "user.starts_activity",
+    "safety_smoke_kitchen": "safety.smoke_detected",
     "security_presence_night": "security.presence_detected",
     "user_arrives_home_evening": "user.arrives_home",
     "user_leaves_home_morning": "user.leaves_home",
@@ -69,7 +78,7 @@ def library_client():
 # ----------------------------------------------------------------- 1. 形状
 
 
-def test_library_contains_exactly_the_eight_canonical_scenarios():
+def test_library_contains_exactly_the_canonical_scenarios():
     library = load_library()
     assert tuple(library) == CANONICAL_SCENARIO_IDS
 
@@ -118,40 +127,24 @@ def test_only_the_arrival_scenario_anchors_the_s15_2_command_acceptance():
     assert len(scenario_timeline_device_entries(library[with_commands[0]])) == 1
 
 
-def test_device_offline_scenario_declares_expected_failures():
-    """§13 恢复要求：掉线设备场景必须**声明**它预期哪一类失败（critic 修正）。
-
-    S4-T2 的评估器据此把"预期内失败"与"回归"分开：没有这条声明，一次正确处理掉线的 run
-    会被记成命令失败率上升。字段是 schema 1.1 的 §14 MINOR 增量（"Minor versions may add
-    optional fields"），本后端已支持 1.1，因此断言走的是 **loader 加载出来的 ScenarioSpec**
-    而不是原始 YAML——评估器读的是前者，只验后者等于验了一份没人能消费的数据。
-    """
-
-    import yaml
-
-    from backend.scenarios.loader import DEFAULT_LIBRARY_DIRS
+def test_device_offline_scenario_models_preemptive_avoidance_not_a_fake_failure():
+    """Canonical 掉线场景先发布环境事实，再由 agent 预判避让并选择替代设备。"""
 
     spec = load_library()["device_offline_fallback"]
-    assert spec.scenario_schema_version == "1.1"
-
-    declared = spec.expected_failures
-    assert declared, "device_offline.yaml 的 expected_failures 必须能被 loader 保留下来"
-    categories = {entry.category for entry in declared}
-    assert "device_offline_before_command" in categories
-    for entry in declared:
-        assert entry.error_code == "device_offline"
-        assert entry.device_id
-        # 声明必须与真实起始世界一致：被声明为会掉线的设备，起始状态里就得是 online=false。
-        device = spec.initial_state.devices[entry.device_id]
-        assert device.state.extra.get("online") is False
-
-    # 文件里写了什么就必须原样到达模型（round-trip），不允许在加载期被丢弃或改写。
-    raw = yaml.safe_load(
-        (DEFAULT_LIBRARY_DIRS[0] / "device_offline.yaml").read_text(encoding="utf-8")
+    assert spec.scenario_schema_version == "1.0"
+    assert spec.expected_failures == []
+    assert spec.initial_state.devices["ac_living_01"].state.extra["online"] is False
+    assert any(
+        item.type == "device.offline" and item.device_id == "ac_living_01"
+        for item in spec.timeline
     )
-    raw_failures = raw.get("expected_failures")
-    assert isinstance(raw_failures, list) and raw_failures
-    assert [entry.model_dump() for entry in declared] == raw_failures
+    assert spec.ground_truth is not None
+    assert "ac_living_01" in spec.ground_truth.relevant_device_ids
+    assert "ac_living_01" not in spec.ground_truth.forbidden_device_ids
+    assert (
+        "do_not_retry_commands_to_a_device_known_offline"
+        in spec.ground_truth.safety_constraints
+    )
 
 
 def test_full_library_load_fires_no_forward_compat_warning():
@@ -184,7 +177,15 @@ def test_expected_failure_device_ids_are_registry_checked():
     assert "ac_living_01" in spec.referenced_device_ids()
 
     data = spec.model_dump()
-    data["expected_failures"][0]["device_id"] = "ac_living_99"
+    data["expected_failures"] = [
+        {
+            "category": "device_offline_before_command",
+            "device_id": "ac_living_99",
+            "error_code": "device_offline",
+            "description": "synthetic registry-integrity fixture",
+            "expected_recovery": "fallback_to_alternative_device",
+        }
+    ]
     with pytest.raises(ScenarioLoadError) as exc:
         parse_scenario_mapping(data)
     assert exc.value.code == "unknown_device_id"
@@ -194,11 +195,11 @@ def test_expected_failure_device_ids_are_registry_checked():
 # ----------------------------------------------------------------- 2. 枚举
 
 
-def test_api_scenarios_enumerates_exactly_the_eight(library_client):
+def test_api_scenarios_enumerates_exactly_the_canonical_library(library_client):
     resp = library_client.get("/api/scenarios")
     assert resp.status_code == 200
     payload = resp.json()
-    assert payload["count"] == 8
+    assert payload["count"] == len(CANONICAL_SCENARIO_IDS) == 10
     assert [item["id"] for item in payload["scenarios"]] == list(CANONICAL_SCENARIO_IDS)
     # §2.3：枚举投影不得泄露 ground truth 本体
     assert all("ground_truth" not in item for item in payload["scenarios"])

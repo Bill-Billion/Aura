@@ -122,6 +122,43 @@ function loadGLB(url: string): Promise<THREE.Group> {
   })
 }
 
+function createProceduralFloorPlaceholder(floorId: FloorId): THREE.Group {
+  // S5-T7: GLB 加载失败时的纯色方块占位——确保系统在无 gamemcu 资产时仍能跑通
+  const group = new THREE.Group()
+  group.name = `procedural_${floorId}`
+
+  const geo = new THREE.BoxGeometry(12, 0.3, 16)
+  const mat = new THREE.MeshStandardMaterial({ color: 0x3a3a5c, roughness: 0.7 })
+  const floor = new THREE.Mesh(geo, mat)
+  floor.name = `floor_${floorId}`
+  floor.position.set(0, 0, 0)
+  group.add(floor)
+
+  const wallGeo = new THREE.BoxGeometry(12, 4, 0.2)
+  const wallMat = new THREE.MeshStandardMaterial({ color: 0x8bafb1, roughness: 0.5, transparent: true, opacity: 0.35 })
+  const positions: [number, number, number][] = [
+    [0, 2, -8], [0, 2, 8], [-6, 2, 0], [6, 2, 0],
+  ]
+  for (const [x, y, z] of positions) {
+    const wall = new THREE.Mesh(wallGeo, wallMat)
+    wall.name = `wall_${floorId}`
+    wall.position.set(x, y, z)
+    if (z === 0) wall.rotation.y = Math.PI / 2
+    group.add(wall)
+  }
+
+  return group
+}
+
+async function loadFloorScene(floorId: FloorId): Promise<THREE.Group> {
+  try {
+    return await loadGLB(`/models/${floorId}.glb`)
+  } catch (err) {
+    console.warn(`GLB ${floorId}.glb 加载失败，使用程序化占位：`, err)
+    return createProceduralFloorPlaceholder(floorId)
+  }
+}
+
 function loadTexture(url: string): Promise<THREE.Texture> {
   return new Promise((resolve, reject) => {
     textureLoader.load(url, resolve, undefined, reject)
@@ -651,7 +688,7 @@ onMounted(async () => {
 
     for (const floorId of floorOrder) {
       const floorConfig = showroomVisualConfig.floors[floorId]
-      const scene = await loadGLB(`/models/${floorId}.glb`)
+      const scene = await loadFloorScene(floorId)
       scene.position.set(0, floorConfig.collapsedY, 0)
 
       const floorLightUnis = lightUniforms.initFloor({

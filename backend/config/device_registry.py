@@ -5,6 +5,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from backend.models.versioning import SUPPORTED_DEVICE_REGISTRY_VERSION
 from backend.engine.state import (
     DeviceCapability,
     DeviceState,
@@ -20,6 +21,8 @@ from backend.engine.state import (
 # 归 backend/execution/capability_matrix.py（spec §3.2），校验归
 # backend/execution/validation.py（§3.3 六级 + §10.2 词表）——本模块不再自带校验函数，
 # 避免出现第二条与 executor 口径不一致的命令合法性判据。
+
+DEVICE_REGISTRY_VERSION = SUPPORTED_DEVICE_REGISTRY_VERSION
 
 
 class DeviceRegistryEntry(BaseModel):

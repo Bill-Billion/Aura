@@ -6,10 +6,13 @@ import time
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from backend.agents.hvac import HVACAgent
-from backend.agents.lighting import LightingAgent
 from backend.agents.llm import LLMProvider
-from backend.agents.runtime import AgentRuntime
+from backend.agents.llm_modes import resolve_mode_for_provider
+from backend.agents.runtime import (
+    AgentRuntime,
+    RuntimePolicySelection,
+    register_default_agents,
+)
 from backend.api.ws import ConnectionManager
 from backend.core.logging import log
 from backend.engine.event_bus import EventBus, SimEvent, WorldEvent
@@ -21,8 +24,14 @@ from backend.engine.event_types import (
     USER_MOVEMENT_EVENT_TYPES,
 )
 from backend.engine.event_log import RunArtifactRecorder, attach_run_artifacts
-from backend.engine.rng import SimRandom
-from backend.engine.run_manager import RunManager, RunMetadata, resolve_run_scenario
+from backend.engine.rng import SimRandom, validate_seed
+from backend.engine.run_manager import (
+    RunManager,
+    RunMetadata,
+    baseline_policy_for_llm_mode,
+    new_run_id,
+    resolve_run_scenario,
+)
 from backend.engine.simulator_timer import SimulatorTimer
 from backend.engine.state import Location3D, WorldState
 from backend.engine.state_manager import (
@@ -36,7 +45,7 @@ from backend.execution.executor import (
     CommandExecutor,
     InvariantReportDebounce,
 )
-from backend.models.schemas import WSMessage
+from backend.models.schemas import BaselinePolicy, WSMessage
 from backend.scenarios.apply import apply_scenario_initial_state
 from backend.scenarios.generator import (
     FAILURE_INJECTION_CAUSED_BY,
@@ -46,6 +55,7 @@ from backend.scenarios.generator import (
     GenerationSources,
     build_generation_sources,
 )
+from backend.scenarios.fingerprint import scenario_contract_fingerprint
 from backend.scenarios.spec import ScenarioSpec
 from backend.simulators.environment import EnvironmentSimulator
 from backend.simulators.user_behavior import UserBehaviorSimulator
@@ -115,8 +125,9 @@ class SimulationEngine:
             episode_timeout_ms=agent_episode_timeout_ms,
             command_executor=self.command_executor,
         )
-        self.agent_runtime.register(LightingAgent())
-        self.agent_runtime.register(HVACAgent())
+        # §8.2 五个域 agent；"注册了谁、什么顺序"的唯一真相在 runtime.DEFAULT_AGENT_FACTORIES
+        # ——顺序同时决定 TaskPlan.domain_tasks 序与 canonical trace 行序（S2-T9 门）。
+        register_default_agents(self.agent_runtime)
 
         # §11 run 模型：引擎一起来就处在一个 run 里——"没有 run 的事件"是 S2 之前那种
         # 无法归属的连续带，正是可复现性缺失的形态。scenario_id/seed 由场景运行方
@@ -139,6 +150,7 @@ class SimulationEngine:
             publish_event=self._publish_sim_event,
             command_executor=self.command_executor,
             run_id_source=lambda: self.run_manager.run_id,
+            recording_integrity_error_handler=self._mark_run_artifact_invalid,
         )
         self._sync_world_timing_state(reset_mode=True)
         self._sync_agent_diagnostics()
@@ -148,6 +160,16 @@ class SimulationEngine:
         """当前活跃 run 的 id（§11）；事件、episode 与工件都以它为归属。"""
 
         return self.run_manager.run_id
+
+    def _mark_run_artifact_invalid(self, run_id: str, message: str) -> None:
+        metadata = self.run_manager.current
+        if metadata is None or metadata.run_id != run_id:
+            return
+        if metadata.artifact_error is None:
+            metadata.artifact_error = message
+        writer = self.run_artifacts.writer
+        if writer is not None and writer.metadata.run_id == run_id:
+            writer.write_metadata()
 
     @property
     def sim_time_s(self) -> float:
@@ -199,6 +221,11 @@ class SimulationEngine:
         *,
         scenario_id: str | None,
         seed: int | None,
+        baseline_policy: BaselinePolicy | None = None,
+        recording_source_run_id: str | None = None,
+        duration_seconds: float | None = None,
+        scenario_schema_version: str | None = None,
+        scenario_contract_hash: str | None = None,
         clear_event_history: bool = True,
     ) -> RunMetadata:
         """开一个新 run 并把 §11 元数据补齐（provider/model/agent 版本从运行期取）。
@@ -209,6 +236,14 @@ class SimulationEngine:
 
         self.scenario_id = scenario_id
         provider = self.agent_runtime.llm_provider
+        effective_mode = resolve_mode_for_provider(provider)
+        selected_policy = baseline_policy or baseline_policy_for_llm_mode(effective_mode)
+        assigned_run_id = new_run_id()
+        # recorded provider 的默认目录依赖新 run_id；此刻 RunManager.current 仍是旧 run，
+        # 必须先显式绑定，不能让 provider 属性访问从 run_id_source 误取旧身份。
+        bind_provider_run = getattr(provider, "bind_run", None)
+        if callable(bind_provider_run):
+            bind_provider_run(assigned_run_id)
         sim_version = self.run_manager.sim_version
         agent_versions = {
             agent.agent_id: str(getattr(agent, "agent_version", sim_version))
@@ -219,7 +254,17 @@ class SimulationEngine:
             scenario_id=scenario_id,
             seed=seed,
             llm_provider=provider,
+            # §11.1：run 工件必须记下用的是哪种模式。显式传是因为 run_manager 在 engine 层，
+            # 它只会鸭子类型地看 provider_name/api_key，认不出 S3 的三层模式包装
+            # （recorded 会被它当成 live 或 mocked）。裸 provider 走到这里结果与 S2 一致。
+            llm_mode=effective_mode,
+            baseline_policy=selected_policy,
+            recording_source_run_id=recording_source_run_id,
+            duration_seconds=duration_seconds,
+            scenario_schema_version=scenario_schema_version,
+            scenario_contract_hash=scenario_contract_hash,
             agent_versions=agent_versions,
+            run_id=assigned_run_id,
             clear_event_history=clear_event_history,
         )
 
@@ -287,13 +332,16 @@ class SimulationEngine:
         log.info("sim_started", drive_timer=drive_timer)
 
     async def pause(self) -> None:
-        if not self.is_running:
-            return
-
+        was_running = self.is_running
+        # Always drain the timer task. On a tick exception the error handler sets
+        # engine.is_running=False before it finishes publishing system.engine_error;
+        # an early return here would let finalization close the writer underneath it.
         await self.timer.pause()
         self.is_running = False
         self.state_manager.world.is_running = False
         self._sync_world_timing_state()
+        if not was_running:
+            return
         await self._publish_sim_event(
             SimEvent(
                 event_type="system.simulation_paused",
@@ -316,6 +364,8 @@ class SimulationEngine:
         seed: int | None = None,
         scenario_dirs: Iterable[Path | str] | None = None,
         stochastic_overrides: Mapping[str, Any] | None = None,
+        policy_selection: RuntimePolicySelection | None = None,
+        duration_seconds: float | None = None,
     ) -> None:
         """重置世界并开一个**新 run**（§11）。
 
@@ -335,8 +385,37 @@ class SimulationEngine:
         # 解析放在最前面：未知场景 id 必须在 pause/取消/换世界**之前**被拒，
         # 否则一次拼错的启动会把正在跑的 run 拆掉再报错。
         spec = resolve_run_scenario(scenario, dirs=scenario_dirs)
+        resolved_seed = seed if seed is not None else (spec.seed if spec is not None else None)
+        if resolved_seed is not None:
+            # Validate before pause/cancel/world swap.  A late failure in
+            # RunManager.start_run would otherwise leave main.state_manager and
+            # engine.state_manager split across two worlds with no active run.
+            resolved_seed = validate_seed(resolved_seed)
+        if policy_selection is None:
+            # ``None`` means "server default for this new run", never "inherit
+            # whichever provider the previous experiment installed".  Without
+            # this reset, leaving an explicit live/recorded run could leak paid
+            # calls or replay state into later anonymous 3D interactions.
+            policy_selection = self.agent_runtime.prepare_baseline_policy(None)
+
+        if spec is not None:
+            # Construct the complete generation graph before pausing the old run
+            # or swapping worlds.  Nested stochastic config used to be an
+            # untyped dict and could fail (for example float("nope")) only after
+            # _start_run had committed a canonical writer, leaving the service
+            # permanently locked behind a stopped half-run.
+            build_generation_sources(
+                spec,
+                context=GenerationContext(run_id=None, scenario_id=spec.id),
+                rng=SimRandom(resolved_seed),
+                user_sim=UserBehaviorSimulator(),
+                stochastic_overrides=stochastic_overrides,
+            )
 
         await self.pause()
+        # Defensive reset for legacy/manual headless failures which may have
+        # interrupted a tick before its handler wrapper was installed.
+        self._is_processing_timer_tick = False
         # 审计必修②：cancel-before-swap——先取消并落账在飞 episode，
         # 再替换世界，否则旧任务可能在 swap 之后、cancel 之前写入新世界。
         await self.agent_runtime.cancel_active_episodes()
@@ -357,6 +436,11 @@ class SimulationEngine:
             # 原地重置会把 time_of_day 抹回 12:00，因此场景覆盖必须**在那之后**再摆。
             if spec is not None:
                 apply_scenario_initial_state(self.state_manager, spec)
+
+        # provider 切换只能发生在旧 episode/命令都已取消、且 initial_state 已完整应用之后；
+        # prepare 已在调用 reset 前完成全部可能失败的凭证/录制校验，所以这里是无失败的
+        # commit，且仍早于 _start_run 写 provider/mode 元数据。
+        self.agent_runtime.activate_baseline_policy(policy_selection)
 
         self.timer.reset()
         self.timer.set_mode(self.DEFAULT_MODE)
@@ -381,29 +465,62 @@ class SimulationEngine:
         # （episode_cancelled / 命令取消）仍归旧 run，reset 事件已经属于新 run。
         # start_run 顺手清空事件历史——审计发现③：1000 条环形历史 reset 从不清空，
         # get_causal_chain 会把两个 run 的链焊成一条。
-        self._start_run(
+        started_run = self._start_run(
             scenario_id=spec.id if spec is not None else None,
-            seed=seed if seed is not None else (spec.seed if spec is not None else None),
+            seed=resolved_seed,
+            baseline_policy=(
+                policy_selection.baseline_policy if policy_selection is not None else None
+            ),
+            recording_source_run_id=(
+                policy_selection.recording_source_run_id
+                if policy_selection is not None
+                else None
+            ),
+            duration_seconds=duration_seconds,
+            scenario_schema_version=(
+                spec.scenario_schema_version if spec is not None else None
+            ),
+            scenario_contract_hash=(
+                scenario_contract_fingerprint(spec) if spec is not None else None
+            ),
         )
         # 产线绑定必须在 _start_run 之后：GenerationContext 盖的是**新** run 的章，
         # 随机子流取自新 run 的 SimRandom（一 run 一 seed）。没有场景就摘干净——
         # 留着上一个场景的产线，等于用旧场景的 timeline 驱动一个匿名的新实验。
-        if spec is not None:
-            self._install_generation_sources(spec, stochastic_overrides=stochastic_overrides)
-        else:
-            self.bind_generation_sources(None)
-        await self._publish_sim_event(
-            SimEvent(
-                event_type="system.simulation_reset",
-                source="simulation_engine",
-                timestamp=float(self.state_manager.world.simulation_tick),
-                priority=2,
-                data={
-                    "scene_id": self.state_manager.world.scene_id,
-                    **self.build_simulation_status_payload(),
-                },
+        try:
+            if spec is not None:
+                self._install_generation_sources(spec, stochastic_overrides=stochastic_overrides)
+            else:
+                self.bind_generation_sources(None)
+            await self._publish_sim_event(
+                SimEvent(
+                    event_type="system.simulation_reset",
+                    source="simulation_engine",
+                    timestamp=float(self.state_manager.world.simulation_tick),
+                    priority=2,
+                    data={
+                        "scene_id": self.state_manager.world.scene_id,
+                        **self.build_simulation_status_payload(),
+                    },
+                )
             )
-        )
+        except Exception as exc:
+            # A post-commit failure must never leave a canonical current run
+            # which blocks every subsequent launch/mutation.  The partial
+            # artifact remains explicit and non-evaluable via end_reason.
+            self.bind_generation_sources(None)
+            current = self.run_manager.current
+            if current is not None and current.run_id == started_run.run_id:
+                self.run_manager.end_run("launch_failed")
+            self.is_running = False
+            self.state_manager.world.is_running = False
+            log.error(
+                "simulation_reset_commit_failed",
+                run_id=started_run.run_id,
+                scenario_id=started_run.scenario_id,
+                error=str(exc),
+            )
+            raise
         log.info("sim_reset")
 
     async def close(self) -> None:
@@ -460,9 +577,30 @@ class SimulationEngine:
         self.run_artifacts.record(event)
 
     async def _handle_timer_tick(self, event: SimEvent) -> None:
+        self._is_processing_timer_tick = True
+        try:
+            await self._handle_timer_tick_body(event)
+            metadata = self.run_manager.current
+            duration_seconds = (
+                metadata.duration_seconds if metadata is not None else None
+            )
+            if (
+                duration_seconds is not None
+                and self.sim_time_s >= duration_seconds
+            ):
+                # Stop at the first tick whose t=(tick-1)*dt covers the deadline.
+                # This only arms the loop stop flag: the current EventBus fan-out
+                # (including wildcard artifact recording) still finishes fully.
+                self.timer.request_stop_after_current_tick()
+        finally:
+            # Covers the full exact-handler body, including the final delta,
+            # invariant and agent-status awaits. Timer.pause then drains the
+            # surrounding EventBus fan-out before finalization closes artifacts.
+            self._is_processing_timer_tick = False
+
+    async def _handle_timer_tick_body(self, event: SimEvent) -> None:
         world = self.state_manager.world
         self._pending_deltas = []
-        self._is_processing_timer_tick = True
 
         timer_tick = int(event.data["tick"])
         simulated_dt = float(event.data["simulated_dt"])
@@ -571,7 +709,6 @@ class SimulationEngine:
             ):
                 await self._dispatch_generated(generated, tick=timer_tick)
 
-        self._is_processing_timer_tick = False
         await self._flush_pending_deltas()
         # tick 收尾探测：本 tick 内的仿真写入（timer/user/env）是否把世界写成不一致。
         await self._report_world_invariants(
@@ -851,27 +988,22 @@ class SimulationEngine:
 
     async def _publish_sim_event(self, event: WorldEvent | SimEvent) -> SimEvent:
         sim_event = self.event_bus.coerce_event(event)
-        # run 归属必须在**外发之前**落到事件上。这里刻意先广播后入总线（审计§六⑤：
-        # 根事件要先于它派生的 STATE_DELTA 到达前端），而总线的盖章发生在 publish 里，
-        # 所以不预先盖 run 章的话，WS 上的每一条 SIM_EVENT 都会是 run_id=null——
-        # 前端与 S5 面板从此无法区分 reset 前后的事件属于哪次 run。
-        # 与总线的盖章规则一致（缺失才填），因此这里填过之后 publish 不会覆盖。
-        if sim_event.run_id is None:
-            sim_event.run_id = self.event_bus.run_id
-        if sim_event.scenario_id is None:
-            sim_event.scenario_id = self.event_bus.scenario_id
-        # sim_time_s 同理必须在外发之前落上：总线也会盖（set_sim_time_source），但那发生在
-        # publish 里，而这里是先广播后入总线——不预先盖的话 WS 上每条 SIM_EVENT 的
-        # sim_time_s 都会是 null，前端与 S5 时间轴只能退回墙钟。
-        if sim_event.sim_time_s is None:
-            sim_event.sim_time_s = self.sim_time_s
-        # seq 同样必须在外发之前落上：S5 的因果树按 seq 排序，无号事件排不进自己的
-        # 子节点之前。stamp() 只分配一次号（见 EventBus._stamp），随后的 publish 不会
-        # 重编，因此 WS 副本与 events.jsonl 副本带的是同一个 seq。
-        sim_event = self.event_bus.stamp(sim_event)
-        await self.conn.broadcast(WSMessage(type="SIM_EVENT", payload=sim_event.model_dump()))
-        await self.event_bus.publish(sim_event)
-        return sim_event
+
+        async def broadcast_before_fan_out(visible: SimEvent) -> None:
+            await self.conn.broadcast(
+                WSMessage(type="SIM_EVENT", payload=visible.model_dump())
+            )
+
+        # Admission, stamping and WS visibility are one transaction.  The
+        # before-fan-out hook preserves the product invariant that a root is on
+        # the wire before synchronous subscribers emit derived events; a
+        # depth-capped input is instead represented everywhere by the same
+        # suppression notice.  Returning that notice also prevents callers from
+        # extending a chain from a refused, non-existent parent.
+        return await self.event_bus.publish_visible(
+            sim_event,
+            before_fan_out=broadcast_before_fan_out,
+        )
 
     def _collect_environment_change_reasons(
         self,
@@ -914,11 +1046,28 @@ class SimulationEngine:
         return "night"
 
     def build_simulation_status_payload(self) -> dict[str, object]:
+        metadata = self.run_manager.current
         return {
             # run_id/scenario_id 纯增字段：前端 simulationStore 不解析未知键，
             # 但研究者从此能在任意一条状态消息上回答"我现在看的是哪次实验"（§18）。
             "run_id": self.run_id,
             "scenario_id": self.scenario_id,
+            "seed": metadata.seed if metadata is not None else None,
+            "baseline_policy": (
+                metadata.baseline_policy.value
+                if metadata is not None and metadata.baseline_policy is not None
+                else None
+            ),
+            "llm_mode": metadata.llm_mode.value if metadata is not None else None,
+            "duration_seconds": (
+                metadata.duration_seconds if metadata is not None else None
+            ),
+            "recording_source_run_id": (
+                metadata.recording_source_run_id if metadata is not None else None
+            ),
+            "finalized": False if metadata is not None else None,
+            "ended_at": metadata.ended_at if metadata is not None else None,
+            "end_reason": metadata.end_reason if metadata is not None else None,
             "is_running": self.is_running,
             "speed": self.speed,
             "mode": self.mode,

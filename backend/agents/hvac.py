@@ -43,8 +43,8 @@ class HVACAgent(BaseAgent):
         world_state: WorldState,
         root_event: SimEvent,
     ) -> str:
-        if root_event.event_type == "user.command":
-            return "direct_user_command"
+        # 与 LightingAgent 同一条纪律：agent 替用户做事仍然是 agent，``explicit_user``
+        # 留给行为体确实是真人的提案（UI 腿）。空调域两条路径本来就同档，分支删掉即可。
         return "user_comfort"
 
     def get_relevant_devices(self, world_state: WorldState, root_event: SimEvent) -> list[DeviceState]:

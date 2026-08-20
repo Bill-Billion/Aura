@@ -5,8 +5,8 @@
      event_generation_mode，rule 事件另有 generation_rule_id、stochastic 事件另有 rng_stream）；
   2. timeline 里的设备变更必须构造 ``DeviceCommand(source="scenario")`` 走 CommandExecutor
      ——没有 state_manager 兜底路径（critic 修正①）；
-  3. 规则事件的 causal_parent 指向**具体的物理触发事件**，绝不是"最近一条用户事件"
-     （critic 修正②：两个用户先后动作时那条启发式会张冠李戴）。
+  3. 富根事件的 causal_parent 为空，具体物理触发者记录在 data.trigger_event_id，绝不是
+     "最近一条用户事件"（critic 修正②：两个用户先后动作时那条启发式会张冠李戴）。
 """
 
 from __future__ import annotations
@@ -225,7 +225,8 @@ def test_rule_based_threshold_emits_environment_temperature_threshold_with_rule_
     assert event.generation_rule_id == "temperature_threshold.high"
     assert event.data["room_id"] == "living_room"
     assert event.data["value"] == pytest.approx(31.0)
-    assert event.causal_parent == tick.event_id
+    assert event.causal_parent is None
+    assert event.data["trigger_event_id"] == tick.event_id
 
     # 迟滞：同一状态不重复发（否则每 tick 一条会淹没事件流）
     assert source.emit(world, trigger=_tick_event(2), sim_time_s=20.0) == []
@@ -245,12 +246,14 @@ def test_rule_based_user_schedule_emits_rich_root_events_with_rule_id():
         assert event.event_type in ROOT_EVENT_TYPES  # 富分类学，不是 user.activity_change
         assert event.event_generation_mode == "rule_based"
         assert event.generation_rule_id.startswith("user_schedule")
+        assert event.causal_parent is None
+        assert event.data["trigger_event_id"]
         # 世界写回所需的三个键与旧兼容事件同名（迁移期兼容）
         assert {"user_id", "from_room", "to_room", "activity"} <= set(event.data)
 
 
-def test_env_threshold_causal_parent_is_actual_trigger_not_latest_user_event():
-    """critic 修正②：两个用户先后动作，阈值事件的父必须是**真正改变了读数**的那条事件。
+def test_env_threshold_records_actual_trigger_without_demoting_episode_root():
+    """两个用户先后动作时，阈值根单独记录真正改变读数的触发事件。
 
     用户 A 走进昏暗的客厅 → 触发 light_level_threshold；随后用户 B 走进明亮的厨房 → 不触发。
     "取最近一条用户事件"的旧启发式会把父指向 B，因果链从此撒谎。
@@ -288,7 +291,8 @@ def test_env_threshold_causal_parent_is_actual_trigger_not_latest_user_event():
         if item.event.event_type == "environment.light_level_threshold"
     ]
     assert len(light_events) == 1
-    assert light_events[0].causal_parent == user_a.event_id, "父必须是物理上造成阈值跨越的那条事件"
+    assert light_events[0].causal_parent is None
+    assert light_events[0].data["trigger_event_id"] == user_a.event_id
     assert light_events[0].generation_rule_id == "light_level_threshold.low"
 
 

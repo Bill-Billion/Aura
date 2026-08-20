@@ -11,6 +11,7 @@ S2 之前，一次仿真跑完之后剩下的全部"记录"是 EventBus 里那 1
         run.json            §11 九字段 + §11.1 llm_mode + ended_at/end_reason
         events.jsonl        本 run 的全部事件，一行一条，按 seq 升序
         llm_recordings.jsonl   S3 写在同一目录；S4 的回放两份一起读
+        llm_recordings.manifest.json   录制请求/成功数与内容摘要
 
 写侧的三条纪律：
 
@@ -34,16 +35,18 @@ S2 之前，一次仿真跑完之后剩下的全部"记录"是 EventBus 里那 1
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+from collections.abc import Iterator, Mapping
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterator, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from backend.core.logging import log
 from backend.engine.event_bus import SimEvent
-from backend.engine.run_manager import RunMetadata, canonical_json
+from backend.engine.run_manager import EventLogIntegrity, RunMetadata, canonical_json
 
 if TYPE_CHECKING:  # pragma: no cover - 仅用于类型标注，避免运行期循环导入
     from backend.engine.run_manager import RunManager
@@ -53,6 +56,7 @@ RUN_METADATA_FILENAME = "run.json"
 # S3 的 LLM 录制工件与 events.jsonl 同目录（critic 定死的路径），此处声明是为了让
 # "同一个 run 目录下有哪些工件" 这件事只有一处说法。
 LLM_RECORDINGS_FILENAME = "llm_recordings.jsonl"
+LLM_RECORDINGS_MANIFEST_FILENAME = "llm_recordings.manifest.json"
 
 # 仓库根锚定的绝对路径：uvicorn 的工作目录随启动方式漂移，用相对路径会让同一台机器上
 # 的两次启动把工件写进两个地方。
@@ -114,6 +118,7 @@ class RunArtifactErrorCode(str, Enum):
     run_not_found = "run_not_found"
     corrupt_event_log = "corrupt_event_log"
     corrupt_run_metadata = "corrupt_run_metadata"
+    unsupported_run_artifact = "unsupported_run_artifact"
 
 
 class RunArtifactError(Exception):
@@ -170,6 +175,27 @@ def validate_run_id(run_id: Any) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _write_json_durable(path: Path, payload: Mapping[str, Any]) -> None:
+    """Atomically replace a JSON file after flushing its complete contents."""
+
+    temp_path = path.with_name(f".{path.name}.tmp")
+    serialized = json.dumps(
+        dict(payload), indent=2, sort_keys=True, ensure_ascii=False
+    ) + "\n"
+    try:
+        with temp_path.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    except BaseException:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:  # pragma: no cover - cleanup after a disk failure
+            pass
+        raise
+
+
 class EventLogWriter:
     """一个 run 的工件写入器（一实例一目录，不复用）。
 
@@ -196,6 +222,7 @@ class EventLogWriter:
         self._buffer: dict[int, str] = {}
         self._written = 0
         self._closed = False
+        self._finalizing = False
         self.failure: str | None = None
         self.write_metadata()
 
@@ -222,10 +249,7 @@ class EventLogWriter:
 
         payload = self.metadata.model_dump(mode="json")
         try:
-            self.metadata_path.write_text(
-                json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
-                encoding="utf-8",
-            )
+            _write_json_durable(self.metadata_path, payload)
         except OSError as exc:  # pragma: no cover - 磁盘故障路径
             self._fail("run_metadata", exc)
 
@@ -250,19 +274,37 @@ class EventLogWriter:
         return True
 
     def close(self) -> None:
-        """冲掉缓冲、补写 run.json、关文件。可重复调用。"""
+        """Durably close events, seal their exact bytes, then update run.json."""
 
         if self._closed:
             return
+        self._finalizing = True
         for seq in sorted(self._buffer):
             self._write_line(self._buffer[seq])
         self._buffer.clear()
-        self._closed = True
-        self.write_metadata()
+        try:
+            self._handle.flush()
+            os.fsync(self._handle.fileno())
+        except (OSError, ValueError) as exc:  # pragma: no cover - 磁盘故障路径
+            self._fail("events.flush", exc)
         try:
             self._handle.close()
-        except OSError:  # pragma: no cover - 磁盘故障路径
-            pass
+        except OSError as exc:  # pragma: no cover - 磁盘故障路径
+            self._fail("events.close", exc)
+        self._closed = True
+
+        # Never bless a trace after any write failure.  A seal is evidence of a
+        # complete close, not a best-effort checksum of whatever prefix survived.
+        if self.failure is None and self.metadata.artifact_error is None:
+            try:
+                _, _, facts = _inspect_event_log(self.metadata.run_id, self.events_path)
+                self.metadata.events_integrity = EventLogIntegrity.model_validate(facts)
+            except (RunArtifactError, ValueError) as exc:
+                self._fail("events.finalize", exc)
+
+        # ``ended_at`` was filled by RunManager before this method.  This is the
+        # first and only finalized metadata write, deliberately after close.
+        self.write_metadata()
 
     # --- internal ----------------------------------------------------------
 
@@ -275,13 +317,40 @@ class EventLogWriter:
         self._written += 1
 
     def _fail(self, artifact: str, exc: BaseException) -> None:
-        self.failure = f"{artifact}: {exc}"
+        message = f"{artifact}: {exc}"
+        # The first write failure is the root cause.  Keep it on the shared
+        # RunMetadata object so a later successful close cannot overwrite
+        # run.json with a complete-looking artifact after events were dropped.
+        if self.failure is None:
+            self.failure = message
+        if self.metadata.artifact_error is None:
+            self.metadata.artifact_error = self.failure
         log.error(
             "run_artifact_write_failed",
             run_id=self.metadata.run_id,
             artifact=artifact,
             error=str(exc),
         )
+        # Do not call write_metadata() here: a metadata write failure would
+        # recurse forever.  A transient failure gets one best-effort retry;
+        # otherwise the in-memory metadata still remains invalid and a later
+        # close will retry the normal write with artifact_error preserved.
+        # During finalization, even the failure marker must wait until the event
+        # handle has been closed; otherwise run.json could advertise ended_at
+        # while the bytes it describes are still buffered.
+        if self._finalizing:
+            return
+        try:
+            _write_json_durable(
+                self.metadata_path, self.metadata.model_dump(mode="json")
+            )
+        except OSError as marker_exc:  # pragma: no cover - persistent disk failure
+            log.error(
+                "run_artifact_failure_marker_write_failed",
+                run_id=self.metadata.run_id,
+                artifact=artifact,
+                error=str(marker_exc),
+            )
 
 
 class RunArtifactRecorder:
@@ -348,6 +417,17 @@ class RunArtifactRecorder:
     def record(self, event: SimEvent) -> None:
         if self.writer is None:
             return
+        expected_run_id = self.writer.metadata.run_id
+        if event.run_id != expected_run_id:
+            message = (
+                f"cross-run event rejected: event run_id={event.run_id!r}, "
+                f"writer run_id={expected_run_id!r}"
+            )
+            # Stop accepting further evidence and persist the reason in run.json.
+            # A partial artifact marked invalid is safer than a complete-looking
+            # trace containing events from another experiment.
+            self.writer._fail("events.cross_run", ValueError(message))
+            return
         self.writer.append(event)
 
     def close(self) -> None:
@@ -365,6 +445,27 @@ class RunArtifactRecorder:
             self.writer = EventLogWriter(metadata, root=self._root, start_seq=start_seq)
         except OSError as exc:
             self.writer = None
+            metadata.artifact_error = f"artifacts.open: {exc}"
+            directory = run_dir(metadata.run_id, root=self._root)
+            try:
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / RUN_METADATA_FILENAME).write_text(
+                    json.dumps(
+                        metadata.model_dump(mode="json"),
+                        indent=2,
+                        sort_keys=True,
+                        ensure_ascii=False,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+            except OSError as marker_exc:  # pragma: no cover - persistent disk failure
+                log.error(
+                    "run_artifact_failure_marker_write_failed",
+                    run_id=metadata.run_id,
+                    artifact="artifacts.open",
+                    error=str(marker_exc),
+                )
             log.error("run_artifact_open_failed", run_id=metadata.run_id, error=str(exc))
 
     def _close_writer(self) -> None:
@@ -450,9 +551,236 @@ def list_run_artifacts(run_id: str, *, root: Path | str | None = None) -> list[s
     return sorted(entry.name for entry in directory.iterdir() if entry.is_file())
 
 
+def _inspect_event_log(
+    run_id: str, path: Path
+) -> tuple[bytes, list[dict[str, Any]], dict[str, Any]]:
+    """Read one immutable snapshot and derive the three seal facts from it."""
+
+    if not path.is_file():
+        raise RunArtifactError(
+            RunArtifactErrorCode.corrupt_event_log,
+            f"finalized run {run_id!r} 缺少 {EVENTS_FILENAME}",
+            run_id=run_id,
+            path=path,
+            details={"reason": "events_file_missing"},
+        )
+    try:
+        payload = path.read_bytes()
+    except OSError as exc:
+        raise RunArtifactError(
+            RunArtifactErrorCode.corrupt_event_log,
+            f"run {run_id!r} 的 {EVENTS_FILENAME} 无法读取: {exc}",
+            run_id=run_id,
+            path=path,
+            details={"reason": "events_file_unreadable", "error": str(exc)},
+        ) from exc
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RunArtifactError(
+            RunArtifactErrorCode.corrupt_event_log,
+            f"run {run_id!r} 的 {EVENTS_FILENAME} 不是合法 UTF-8: {exc}",
+            run_id=run_id,
+            path=path,
+            details={"reason": "events_file_not_utf8", "error": str(exc)},
+        ) from exc
+
+    events: list[dict[str, Any]] = []
+    for line_number, raw in enumerate(text.splitlines(), start=1):
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        try:
+            event = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            raise RunArtifactError(
+                RunArtifactErrorCode.corrupt_event_log,
+                f"run {run_id!r} 的 {EVENTS_FILENAME} "
+                f"第 {line_number} 行无法解析: {exc}",
+                run_id=run_id,
+                path=path,
+                details={"line": line_number, "error": str(exc)},
+            ) from exc
+        if not isinstance(event, dict):
+            raise RunArtifactError(
+                RunArtifactErrorCode.corrupt_event_log,
+                f"run {run_id!r} 的 {EVENTS_FILENAME} "
+                f"第 {line_number} 行必须是 JSON object",
+                run_id=run_id,
+                path=path,
+                details={"line": line_number, "reason": "event_not_object"},
+            )
+        events.append(event)
+
+    final_seq = -1
+    if events:
+        candidate = events[-1].get("seq")
+        if (
+            isinstance(candidate, bool)
+            or not isinstance(candidate, int)
+            or candidate < 0
+        ):
+            raise RunArtifactError(
+                RunArtifactErrorCode.corrupt_event_log,
+                f"run {run_id!r} 的末条事件没有合法 seq",
+                run_id=run_id,
+                path=path,
+                details={"reason": "invalid_final_seq", "actual": candidate},
+            )
+        final_seq = candidate
+
+    facts = {
+        "event_count": len(events),
+        "final_seq": final_seq,
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
+    return payload, events, facts
+
+
+def _require_events_integrity(
+    run_id: str, metadata: Mapping[str, Any], metadata_path: Path
+) -> dict[str, Any]:
+    if metadata.get("run_id") != run_id:
+        raise RunArtifactError(
+            RunArtifactErrorCode.corrupt_run_metadata,
+            f"run metadata run_id {metadata.get('run_id')!r} "
+            f"与请求的 {run_id!r} 不一致",
+            run_id=run_id,
+            path=metadata_path,
+            details={"expected": run_id, "actual": metadata.get("run_id")},
+        )
+    if metadata.get("ended_at") is None:
+        raise RunArtifactError(
+            RunArtifactErrorCode.unsupported_run_artifact,
+            f"run {run_id!r} 尚未 finalized，不能验证稳定 trace",
+            run_id=run_id,
+            path=metadata_path,
+            details={"reason": "run_not_finalized"},
+        )
+
+    integrity = metadata.get("events_integrity")
+    if integrity is None:
+        raise RunArtifactError(
+            RunArtifactErrorCode.unsupported_run_artifact,
+            f"run {run_id!r} 缺少 events_integrity；旧工件不能作为完整 trace",
+            run_id=run_id,
+            path=metadata_path,
+            details={
+                "reason": "events_integrity_missing",
+                "required_fields": ["event_count", "final_seq", "sha256"],
+            },
+        )
+    if not isinstance(integrity, dict):
+        raise RunArtifactError(
+            RunArtifactErrorCode.corrupt_run_metadata,
+            f"run {run_id!r} 的 events_integrity 必须是 JSON object",
+            run_id=run_id,
+            path=metadata_path,
+            details={"reason": "events_integrity_not_object"},
+        )
+    required = {"event_count", "final_seq", "sha256"}
+    missing = sorted(required - integrity.keys())
+    if missing:
+        raise RunArtifactError(
+            RunArtifactErrorCode.unsupported_run_artifact,
+            f"run {run_id!r} 的 events_integrity 缺字段: {', '.join(missing)}",
+            run_id=run_id,
+            path=metadata_path,
+            details={"reason": "events_integrity_incomplete", "missing": missing},
+        )
+
+    event_count = integrity["event_count"]
+    final_seq = integrity["final_seq"]
+    sha256 = integrity["sha256"]
+    valid = (
+        not isinstance(event_count, bool)
+        and isinstance(event_count, int)
+        and event_count >= 0
+        and not isinstance(final_seq, bool)
+        and isinstance(final_seq, int)
+        and final_seq >= -1
+        and isinstance(sha256, str)
+        and re.fullmatch(r"[0-9a-f]{64}", sha256) is not None
+    )
+    if not valid:
+        raise RunArtifactError(
+            RunArtifactErrorCode.corrupt_run_metadata,
+            f"run {run_id!r} 的 events_integrity 字段类型或取值无效",
+            run_id=run_id,
+            path=metadata_path,
+            details={"reason": "events_integrity_invalid", "actual": dict(integrity)},
+        )
+    return {
+        "event_count": event_count,
+        "final_seq": final_seq,
+        "sha256": sha256,
+    }
+
+
+def _verified_event_log_snapshot(
+    run_id: str,
+    *,
+    metadata: Mapping[str, Any] | None = None,
+    root: Path | str | None = None,
+) -> tuple[bytes, list[dict[str, Any]], dict[str, Any]]:
+    directory = _require_run_dir(run_id, root=root)
+    effective_metadata = (
+        read_run_metadata(run_id, root=root) if metadata is None else metadata
+    )
+    expected = _require_events_integrity(
+        run_id, effective_metadata, directory / RUN_METADATA_FILENAME
+    )
+    payload, events, actual = _inspect_event_log(run_id, directory / EVENTS_FILENAME)
+    mismatches = {
+        field: {"expected": expected[field], "actual": actual[field]}
+        for field in ("event_count", "final_seq", "sha256")
+        if expected[field] != actual[field]
+    }
+    if mismatches:
+        raise RunArtifactError(
+            RunArtifactErrorCode.corrupt_event_log,
+            f"run {run_id!r} 的 {EVENTS_FILENAME} 与 finalized seal 不一致",
+            run_id=run_id,
+            path=directory / EVENTS_FILENAME,
+            details={"reason": "events_integrity_mismatch", "mismatches": mismatches},
+        )
+    return payload, events, actual
+
+
+def verify_finalized_event_log(
+    run_id: str,
+    *,
+    metadata: Mapping[str, Any] | None = None,
+    root: Path | str | None = None,
+) -> dict[str, Any]:
+    """Verify a finalized trace seal and return its observed integrity facts."""
+
+    _, _, facts = _verified_event_log_snapshot(run_id, metadata=metadata, root=root)
+    return facts
+
+
+def read_verified_event_log_bytes(
+    run_id: str,
+    *,
+    metadata: Mapping[str, Any] | None = None,
+    root: Path | str | None = None,
+) -> bytes:
+    """Return the exact byte snapshot that passed the finalized trace seal."""
+
+    payload, _, _ = _verified_event_log_snapshot(run_id, metadata=metadata, root=root)
+    return payload
+
+
 def iter_run_events(
-    run_id: str, *, root: Path | str | None = None
+    run_id: str,
+    *,
+    root: Path | str | None = None,
+    verify_integrity: bool = True,
 ) -> Iterator[dict[str, Any]]:
+    if verify_integrity:
+        _, events, _ = _verified_event_log_snapshot(run_id, root=root)
+        yield from events
+        return
     directory = _require_run_dir(run_id, root=root)
     path = directory / EVENTS_FILENAME
     if not path.is_file():
@@ -495,14 +823,34 @@ def read_run_events(
     offset: int = 0,
     limit: int | None = None,
     root: Path | str | None = None,
+    verify_integrity: bool | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """读并过滤一个 run 的事件，返回 ``(页内事件, 过滤后总数)``。
 
     分页在过滤**之后**：``total`` 回答"符合条件的一共多少条"，前端据此决定还要不要翻页。
     """
 
+    # Active JSON polling must remain available before a seal exists.  Once the
+    # run is finalized, the same public read becomes evidence-bearing and must
+    # reject a truncated/mismatched artifact.  Evaluator passes False so it can
+    # retain its more specific schema/sequence diagnostics before checking seal.
+    if verify_integrity is None:
+        metadata = read_run_metadata(run_id, root=root)
+        if metadata.get("ended_at") is not None:
+            _, event_stream, _ = _verified_event_log_snapshot(
+                run_id, metadata=metadata, root=root
+            )
+        else:
+            event_stream = iter_run_events(
+                run_id, root=root, verify_integrity=False
+            )
+    elif verify_integrity:
+        _, event_stream, _ = _verified_event_log_snapshot(run_id, root=root)
+    else:
+        event_stream = iter_run_events(run_id, root=root, verify_integrity=False)
+
     matched: list[dict[str, Any]] = []
-    for event in iter_run_events(run_id, root=root):
+    for event in event_stream:
         if correlation_id is not None and event.get("correlation_id") != correlation_id:
             continue
         if event_type is not None and event.get("event_type") != event_type:

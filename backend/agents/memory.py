@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
+from collections.abc import Mapping
+from typing import Any
 
 from backend.engine.event_bus import SimEvent
 
@@ -84,4 +86,26 @@ class AgentMemoryStore:
                 f" property={event.data.get('property') or '-'}"
             )
 
-        return f"{event.event_type}: {event.data}"
+        return f"{event.event_type}: {AgentMemoryStore._stable_event_data(event.data)}"
+
+    @staticmethod
+    def _stable_event_data(value: Any) -> Any:
+        """Remove transport identities before event memory enters an LLM prompt."""
+
+        if isinstance(value, Mapping):
+            return {
+                str(key): AgentMemoryStore._stable_event_data(item)
+                for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+                if key
+                not in {
+                    "event_id",
+                    "trigger_event_id",
+                    "caused_by_event_id",
+                    "correlation_id",
+                    "causal_parent",
+                    "run_id",
+                }
+            }
+        if isinstance(value, (list, tuple)):
+            return [AgentMemoryStore._stable_event_data(item) for item in value]
+        return value

@@ -106,7 +106,7 @@ metrics:
   - first_action_latency_ms
   - command_failure_count
   - device_state_match_rate
-  - unnecessary_command_count
+  - user_intent_satisfied
 
 ground_truth:
   user_goal: "把有人的客厅温度降回舒适区，同时不无谓地拉高能耗"
@@ -122,7 +122,8 @@ ground_truth:
     - light_bedroom_01
   required_agent_roles: ["hvac"]
   acceptable_noop: false
-  expected_intent: "heat_relief"
+  # 有人房间的 temperature_threshold 在运行时权威词表中归为 comfort。
+  expected_intent: "temperature_comfort"
   safety_constraints:
     - "do_not_set_target_temp_below_16"
     - "prefer_low_energy_options_before_hvac"

@@ -14,10 +14,12 @@ S2 之前事件只活在 EventBus 的 1000 条环形历史里：进程一停就�
 
 from __future__ import annotations
 
+import hashlib
 import json
 
 import pytest
 
+import backend.engine.event_log as event_log_module
 from backend.api.ws import ConnectionManager
 from backend.engine.event_bus import EventBus, SimEvent
 from backend.engine.event_log import (
@@ -29,6 +31,7 @@ from backend.engine.event_log import (
     read_run_events,
     read_run_metadata,
     run_dir,
+    verify_finalized_event_log,
 )
 from backend.engine.event_types import TIMER_TICK_EVENT_TYPE
 from backend.engine.run_manager import SPEC11_REQUIRED_FIELDS, new_run_id
@@ -42,6 +45,7 @@ from backend.engine.state import (
 )
 from backend.engine.state_manager import StateManager
 from backend.scenarios.spec import ScenarioSpec
+from backend.scenarios.trace import export_canonical_trace
 
 pytestmark = pytest.mark.anyio
 
@@ -204,6 +208,76 @@ async def test_two_runs_produce_isolated_artifacts_no_cross_contamination():
     assert second_meta["end_reason"] == "closed"
 
 
+async def test_recorder_rejects_cross_run_event_and_marks_artifact_invalid():
+    engine = _make_engine()
+    run_id = engine.run_id
+    assert run_id is not None
+    foreign_run_id = new_run_id()
+
+    engine.run_artifacts.record(
+        SimEvent(
+            event_type="test.cross_run",
+            source="test",
+            timestamp=0.0,
+            run_id=foreign_run_id,
+            seq=0,
+        )
+    )
+    await engine.close()
+
+    metadata = read_run_metadata(run_id)
+    assert foreign_run_id in metadata["artifact_error"]
+    assert not any(
+        event.get("run_id") == foreign_run_id for event in _read_lines(run_id)
+    )
+
+
+async def test_midstream_event_write_failure_survives_recovery_and_finalize():
+    """A transient disk failure must not later finalize as a valid short prefix."""
+
+    engine = _make_engine()
+    run_id = engine.run_id
+    assert run_id is not None
+    writer = engine.run_artifacts.writer
+    assert writer is not None
+    real_handle = writer._handle
+
+    class FailOnceHandle:
+        failed = False
+
+        def write(self, value):
+            if not self.failed:
+                self.failed = True
+                raise OSError("injected event write failure")
+            return real_handle.write(value)
+
+        def flush(self):
+            return real_handle.flush()
+
+        def fileno(self):
+            return real_handle.fileno()
+
+        def close(self):
+            return real_handle.close()
+
+    writer._handle = FailOnceHandle()  # type: ignore[assignment]
+    engine.run_artifacts.record(
+        SimEvent(
+            event_type="test.write_failure",
+            source="test",
+            timestamp=0.0,
+            run_id=run_id,
+            seq=0,
+        )
+    )
+    await engine.close()
+
+    metadata = read_run_metadata(run_id)
+    assert metadata["ended_at"] is not None
+    assert metadata["artifact_error"] == "events: injected event write failure"
+    assert _read_lines(run_id) == []
+
+
 # --------------------------------------------------------------- 3. run.json §11 字段
 
 
@@ -217,9 +291,142 @@ async def test_run_json_carries_all_spec11_fields():
     missing = [field for field in SPEC11_REQUIRED_FIELDS if field not in metadata]
     assert missing == [], f"run.json 缺 §11 字段: {missing}"
     # §11.1：每份 run 工件都必须标注用的是哪种 LLM 决定性模式。
-    assert metadata["llm_mode"] in {"mocked", "recorded", "live"}
+    assert metadata["llm_mode"] in {"mocked", "recorded", "live", "rule_based"}
     assert len(metadata["initial_state_hash"]) == 64
+    assert metadata["events_integrity"] == {
+        "event_count": 0,
+        "final_seq": -1,
+        "sha256": hashlib.sha256(b"").hexdigest(),
+    }
     assert (run_dir(run_id) / RUN_METADATA_FILENAME).exists()
+
+
+async def test_finalize_closes_events_before_persisting_integrity_metadata(monkeypatch):
+    """The seal must describe durable bytes, not a still-buffered file prefix."""
+
+    bus = EventBus()
+    engine = _make_engine(bus)
+    run_id = engine.run_id
+    writer = engine.run_artifacts.writer
+    assert run_id is not None and writer is not None
+
+    operations: list[str] = []
+    original_write_metadata = writer.write_metadata
+    original_fsync = event_log_module.os.fsync
+    events_fd = writer._handle.fileno()
+
+    def track_fsync(fd: int) -> None:
+        if not writer._handle.closed and fd == events_fd:
+            operations.append("events_fsync")
+        return original_fsync(fd)
+
+    def write_metadata_after_close() -> None:
+        if writer.metadata.ended_at is not None:
+            operations.append(
+                "metadata_after_close"
+                if writer._handle.closed
+                else "metadata_before_close"
+            )
+        original_write_metadata()
+
+    monkeypatch.setattr(event_log_module.os, "fsync", track_fsync)
+    writer.write_metadata = write_metadata_after_close  # type: ignore[method-assign]
+    await bus.publish(
+        SimEvent(event_type="test.integrity", source="test", timestamp=0.0)
+    )
+    await engine.close()
+
+    events_path = run_dir(run_id) / EVENTS_FILENAME
+    events = _read_lines(run_id)
+    metadata = read_run_metadata(run_id)
+    integrity = metadata["events_integrity"]
+
+    assert operations[:2] == ["events_fsync", "metadata_after_close"]
+    assert integrity == {
+        "event_count": len(events),
+        "final_seq": events[-1]["seq"],
+        "sha256": hashlib.sha256(events_path.read_bytes()).hexdigest(),
+    }
+    assert verify_finalized_event_log(run_id) == integrity
+
+
+async def test_complete_event_suffix_truncation_is_detected():
+    """Removing whole JSONL records must not look like a valid shorter trace."""
+
+    bus = EventBus()
+    engine = _make_engine(bus)
+    run_id = engine.run_id
+    assert run_id is not None
+    await bus.publish(SimEvent(event_type="test.first", source="test", timestamp=0.0))
+    await bus.publish(SimEvent(event_type="test.last", source="test", timestamp=1.0))
+    await engine.close()
+
+    events_path = run_dir(run_id) / EVENTS_FILENAME
+    lines = events_path.read_bytes().splitlines(keepends=True)
+    assert len(lines) >= 2
+    events_path.write_bytes(b"".join(lines[:-1]))
+
+    with pytest.raises(RunArtifactError) as excinfo:
+        verify_finalized_event_log(run_id)
+    assert excinfo.value.code is RunArtifactErrorCode.corrupt_event_log
+    assert "event_count" in excinfo.value.details["mismatches"]
+
+    with pytest.raises(RunArtifactError) as export_excinfo:
+        export_canonical_trace(run_id)
+    assert export_excinfo.value.code is RunArtifactErrorCode.corrupt_event_log
+
+
+@pytest.mark.parametrize("missing_field", [None, "event_count", "final_seq", "sha256"])
+async def test_finalized_artifact_with_missing_event_integrity_is_unsupported(
+    missing_field: str | None,
+):
+    engine = _make_engine()
+    run_id = engine.run_id
+    assert run_id is not None
+    await engine.close()
+
+    metadata_path = run_dir(run_id) / RUN_METADATA_FILENAME
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if missing_field is None:
+        metadata.pop("events_integrity")
+    else:
+        metadata["events_integrity"].pop(missing_field)
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    with pytest.raises(RunArtifactError) as excinfo:
+        verify_finalized_event_log(run_id)
+    assert excinfo.value.code is RunArtifactErrorCode.unsupported_run_artifact
+    assert excinfo.value.details["reason"] in {
+        "events_integrity_missing",
+        "events_integrity_incomplete",
+    }
+    if missing_field is not None:
+        assert missing_field in excinfo.value.details["missing"]
+
+
+@pytest.mark.parametrize("field_name", ["event_count", "final_seq", "sha256"])
+async def test_event_integrity_mismatch_is_rejected(field_name: str):
+    bus = EventBus()
+    engine = _make_engine(bus)
+    run_id = engine.run_id
+    assert run_id is not None
+    await bus.publish(
+        SimEvent(event_type="test.integrity", source="test", timestamp=0.0)
+    )
+    await engine.close()
+
+    metadata_path = run_dir(run_id) / RUN_METADATA_FILENAME
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if field_name == "sha256":
+        metadata["events_integrity"][field_name] = "0" * 64
+    else:
+        metadata["events_integrity"][field_name] += 1
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    with pytest.raises(RunArtifactError) as excinfo:
+        verify_finalized_event_log(run_id)
+    assert excinfo.value.code is RunArtifactErrorCode.corrupt_event_log
+    assert field_name in excinfo.value.details["mismatches"]
 
 
 # ------------------------------------------------------------------ 4. 读侧过滤

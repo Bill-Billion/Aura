@@ -19,6 +19,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from typing import Any
+
 __all__ = [
     "USER_ARRIVES_HOME",
     "USER_LEAVES_HOME",
@@ -49,6 +52,7 @@ __all__ = [
     "COMPAT_ALIAS",
     "compat_event_type",
     "is_root_event",
+    "starts_agent_episode",
     "OUTSIDE_ROOM_ID",
 ]
 
@@ -172,4 +176,24 @@ def compat_event_type(event_type: str) -> str:
 def is_root_event(event_type: str) -> bool:
     """是否是一条会开启新因果链的根事件（§4.4）。"""
 
+    return event_type in ALL_ROOT_EVENT_TYPES
+
+
+def starts_agent_episode(event_type: str, data: Mapping[str, Any] | None = None) -> bool:
+    """Return whether an event opens an agent episode.
+
+    This semantic trigger is intentionally independent of ``causal_parent``:
+    compatibility ``environment.state_refresh`` events are children of timer
+    ticks, yet significant ones still open real runtime episodes.
+    """
+
+    payload = data or {}
+    if event_type in ENVIRONMENT_ROOT_EVENT_TYPES:
+        reasons = payload.get("significant_change_reasons")
+        return isinstance(reasons, list) and bool(reasons)
+    if event_type == USER_COMMAND:
+        if payload.get("message_type") == "CMD_DEVICE_CONTROL":
+            return False
+        if payload.get("device_id") and (payload.get("capability") or payload.get("property")):
+            return False
     return event_type in ALL_ROOT_EVENT_TYPES

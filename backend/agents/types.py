@@ -1,8 +1,33 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+
+# These bounds are part of the paid-provider boundary, not presentation hints.
+# They keep a malformed/adversarial structured response from turning one accepted
+# decision into an effectively unbounded bill or trace artifact.
+MAX_AGENT_ID_CHARS = 128
+MAX_AGENT_NAME_CHARS = 160
+MAX_EVENT_TYPE_CHARS = 160
+MAX_WORLD_SUMMARY_CHARS = 16_384
+MAX_RECENT_EVENTS = 32
+MAX_RECENT_EVENT_CHARS = 2_048
+MAX_AVAILABLE_DEVICES = 128
+MAX_ALLOWED_COMMANDS = 256
+MAX_REQUEST_JSON_BYTES = 256 * 1_024
+
+MAX_INTENT_CHARS = 256
+MAX_EXPLANATION_CHARS = 2_048
+MAX_TASK_STEPS = 8
+MAX_TASK_STEP_CHARS = 512
+MAX_PROPOSED_COMMANDS = 32
+MAX_DEVICE_ID_CHARS = 256
+MAX_PROPERTY_CHARS = 256
+MAX_COMMAND_REASON_CHARS = 512
+MAX_DECISION_JSON_BYTES = 32 * 1_024
 
 
 PriorityLabel = Literal[
@@ -16,29 +41,64 @@ PriorityLabel = Literal[
 
 
 class AgentCommandProposal(BaseModel):
-    device_id: str
-    property: str
+    device_id: str = Field(max_length=MAX_DEVICE_ID_CHARS)
+    property: str = Field(max_length=MAX_PROPERTY_CHARS)
     value: Any
-    reason: str = ""
+    reason: str = Field(default="", max_length=MAX_COMMAND_REASON_CHARS)
 
 
 class AgentLLMDecision(BaseModel):
-    intent: str
+    intent: str = Field(max_length=MAX_INTENT_CHARS)
     confidence: float = Field(ge=0.0, le=1.0)
-    task_steps: list[str] = Field(default_factory=list)
-    proposed_commands: list[AgentCommandProposal] = Field(default_factory=list)
-    explanation: str
+    task_steps: list[str] = Field(default_factory=list, max_length=MAX_TASK_STEPS)
+    proposed_commands: list[AgentCommandProposal] = Field(
+        default_factory=list,
+        max_length=MAX_PROPOSED_COMMANDS,
+    )
+    explanation: str = Field(max_length=MAX_EXPLANATION_CHARS)
     needs_coordination: bool = False
+
+    @model_validator(mode="after")
+    def validate_bounded_payload(self) -> "AgentLLMDecision":
+        if any(len(step) > MAX_TASK_STEP_CHARS for step in self.task_steps):
+            raise ValueError(f"task_steps 每项不能超过 {MAX_TASK_STEP_CHARS} 个字符")
+        encoded = json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded) > MAX_DECISION_JSON_BYTES:
+            raise ValueError(f"LLM 决策 JSON 不能超过 {MAX_DECISION_JSON_BYTES} 字节")
+        return self
 
 
 class LLMDecisionRequest(BaseModel):
-    agent_id: str
-    agent_name: str
-    root_event_type: str
-    world_summary: str
-    recent_events: list[str] = Field(default_factory=list)
-    available_devices: list[dict[str, Any]] = Field(default_factory=list)
-    allowed_commands: list[dict[str, Any]] = Field(default_factory=list)
+    agent_id: str = Field(max_length=MAX_AGENT_ID_CHARS)
+    agent_name: str = Field(max_length=MAX_AGENT_NAME_CHARS)
+    root_event_type: str = Field(max_length=MAX_EVENT_TYPE_CHARS)
+    world_summary: str = Field(max_length=MAX_WORLD_SUMMARY_CHARS)
+    recent_events: list[str] = Field(default_factory=list, max_length=MAX_RECENT_EVENTS)
+    available_devices: list[dict[str, Any]] = Field(
+        default_factory=list,
+        max_length=MAX_AVAILABLE_DEVICES,
+    )
+    allowed_commands: list[dict[str, Any]] = Field(
+        default_factory=list,
+        max_length=MAX_ALLOWED_COMMANDS,
+    )
+
+    @model_validator(mode="after")
+    def validate_bounded_payload(self) -> "LLMDecisionRequest":
+        if any(len(event) > MAX_RECENT_EVENT_CHARS for event in self.recent_events):
+            raise ValueError(f"recent_events 每项不能超过 {MAX_RECENT_EVENT_CHARS} 个字符")
+        encoded = json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded) > MAX_REQUEST_JSON_BYTES:
+            raise ValueError(f"LLM 请求 JSON 不能超过 {MAX_REQUEST_JSON_BYTES} 字节")
+        return self
 
 
 class AgentDecisionEnvelope(BaseModel):

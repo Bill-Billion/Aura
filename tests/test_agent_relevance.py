@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import pytest
 
+from backend.agents.arbiter import ARBITER_ID
 from backend.agents.hvac import HVACAgent
 from backend.agents.lighting import LightingAgent
 from backend.agents.llm import LLMProvider, LLMProviderError
@@ -208,8 +209,14 @@ def test_every_root_event_type_declares_its_device_relevance():
 
 
 @pytest.mark.anyio
-async def test_offline_camera_produces_no_agent_episode_at_runtime():
-    """端到端：摄像头掉线不再触发任何一条推理链（episode 爆炸的直接度量）。"""
+async def test_offline_camera_only_wakes_the_security_agent_at_runtime():
+    """端到端：摄像头掉线只惊动安防域，照明/空调/能耗/场景一律不开 episode。
+
+    S3-T4 之前这条断言写的是"**任何** agent 都不该跑"——那时没有 agent 控摄像头，
+    所以掉线事件在相关性判定里全被判掉。现在 SecurityAgent 控 camera（观测覆盖用），
+    §7 那行 *fail closed and explain* 终于有了落点：安防域必须醒过来说清覆盖丢没丢。
+    收口的度量因此从"零 episode"变成"只有安防域一条"。
+    """
 
     engine = SimulationEngine(
         event_bus=EventBus(),
@@ -242,12 +249,22 @@ async def test_offline_camera_produces_no_agent_episode_at_runtime():
     await engine.close()
 
     def reasoning_agents(root: SimEvent) -> set[str]:
+        # S3-T3 起，一条 episode 里除了域 agent 的推理链，还有编排层自己的三环
+        # （source=home_orchestrator，data 里是 orchestrator_id 而不是 agent_id）。
+        # 本条测的是"哪些**域 agent**被卷进来了"，因此按 agent_id 这把钥匙取，
+        # 编排层事件天然不在其中。
+        #
+        # S3-T5 起还要再排掉仲裁器：一条 episode 只发一条
+        # ``reasoning.coordination_decision``，它的 data 里带 ``agent_id=arbiter``
+        # （前端面板冻结期仍读这个键）。仲裁器不是域 agent，它出现不代表谁被叫醒了。
         return {
-            str(event.data.get("agent_id"))
+            str(event.data["agent_id"])
             for event in collected
             if event.event_type.startswith("reasoning.")
             and event.correlation_id == root.correlation_id
+            and "agent_id" in event.data
+            and event.data["agent_id"] != ARBITER_ID
         }
 
-    assert reasoning_agents(camera_offline) == set()
+    assert reasoning_agents(camera_offline) == {"security_agent"}
     assert reasoning_agents(ac_offline) == {"hvac_agent"}

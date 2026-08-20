@@ -92,7 +92,7 @@ success_criteria:
 metrics:
   - first_action_latency_ms
   - command_failure_count
-  - unnecessary_command_count
+  - user_intent_satisfied
 
 ground_truth:
   user_goal: "夜间无人时发现门口有人，给出可见的安防响应"
