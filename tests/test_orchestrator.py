@@ -18,7 +18,6 @@ from __future__ import annotations
 import inspect
 
 import pytest
-import structlog
 
 from backend.agents import base as base_module
 from backend.agents.contracts import (
@@ -35,12 +34,10 @@ from backend.agents.llm import LLMProvider, LLMProviderError
 from backend.agents.orchestrator import (
     DEFAULT_ORCHESTRATOR_ID,
     MIN_CONFIDENCE_ENV,
-    ORCHESTRATOR_ENABLED_ENV,
     ORCHESTRATOR_INTENT_SCHEMA,
     DomainAgentBinding,
     HomeOrchestratorAgent,
     classify_intent_rule_based,
-    orchestrator_enabled,
     rule_based_confidence,
 )
 from backend.agents.types import AgentLLMDecision, LLMDecisionRequest
@@ -378,43 +375,6 @@ async def test_orchestrator_never_mutates_world():
     assert not hasattr(HomeOrchestratorAgent(), "apply_action")
 
 
-def test_orchestrator_enabled_flag_defaults_on_and_can_be_switched_off():
-    assert orchestrator_enabled({}) is True
-    assert orchestrator_enabled({ORCHESTRATOR_ENABLED_ENV: "0"}) is False
-    assert orchestrator_enabled({ORCHESTRATOR_ENABLED_ENV: "false"}) is False
-    assert orchestrator_enabled({ORCHESTRATOR_ENABLED_ENV: "1"}) is True
-
-
-def test_disabling_the_orchestrator_warns_at_startup(monkeypatch):
-    """逃生阀不许静默：关掉编排器 = 任务分解退回审计坑 (c) 的自由文本路径。
-
-    默认开 + 静默关意味着一条流水线可以被无声降级，事后没人能从日志里看出
-    这批数据是哪条路径产的。所以关闭必须在启动时留下一条 warning。
-    """
-
-    from backend.agents.runtime import AgentRuntime
-
-    monkeypatch.setenv(ORCHESTRATOR_ENABLED_ENV, "0")
-    with structlog.testing.capture_logs() as logs:
-        runtime = AgentRuntime()
-
-    assert runtime.orchestrator_enabled is False
-    warnings = [
-        entry
-        for entry in logs
-        if entry["event"] == "orchestrator_disabled" and entry["log_level"] == "warning"
-    ]
-    assert len(warnings) == 1, "关闭编排器必须且只需喊一声"
-    assert warnings[0]["env_var"] == ORCHESTRATOR_ENABLED_ENV
-    assert "task_decomposition" in warnings[0]["impact"]
-
-    # 负控：开着的时候不许喊狼来了，否则这条 warning 很快就没人看了。
-    monkeypatch.setenv(ORCHESTRATOR_ENABLED_ENV, "1")
-    with structlog.testing.capture_logs() as logs:
-        assert AgentRuntime().orchestrator_enabled is True
-    assert [entry for entry in logs if entry["event"] == "orchestrator_disabled"] == []
-
-
 async def test_rule_path_labels_itself_rule_based_not_mocked():
     """§11.1：没有任何 LLM 的编排结论必须自报 ``rule_based``。
 
@@ -494,8 +454,6 @@ def _sim_events(engine):
 
 
 async def test_runtime_emits_orchestrator_reasoning_events_under_one_correlation(monkeypatch):
-    # 显式钉住开关：本条测的是"编排器开着的时候长什么样"，不能被外部环境变量改掉语义。
-    monkeypatch.setenv(ORCHESTRATOR_ENABLED_ENV, "1")
     from backend.agents.runtime import DisabledLLMProvider
 
     engine = _engine(DisabledLLMProvider())
@@ -544,7 +502,6 @@ async def test_runtime_dispatches_only_agents_named_by_the_plan(monkeypatch):
 
     from backend.agents.runtime import DisabledLLMProvider
 
-    monkeypatch.setenv(ORCHESTRATOR_ENABLED_ENV, "1")
     engine = _engine(DisabledLLMProvider())
     root = SimEvent(
         event_type="user.starts_activity",
@@ -564,32 +521,6 @@ async def test_runtime_dispatches_only_agents_named_by_the_plan(monkeypatch):
     }
     assert "lighting_agent" in reasoning_agents
     assert "hvac_agent" not in reasoning_agents
-
-
-async def test_orchestrator_can_be_disabled_restoring_fan_out(monkeypatch):
-    monkeypatch.setenv(ORCHESTRATOR_ENABLED_ENV, "0")
-    from backend.agents.runtime import DisabledLLMProvider
-
-    engine = _engine(DisabledLLMProvider())
-    assert engine.agent_runtime.orchestrator_enabled is False
-    root = SimEvent(
-        event_type="user.starts_activity",
-        source="test",
-        timestamp=1.0,
-        data={"user_id": "user_01", "activity": "cooking", "room_id": "kitchen"},
-    )
-    await engine.event_bus.publish(root)
-    assert await engine.agent_runtime.wait_for_idle(timeout=10.0)
-    await engine.close()
-
-    events = [e for e in _sim_events(engine) if e["correlation_id"] == root.correlation_id]
-    sources = {e["source"] for e in events}
-    assert DEFAULT_ORCHESTRATOR_ID not in sources
-    reasoning_agents = {
-        e["data"].get("agent_id") for e in events if e["event_type"].startswith("reasoning.")
-    }
-    # 旧扇出路径：所有 is_relevant 的 agent 都跑
-    assert {"lighting_agent", "hvac_agent"} <= reasoning_agents
 
 
 async def test_domain_agent_receives_its_domain_task():
@@ -627,7 +558,6 @@ async def test_domain_agent_receives_its_domain_task():
 async def test_low_confidence_episode_is_visible_but_executes_nothing(monkeypatch):
     """审计坑的端到端版：阈值拉满时，episode 仍可见，但一条设备命令都不许落地。"""
 
-    monkeypatch.setenv(ORCHESTRATOR_ENABLED_ENV, "1")
     monkeypatch.setenv(MIN_CONFIDENCE_ENV, "1.0")
     from backend.agents.runtime import DisabledLLMProvider
 

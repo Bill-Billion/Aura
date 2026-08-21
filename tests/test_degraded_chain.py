@@ -26,7 +26,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from backend.agents.llm import LLMProviderError
-from backend.agents.orchestrator import DEFAULT_ORCHESTRATOR_ID, ORCHESTRATOR_ENABLED_ENV
+from backend.agents.orchestrator import DEFAULT_ORCHESTRATOR_ID
 from backend.agents.runtime import AgentRuntime, DisabledLLMProvider
 from backend.engine.run_manager import LLMMode
 from backend.scenarios.runner import ScenarioRunResult, run_scenario
@@ -55,7 +55,6 @@ PROVIDER_ENV_VARS = (
 def no_api_key(monkeypatch):
     """把 key 全部拔掉（= 用户从 .env.local 里删掉配置的那一刻）。"""
 
-    monkeypatch.setenv(ORCHESTRATOR_ENABLED_ENV, "1")
     for name in PROVIDER_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
 

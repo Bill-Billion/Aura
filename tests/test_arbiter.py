@@ -24,6 +24,7 @@ import itertools
 import pytest
 
 from backend.agents.arbiter import (
+    ARBITER_ID,
     COORDINATION_DECISION_EVENT_TYPE,
     UI_ACTOR_ID,
     Arbiter,
@@ -39,7 +40,7 @@ from backend.agents.contracts import (
     ProposalOutcome,
     priority_rank,
 )
-from backend.agents.energy import ENERGY_AGENT_ID, EnergyVeto, EnergyVetoReview
+from backend.agents.energy import EnergyVeto, EnergyVetoReview
 from backend.agents.types import AgentCommandProposal
 from backend.engine.event_bus import SimEvent
 from backend.engine.state import (
@@ -414,9 +415,10 @@ def test_result_contains_approved_rejected_explanation_winning_priority():
     assert result.explanation
     assert result.winning_priority is PriorityLevel.COMFORT
 
-    # 兼容视图：runtime 仍按 agent 分组取胜出命令
-    assert set(result.winning_commands_by_agent) == {"hvac_agent", "energy_agent"}
-    assert len(result.winning_commands) == 2
+    assert {item.agent_id for item in result.approved_commands} == {
+        "hvac_agent",
+        "energy_agent",
+    }
 
 
 def test_event_data_carries_the_whole_result_for_one_coordination_decision():
@@ -443,6 +445,11 @@ def test_event_data_carries_the_whole_result_for_one_coordination_decision():
     assert data["conflicts"][0]["conflict_class"] == "same_device_property"
     # per-agent 结论从"每 agent 一条事件"降级为本事件里的一段分解（审计：仲裁全序名存实亡）
     assert {item["agent_id"] for item in data["per_agent"]} == {"lighting_agent", "scene_agent"}
+    # event schema 1.0 persisted-run compatibility.
+    assert data["agent_id"] == ARBITER_ID
+    assert data["outcome"] == "partial"
+    assert data["priority"] == "comfort"
+    assert [item["value"] for item in data["winning_commands"]] == [True]
 
 
 def test_non_action_proposals_are_reported_without_inventing_commands():

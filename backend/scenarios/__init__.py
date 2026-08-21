@@ -3,5 +3,5 @@
 对外入口只有这三样，其余模块内部实现不保证稳定：
   - ``backend.scenarios.spec``      —— 场景形状的唯一来源（含 §4.1 根事件分类学常量）
   - ``backend.scenarios.loader``    —— ``load_library(dirs)`` / ``load_scenario_file(path)``
-  - ``backend.scenarios.versioning``—— §14 版本比较（S4-T1 将整体搬进 backend/models/）
+  - ``backend.models.versioning``—— §14 版本比较
 """

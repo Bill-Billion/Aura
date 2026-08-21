@@ -354,22 +354,13 @@ def _scenario_context(spec: ScenarioSpec) -> dict[str, Any]:
 class ScenarioEvaluator:
     """Compute the seven canonical metrics against one ScenarioSpec contract."""
 
-    def __init__(
-        self,
-        success_criteria: dict[str, Any] | None = None,
-        *,
-        scenario: ScenarioSpec | None = None,
-    ) -> None:
+    def __init__(self, scenario: ScenarioSpec) -> None:
         self._scenario = scenario
-        self._criteria = (
-            scenario.success_criteria.model_dump(mode="json")
-            if scenario is not None
-            else dict(success_criteria or {})
-        )
+        self._criteria = scenario.success_criteria.model_dump(mode="json")
 
     @classmethod
     def from_scenario(cls, scenario: ScenarioSpec) -> "ScenarioEvaluator":
-        return cls(scenario=scenario)
+        return cls(scenario)
 
     def evaluate(
         self,
@@ -378,52 +369,29 @@ class ScenarioEvaluator:
         run_id: str = "",
         scenario_id: str | None = None,
         seed: int | None = None,
-        scenario: ScenarioSpec | None = None,
-        expected_failures: list[dict[str, Any]] | None = None,
-        expected_device_effects: list[dict[str, Any]] | None = None,
-        initial_device_states: dict[str, dict[str, Any]] | None = None,
-        ground_truth: dict[str, Any] | None = None,
-        device_rooms: dict[str, str] | None = None,
-        device_types: dict[str, str] | None = None,
         run_metadata: dict[str, Any] | None = None,
-        # Legacy loose filters remain accepted but cannot prove an expected failure.
-        expected_failure_device_ids: set[str] | None = None,
-        expected_failure_categories: set[str] | None = None,
     ) -> EvalReport:
-        resolved = scenario or self._scenario
-        if resolved is not None:
-            unknown_metrics = sorted(
-                set(resolved.metrics) - set(CANONICAL_METRIC_NAMES)
-            )
-            if unknown_metrics:
-                return _error_report(
-                    run_id,
-                    "ScenarioSpec declares unsupported required metric(s): "
-                    + ", ".join(unknown_metrics),
-                    scenario_id=scenario_id or resolved.id,
+        scenario = self._scenario
+        unknown_metrics = sorted(set(scenario.metrics) - set(CANONICAL_METRIC_NAMES))
+        if unknown_metrics:
+            return _error_report(
+                run_id,
+                "ScenarioSpec declares unsupported required metric(s): "
+                + ", ".join(unknown_metrics),
+                scenario_id=scenario_id or scenario.id,
+                seed=seed,
+                provenance=self._provenance(
+                    run_id=run_id,
+                    scenario=scenario,
+                    scenario_id=scenario_id or scenario.id,
                     seed=seed,
-                    provenance=self._provenance(
-                        run_id=run_id,
-                        scenario=resolved,
-                        scenario_id=scenario_id or resolved.id,
-                        seed=seed,
-                        run_metadata=run_metadata or {},
-                        events=events,
-                    ),
-                )
-            context = _scenario_context(resolved)
-            scenario_id = scenario_id or resolved.id
-            criteria = context["success_criteria"]
-        else:
-            context = {
-                "expected_failures": expected_failures or [],
-                "expected_device_effects": expected_device_effects or [],
-                "initial_device_states": initial_device_states or {},
-                "ground_truth": ground_truth,
-                "device_rooms": device_rooms or {},
-                "device_types": device_types or {},
-            }
-            criteria = self._criteria
+                    run_metadata=run_metadata or {},
+                    events=events,
+                ),
+            )
+        context = _scenario_context(scenario)
+        scenario_id = scenario_id or scenario.id
+        criteria = self._criteria
 
         collector = MetricsCollector(
             events=events,
@@ -456,11 +424,11 @@ class ScenarioEvaluator:
             has_expected_effects=bool(context["expected_device_effects"]),
             acceptable_noop=bool((context["ground_truth"] or {}).get("acceptable_noop", False)),
             has_expected_failures=bool(context["expected_failures"]),
-            required_metrics=(list(resolved.metrics) if resolved is not None else []),
+            required_metrics=list(scenario.metrics),
         )
         provenance = self._provenance(
             run_id=run_id,
-            scenario=resolved,
+            scenario=scenario,
             scenario_id=scenario_id,
             seed=seed,
             run_metadata=run_metadata or {},
@@ -480,9 +448,6 @@ class ScenarioEvaluator:
                 "total_events": len(events),
                 "total_episodes": len(collector.agent_episode_ids),
                 "total_commands": len(collector.final_command_events),
-                "legacy_expected_failure_filters_ignored": bool(
-                    expected_failure_device_ids or expected_failure_categories
-                ),
             },
         )
 
@@ -685,10 +650,6 @@ def evaluate_run(
     *,
     scenario_id: str | None = None,
     seed: int | None = None,
-    success_criteria: dict[str, Any] | None = None,
-    expected_failure_device_ids: set[str] | None = None,
-    expected_failure_categories: set[str] | None = None,
-    expected_device_effects: list[dict[str, Any]] | None = None,
     data_root: Path | str | None = None,
     scenario_dirs: Iterable[Path | str] | None = None,
 ) -> EvalReport:
@@ -871,14 +832,4 @@ def evaluate_run(
         seed=int(metadata_seed),
         run_metadata=metadata,
     )
-    if any(
-        value is not None
-        for value in (
-            success_criteria,
-            expected_failure_device_ids,
-            expected_failure_categories,
-            expected_device_effects,
-        )
-    ):
-        report.metadata["legacy_evaluate_run_overrides_ignored"] = True
     return report

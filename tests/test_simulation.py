@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -121,42 +121,6 @@ class TestAgentRuntime:
         assert len(runtime.agents) == 2
         assert isinstance(runtime.agents[0], LightingAgent)
         assert isinstance(runtime.agents[1], HVACAgent)
-
-    @pytest.mark.anyio
-    async def test_step_returns_actions(self):
-        runtime = AgentRuntime()
-        runtime.register(LightingAgent())
-        world = _make_world()
-        # At time 12:00, light in occupied room should target brightness 40
-        actions = await runtime.step(world)
-        # LightingAgent should produce actions because current brightness=0,
-        # target is 40 for daytime occupied room
-        light_actions = [a for a in actions if a["agent_id"] == "lighting_agent"]
-        assert len(light_actions) > 0
-        # Each action should have the required keys
-        for a in light_actions:
-            assert "device_id" in a
-            assert "property" in a
-            assert "value" in a
-            assert "reason" in a
-            assert "agent_id" in a
-            assert "agent_name" in a
-            assert a["agent_id"] == "lighting_agent"
-            assert a["agent_name"] == "Lighting Agent"
-
-    @pytest.mark.anyio
-    async def test_step_no_actions(self):
-        runtime = AgentRuntime()
-        runtime.register(LightingAgent())
-        world = _make_world()
-        # Set brightness to match target so no action is needed
-        world.environment.time_of_day = "12:00"
-        world.devices["light_living_01"].state.extra["brightness"] = 40
-        world.devices["light_living_01"].state.extra["color_temp"] = 4500
-        actions = await runtime.step(world)
-        light_actions = [a for a in actions if a["agent_id"] == "lighting_agent"]
-        assert len(light_actions) == 0
-
 
 # ---------------------------------------------------------------------------
 # SimulationEngine tests

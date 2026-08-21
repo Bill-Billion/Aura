@@ -36,7 +36,6 @@ from backend.agents.arbiter import (
     ConflictClass,
 )
 from backend.agents.contracts import PriorityLevel
-from backend.agents.orchestrator import ORCHESTRATOR_ENABLED_ENV
 from backend.engine.event_bus import SimEvent
 from backend.scenarios.loader import get_scenario
 from backend.scenarios.runner import ScenarioRunResult, run_scenario
@@ -52,12 +51,7 @@ PRIORITY_VALUES = frozenset(item.value for item in PriorityLevel)
 
 
 @pytest.fixture
-def orchestrated(monkeypatch):
-    monkeypatch.setenv(ORCHESTRATOR_ENABLED_ENV, "1")
-
-
-@pytest.fixture
-async def conflict_run(orchestrated) -> ScenarioRunResult:
+async def conflict_run() -> ScenarioRunResult:
     """跑一遍 §6.10 场景（headless、固定 seed、mocked LLM）。"""
 
     return await run_scenario(SCENARIO_ID)
@@ -266,7 +260,7 @@ async def test_rejected_commands_reach_a_rejected_lifecycle_state(conflict_run):
 # ------------------------------------------------- 3. 仲裁结论真的落到了世界上
 
 
-async def test_the_arbitration_winner_is_what_the_world_ends_up_with(orchestrated):
+async def test_the_arbitration_winner_is_what_the_world_ends_up_with():
     """选边不能只写在事件里：共享房间的灯最终必须是**赢家**的值。
 
     这条与上面几条是两件事。仲裁可以把结论写得很漂亮，而落地那一步照样把输家的命令
@@ -303,7 +297,7 @@ async def test_the_arbitration_winner_is_what_the_world_ends_up_with(orchestrate
 # ------------------------------------------------------------------ 4. 可复现
 
 
-async def test_conflict_outcome_is_reproducible_across_runs(orchestrated):
+async def test_conflict_outcome_is_reproducible_across_runs():
     """同 seed 两次运行，冲突结论逐字段相同——仲裁不能随调度抖动改口。"""
 
     def signature(result: ScenarioRunResult):

@@ -275,10 +275,9 @@ Aura/
 
 ## Documentation
 
-- `GSTACK_FINAL_PLAN.md`
+- `docs/architecture/simulation-requirements-spec.md`
 - `docs/architecture/ws-protocol.md`
 - `docs/architecture/sim-event-schema.md`
-- `docs/architecture/gamemcu-device-registration-plan.md`
 
 ## Testing
 

@@ -450,8 +450,7 @@ class BaseAgent(ABC):
     ) -> AgentDecisionEnvelope | None:
         """处理一条根事件。
 
-        ``domain_task`` 是 S3-T3 编排器派下来的那件事（§8.3）。默认 None 保留 S2 的直接
-        扇出路径（``ORCHESTRATOR_ENABLED=0`` 的逃生阀、以及直接构造 agent 的单测）。
+        ``domain_task`` 是编排器派下来的那件事（§8.3）；直接构造 agent 的单测可省略。
         """
 
         if not self.is_relevant(world_state, root_event):

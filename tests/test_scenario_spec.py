@@ -16,6 +16,12 @@ import structlog
 from pydantic import ValidationError
 
 from backend.engine.rng import MAX_JSON_SAFE_SEED
+from backend.models.versioning import (
+    SUPPORTED_SCENARIO_SCHEMA_VERSION,
+    SchemaVersionError,
+    check_schema_compatibility,
+    parse_schema_version,
+)
 from backend.scenarios.loader import (
     DEFAULT_LIBRARY_DIRS,
     ScenarioLoadError,
@@ -27,12 +33,6 @@ from backend.scenarios.spec import (
     ExpectedValue,
     ScenarioSpec,
     SuccessCriteria,
-)
-from backend.scenarios.versioning import (
-    SUPPORTED_SCENARIO_SCHEMA_VERSION,
-    SchemaVersionError,
-    check_schema_compatibility,
-    parse_schema_version,
 )
 
 

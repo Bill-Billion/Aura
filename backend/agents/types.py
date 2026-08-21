@@ -123,9 +123,3 @@ class AgentDecisionEnvelope(BaseModel):
     relevant_rooms: list[str] = Field(default_factory=list)
     fallback_reason: str | None = None
     failed_step: str | None = None
-
-
-class ArbiterResult(BaseModel):
-    winning_commands: list[AgentCommandProposal] = Field(default_factory=list)
-    winning_commands_by_agent: dict[str, list[AgentCommandProposal]] = Field(default_factory=dict)
-    conflicts: list[dict[str, Any]] = Field(default_factory=list)

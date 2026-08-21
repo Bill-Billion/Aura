@@ -46,7 +46,6 @@ import pytest
 
 from backend.agents.arbiter import COORDINATION_DECISION_EVENT_TYPE
 from backend.agents.contracts import PRIORITY_LEVELS, PriorityLevel
-from backend.agents.orchestrator import ORCHESTRATOR_ENABLED_ENV
 from backend.agents.runtime import DisabledLLMProvider
 from backend.api.ws import ConnectionManager
 from backend.engine import event_types as event_types_module
@@ -172,14 +171,7 @@ def root_correlation_id(result: ScenarioRunResult, event_type: str) -> str:
 # --------------------------------------------------- 1. 脚本化 arrive-home 六环
 
 
-@pytest.fixture
-def orchestrated(monkeypatch):
-    """阶段门的默认姿态：编排器开着（S3 的被测对象就是它）。"""
-
-    monkeypatch.setenv(ORCHESTRATOR_ENABLED_ENV, "1")
-
-
-async def test_scripted_arrive_home_run_completes_all_six_rings(orchestrated):
+async def test_scripted_arrive_home_run_completes_all_six_rings():
     """门条款：脚本化 ``user.arrives_home``（固定 seed + mocked LLM）→ 六环齐全且有序。
 
     走的是 S2 的 headless runner，也就是**真实装配**：SimulationEngine + AgentRuntime +
@@ -203,7 +195,7 @@ async def test_scripted_arrive_home_run_completes_all_six_rings(orchestrated):
     assert first_seq["reasoning.coordination_decision"] < first_seq["action.device_control"]
 
 
-async def test_arrive_home_episode_has_exactly_one_orchestrated_prefix(orchestrated):
+async def test_arrive_home_episode_has_exactly_one_orchestrated_prefix():
     """一条根事件 = 一棵树：前三环各恰好一条，协调决策也恰好一条（§9.3）。
 
     这条与"六环在场"是两件事：在场断言对"每个 agent 各发一套"同样成立，而那正是
@@ -235,7 +227,7 @@ async def test_arrive_home_episode_has_exactly_one_orchestrated_prefix(orchestra
         assert {"agent_role", "task", "relevant_device_ids", "priority"} <= set(task)
 
 
-async def test_same_seed_arrive_home_run_repeats_the_same_episode_shape(orchestrated):
+async def test_same_seed_arrive_home_run_repeats_the_same_episode_shape():
     """同 seed 两次运行，六环链的形状（类型序列）逐条相同。
 
     S2-T9 的字节一致性门盯的是整条 trace；这里盯的是**推理链本身**——两者都绿，
@@ -372,7 +364,7 @@ def _fresh_engine() -> SimulationEngine:
 
 
 @pytest.mark.parametrize("event_type", sorted(ALL_ROOT_EVENT_TYPES))
-async def test_every_root_event_type_yields_visible_episode(orchestrated, event_type):
+async def test_every_root_event_type_yields_visible_episode(event_type):
     """§15 验收 3：**每一条**根事件都要产生一条可见的 episode，零子事件即失败。
 
     "可见"的最低标准刻意给了两条通路，因为它们表达的是两件不同的事：

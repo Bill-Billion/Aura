@@ -1,20 +1,10 @@
 import { defineStore } from 'pinia'
-import { reactive, ref } from 'vue'
+import { reactive } from 'vue'
 import type { AgentState } from '@/types/world-state'
-
-export interface AgentLogEntry {
-  timestamp: number
-  agent_name: string
-  action: string
-  reason: string
-}
-
-const MAX_LOG_ENTRIES = 100
 
 export const useAgentStore = defineStore('agent', () => {
   // --- State ---
   const agents = reactive<Record<string, AgentState>>({})
-  const actionLog = ref<AgentLogEntry[]>([])
 
   // --- Actions ---
 
@@ -52,28 +42,17 @@ export const useAgentStore = defineStore('agent', () => {
     }
   }
 
-  /** Append an entry to the action log, trimming to MAX_LOG_ENTRIES */
-  function appendLog(entry: AgentLogEntry) {
-    actionLog.value.push(entry)
-    if (actionLog.value.length > MAX_LOG_ENTRIES) {
-      actionLog.value = actionLog.value.slice(-MAX_LOG_ENTRIES)
-    }
-  }
-
   /** Clear all state */
   function $reset() {
     for (const key of Object.keys(agents)) {
       delete agents[key]
     }
-    actionLog.value = []
   }
 
   return {
     agents,
-    actionLog,
     updateStatus,
     setAllAgents,
-    appendLog,
     $reset,
   }
 })

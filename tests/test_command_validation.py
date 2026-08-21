@@ -17,8 +17,6 @@ from backend.config.device_registry import build_default_devices
 from backend.execution.validation import (
     CommandErrorCode,
     CommandFailure,
-    ForbiddenDevicePolicy,
-    PermissivePolicy,
     validate_command,
 )
 from backend.engine.state import (
@@ -298,38 +296,6 @@ def test_empty_instance_capability_list_falls_back_to_type_level():
     failure = validate_command(world, "light_bare_01", "open_percent", 50)
     assert failure is not None
     assert failure.code is CommandErrorCode.CAPABILITY_NOT_SUPPORTED
-
-
-# --------------------------------------------------------------------------- #
-# 场景策略级（S2 ScenarioSpec §5.1 接入前的 stub 钩子）
-# --------------------------------------------------------------------------- #
-
-
-def test_policy_denied_via_stub_policy():
-    policy = ForbiddenDevicePolicy(["light_living_01"])
-    failure = validate_command(
-        _world(), "light_living_01", "brightness", 50, policy=policy
-    )
-    assert failure is not None
-    assert failure.code is CommandErrorCode.POLICY_DENIED
-    assert failure.details["device_id"] == "light_living_01"
-
-
-def test_permissive_policy_allows_valid_command():
-    failure = validate_command(
-        _world(), "light_living_01", "brightness", 50, policy=PermissivePolicy()
-    )
-    assert failure is None
-
-
-def test_policy_only_consulted_after_earlier_levels_pass():
-    # 越界值 + 被禁设备：值域是第 6 级，策略是第 7 级 → 先报值域，不到策略。
-    policy = ForbiddenDevicePolicy(["light_living_01"])
-    failure = validate_command(
-        _world(), "light_living_01", "brightness", 101, policy=policy
-    )
-    assert failure is not None
-    assert failure.code is CommandErrorCode.INVALID_VALUE_RANGE
 
 
 # --------------------------------------------------------------------------- #

@@ -33,7 +33,6 @@ import pytest
 from backend.agents.llm import LLMProvider, LLMProviderError
 from backend.agents.orchestrator import (
     DEFAULT_ORCHESTRATOR_ID,
-    ORCHESTRATOR_ENABLED_ENV,
 )
 from backend.agents.runtime import (
     AgentRuntime,
@@ -421,13 +420,7 @@ def test_default_agent_registry_contains_the_three_new_domain_agents():
 async def test_byte_identity_holds_with_orchestrator_and_new_agents(
     monkeypatch, scenario_id
 ):
-    """S2 门在**编排器打开 + 五个域 agent 全注册**的姿态下逐场景重新成立。
-
-    与文件开头那条正向门的区别只有一个：这里把 ``ORCHESTRATOR_ENABLED`` 显式钉成 1，
-    因此它测的永远是 S3 的新流水线，而不是"当前默认值恰好是什么"。
-    """
-
-    monkeypatch.setenv(ORCHESTRATOR_ENABLED_ENV, "1")
+    """S2 门在编排器 + 五个域 agent 全注册的姿态下逐场景重新成立。"""
 
     first = await run_scenario(scenario_id)
     second = await run_scenario(scenario_id)
@@ -444,28 +437,3 @@ async def test_byte_identity_holds_with_orchestrator_and_new_agents(
         if event.source == DEFAULT_ORCHESTRATOR_ID
     ]
     assert orchestrator_events, f"{scenario_id}: 编排器开着却一条事件都没发"
-
-
-@pytest.mark.anyio
-async def test_orchestrator_actually_changes_the_trace(monkeypatch):
-    """阴性对照：关掉编排器必须让 canonical trace **改变**。
-
-    没有这一条，上面那条"开着编排器也字节一致"可能只是因为编排器根本没接进链路——
-    一个不参与的组件当然不会破坏确定性。这条测试证明被测的确实是新流水线。
-    """
-
-    scenario_id = "user_arrives_home_evening"
-
-    monkeypatch.setenv(ORCHESTRATOR_ENABLED_ENV, "1")
-    orchestrated = canonical_trace_text((await run_scenario(scenario_id)).events)
-
-    monkeypatch.setenv(ORCHESTRATOR_ENABLED_ENV, "0")
-    bypassed = canonical_trace_text((await run_scenario(scenario_id)).events)
-    # 逃生阀本身也必须是确定的（否则"关掉编排器"会变成一条不可复现的对照）
-    bypassed_again = canonical_trace_text((await run_scenario(scenario_id)).events)
-
-    assert bypassed == bypassed_again
-    assert orchestrated != bypassed, (
-        "开/关编排器产出了同一份 trace —— 编排器没有真正接进派发循环，"
-        "上面那条确定性重新断言随之空转"
-    )

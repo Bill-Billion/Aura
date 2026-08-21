@@ -131,18 +131,6 @@ export function useWebSocket() {
       case 'STATE_DELTA': {
         const deltas = ((msg.payload as { deltas?: DeltaChange[] } | undefined)?.deltas ?? []) as DeltaChange[]
         worldStore.applyDelta(deltas)
-
-        // Extract agent actions from delta metadata for the log
-        for (const delta of deltas) {
-          if (delta.caused_by) {
-            agentStore.appendLog({
-              timestamp: Date.now(),
-              agent_name: delta.caused_by,
-              action: `Changed ${delta.path}`,
-              reason: delta.reason ?? '',
-            })
-          }
-        }
         break
       }
 
