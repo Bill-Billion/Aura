@@ -60,11 +60,10 @@ from pydantic import BaseModel, ConfigDict, Field
 from backend.agents.contracts import (
     AgentProposal,
     PriorityLevel,
-    migrate_legacy_priority,
     priority_rank,
 )
 from backend.agents.energy import ENERGY_AGENT_ID, EnergyVetoReview
-from backend.agents.types import AgentCommandProposal, AgentDecisionEnvelope
+from backend.agents.types import AgentCommandProposal
 from backend.core.logging import log
 from backend.engine.event_bus import SimEvent
 from backend.engine.observation import device_reports_online
@@ -85,21 +84,20 @@ from backend.execution.executor import (
 __all__ = [
     "ARBITER_ID",
     "COORDINATION_DECISION_EVENT_TYPE",
+    "UI_ACTOR_ID",
     "UNILATERAL_EXEMPT_TIERS",
     "USER_ACTOR_IDS",
     "AgentArbitrationOutcome",
     "Arbiter",
     "ArbiterResult",
+    "ArbitratedCommand",
     "ArbitrationConflict",
     "ArbitrationGate",
-    "ArbitratedCommand",
     "ConflictClass",
     "ConflictResolution",
     "ExplicitUserClaim",
     "RejectedCommand",
-    "UI_ACTOR_ID",
     "is_user_actor",
-    "proposal_from_envelope",
 ]
 
 
@@ -257,44 +255,24 @@ class ArbiterResult(_StrictModel):
     explanation: str = ""
     per_agent: list[AgentArbitrationOutcome] = Field(default_factory=list)
 
-    # —— 兼容视图（runtime 按 agent 取胜出命令；前端面板读 winning_commands）——
-
-    @property
-    def winning_commands(self) -> list[AgentCommandProposal]:
-        return [item.as_proposal() for item in self.approved_commands]
-
-    @property
-    def winning_commands_by_agent(self) -> dict[str, list[AgentCommandProposal]]:
-        grouped: dict[str, list[AgentCommandProposal]] = {}
-        for item in self.approved_commands:
-            grouped.setdefault(item.agent_id, []).append(item.as_proposal())
-        return grouped
-
     def approved_for(self, agent_id: str) -> list[ArbitratedCommand]:
         return [item for item in self.approved_commands if item.agent_id == agent_id]
 
     def rejected_for(self, agent_id: str) -> list[RejectedCommand]:
         return [item for item in self.rejected_commands if item.agent_id == agent_id]
 
-    @property
-    def outcome(self) -> str:
-        if self.approved_commands and self.rejected_commands:
-            return "partial"
-        if self.approved_commands:
-            return "approved"
-        if self.rejected_commands:
-            return "conflicted"
-        return "no_commands"
-
     def event_data(self) -> dict[str, Any]:
-        """``reasoning.coordination_decision`` 的 payload（一条 episode 只发一条）。
-
-        既带 §9.3 的新键，也保留前端 ObservabilityPanel 现在就在读的四个旧键
-        （``agent_id`` / ``outcome`` / ``priority`` / ``conflicts`` / ``winning_commands``）——
-        S5 之前 UI 是冻结的，换掉键名等于让面板当场变成 ``undefined · undefined``。
-        """
+        """``reasoning.coordination_decision`` 的 §9.3 payload。"""
 
         winning = self.winning_priority.value if self.winning_priority is not None else None
+        if self.approved_commands and self.rejected_commands:
+            outcome = "partial"
+        elif self.approved_commands:
+            outcome = "approved"
+        elif self.rejected_commands:
+            outcome = "conflicted"
+        else:
+            outcome = "no_commands"
         return {
             # §9.3 三项输出
             "approved_commands": [item.model_dump(mode="json") for item in self.approved_commands],
@@ -303,9 +281,9 @@ class ArbiterResult(_StrictModel):
             "winning_priority": winning,
             "explanation": self.explanation,
             "per_agent": [item.model_dump(mode="json") for item in self.per_agent],
-            # 兼容键（前端冻结期）
+            # event_schema_version=1.0 compatibility; remove only with a v2 migrator.
             "agent_id": ARBITER_ID,
-            "outcome": self.outcome,
+            "outcome": outcome,
             "priority": winning or "",
             "winning_commands": [item.as_proposal().model_dump() for item in self.approved_commands],
         }
@@ -333,23 +311,6 @@ class ExplicitUserClaim(_StrictModel):
     @property
     def target(self) -> CommandTarget:
         return (self.device_id, self.capability)
-
-
-def proposal_from_envelope(envelope: AgentDecisionEnvelope) -> AgentProposal:
-    """旧 :class:`AgentDecisionEnvelope` → §8.4 提案（迁移期兼容入口）。
-
-    只做词表迁移与字段搬运，不做 outcome 判定——那一步由
-    :meth:`BaseAgent.build_proposal` 拥有（§8.4 五种非动作表达的唯一判定点）。
-    """
-
-    return AgentProposal(
-        agent_id=envelope.agent_id,
-        intent=envelope.intent or f"{envelope.agent_id} decision",
-        priority=migrate_legacy_priority(str(envelope.priority)),
-        confidence=envelope.confidence,
-        commands=list(envelope.candidate_commands),
-        requires_coordination=envelope.needs_coordination,
-    )
 
 
 class _Entry:
@@ -493,7 +454,7 @@ class Arbiter:
 
     def resolve(
         self,
-        proposals: Sequence[AgentProposal | AgentDecisionEnvelope],
+        proposals: Sequence[AgentProposal],
         root_event: SimEvent,
         world_snapshot: WorldState | None = None,
         *,
@@ -507,9 +468,9 @@ class Arbiter:
         只做纯提案层的裁决。传进来的必须是 §2.3 的 observable 投影，不是 ground truth。
         """
 
-        normalized = [self._normalize(item, root_event) for item in proposals]
         entries: list[_Entry] = []
-        for proposal, recency in normalized:
+        recency = float(root_event.timestamp or 0.0)
+        for proposal in proposals:
             for index, command in enumerate(proposal.commands):
                 entries.append(_Entry(proposal, command, index, recency))
         ordered = sorted(entries, key=lambda entry: entry.sort_key())
@@ -579,7 +540,7 @@ class Arbiter:
         winning_priority = (
             max((item.priority for item in approved), key=priority_rank) if approved else None
         )
-        per_agent = self._per_agent(normalized, approved, rejected)
+        per_agent = self._per_agent(proposals, approved, rejected)
         result = ArbiterResult(
             approved_commands=approved,
             rejected_commands=rejected,
@@ -596,18 +557,6 @@ class Arbiter:
                 winning_priority=winning_priority.value if winning_priority else None,
             )
         return result
-
-    # ------------------------------------------------------------------ 归一
-
-    @staticmethod
-    def _normalize(
-        item: AgentProposal | AgentDecisionEnvelope, root_event: SimEvent
-    ) -> tuple[AgentProposal, float]:
-        """提案 + 新近度。旧 envelope 的 ``root_event_timestamp`` 语义在这里保留。"""
-
-        if isinstance(item, AgentDecisionEnvelope):
-            return proposal_from_envelope(item), float(item.root_event_timestamp)
-        return item, float(root_event.timestamp or 0.0)
 
     @staticmethod
     def _veto_index(
@@ -853,12 +802,12 @@ class Arbiter:
 
     @staticmethod
     def _per_agent(
-        normalized: Sequence[tuple[AgentProposal, float]],
+        proposals: Sequence[AgentProposal],
         approved: Sequence[ArbitratedCommand],
         rejected: Sequence[RejectedCommand],
     ) -> list[AgentArbitrationOutcome]:
         outcomes: list[AgentArbitrationOutcome] = []
-        for proposal, _ in normalized:
+        for proposal in proposals:
             wins = sum(1 for item in approved if item.agent_id == proposal.agent_id)
             losses = sum(1 for item in rejected if item.agent_id == proposal.agent_id)
             if proposal.is_non_action:

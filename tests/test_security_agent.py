@@ -255,7 +255,6 @@ async def test_smoke_scenario_puts_the_safety_tier_on_the_real_runtime_path(monk
     改动设备。
     """
 
-    monkeypatch.setenv("ORCHESTRATOR_ENABLED", "1")
     result = await run_scenario(SAFETY_SMOKE_SCENARIO_ID)
 
     assert result.completed is True, "timeline 必须在 duration 内全部触发"
@@ -305,7 +304,6 @@ async def test_smoke_scenario_preempts_a_comfort_tier_behaviour(monkeypatch):
     必须让报警持续到照明域打算把疏散照明调回去的那一轮。
     """
 
-    monkeypatch.setenv("ORCHESTRATOR_ENABLED", "1")
     result = await run_scenario(SAFETY_SMOKE_SCENARIO_ID)
 
     preemptions = [

@@ -125,9 +125,6 @@ def test_root_event_taxonomy_has_single_source_of_truth():
     assert COMPAT_ROOT_EVENT_TYPES is event_types.COMPAT_ROOT_EVENT_TYPES
     assert ALLOWED_TIMELINE_EVENT_TYPES is event_types.ALLOWED_TIMELINE_EVENT_TYPES
     assert len(event_types.ROOT_EVENT_TYPES) == 14
-    # 迁移期别名：每个富事件都能回落到一个旧兼容事件名
-    for event_type in event_types.ROOT_EVENT_TYPES:
-        assert event_types.compat_event_type(event_type) in COMPAT_ROOT_EVENT_TYPES
 
 
 # -------------------------------------------------------------- scripted 模式

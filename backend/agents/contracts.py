@@ -21,8 +21,8 @@
 - **``extra="forbid"``**（与 ``backend/scenarios/spec.py::_StrictModel`` 同口径）。
   拼错字段名必须当场炸；契约模型静默吞字段等于没有契约。
 - **不改 ``types.py``**。旧 :class:`~backend.agents.types.AgentDecisionEnvelope` 与
-  六标签 ``PriorityLabel`` 仍在（arbiter / runtime / 前端 AGENT_STATUS 都在读它），
-  S3-T1 只新增本模块并提供 :data:`LEGACY_PRIORITY_MIGRATION`。命令形状则**直接复用**
+  六标签 ``PriorityLabel`` 仍作为 runtime 的决策过程证据，结论再转换为本模块的
+  :class:`AgentProposal`。命令形状则**直接复用**
   ``types.AgentCommandProposal``——同一个概念两份模型是下一个 bug 的温床。
 
 词表纪律：新产出的 ``reasoning.coordination_decision`` / ``TaskPlan`` /

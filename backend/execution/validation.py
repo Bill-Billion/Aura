@@ -3,7 +3,7 @@
 所有设备变更——不论来自 UI / Agent / 场景脚本 / 规则降级——都必须过同一条校验路径
 （§3.3）。本模块是这条路径的唯一实现与唯一失败词表来源：``validate_command`` 按固定
 顺序逐级校验，命中即返回结构化 ``CommandFailure``（§10.2 码 + 可读原因 + 定位 details），
-全部通过返回 None。executor 层（S1-T3/T4）在此之上叠加执行期失败（后三类码）与生命周期。
+全部通过返回 None。executor 层（S1-T3/T4）在此之上叠加执行期失败与生命周期。
 
 校验顺序（前者先于后者，多问题并存时报靠前的级）:
   1. device exists            → unknown_device            §3.3
@@ -12,13 +12,12 @@
   4. capability writable      → read_only_capability      §3.3
   5. value type               → invalid_value_type        §3.3
   6. value range / enum       → invalid_value_range       §3.3
-  7. scenario policy          → policy_denied             §3.3（S1 给 permissive 默认，S2 §5.1 接入）
 """
 
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Iterable, Protocol, runtime_checkable
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -27,7 +26,7 @@ from backend.engine.state import DeviceState, WorldState
 
 
 class CommandErrorCode(str, Enum):
-    """§10.2 十类失败语义。前七类由本校验层产出，后三类由 executor 执行期产出。"""
+    """§10.2 十类失败语义；当前校验层产出前六类。"""
 
     # —— 校验期（本模块）——
     UNKNOWN_DEVICE = "unknown_device"
@@ -36,6 +35,7 @@ class CommandErrorCode(str, Enum):
     READ_ONLY_CAPABILITY = "read_only_capability"
     INVALID_VALUE_TYPE = "invalid_value_type"
     INVALID_VALUE_RANGE = "invalid_value_range"
+    # 公共失败词表保留位；当前没有场景策略执行器。
     POLICY_DENIED = "policy_denied"
     # —— 执行期（executor 层 S1-T3/T4；列于此以保 §10.2 词表单一来源）——
     EXECUTION_TIMEOUT = "execution_timeout"
@@ -59,40 +59,6 @@ class CommandFailure(BaseModel):
     code: CommandErrorCode
     message: str
     details: dict[str, Any] = Field(default_factory=dict)
-
-
-@runtime_checkable
-class ScenarioPolicy(Protocol):
-    """场景策略接口（§3.3 第 6 级）。
-
-    字段口径对齐 spec §5.1 / §12.2 的 allowed / forbidden devices，以缩小 S2 ScenarioSpec
-    接入时的改动面：策略只按 (device_id, capability) 判定，放行返回 None，否则返回拒绝原因。
-    """
-
-    def check(self, device_id: str, capability: str) -> str | None:
-        ...
-
-
-class PermissivePolicy:
-    """S1 默认策略：不设限、全部放行。S2 的 ScenarioSpec §5.1 会以 forbidden_device_ids 收紧。"""
-
-    def check(self, device_id: str, capability: str) -> str | None:  # noqa: D401
-        return None
-
-
-class ForbiddenDevicePolicy:
-    """按 §5.1/§12.2 ``forbidden_device_ids`` 判定：命中黑名单即拒。
-
-    ScenarioSpec 落地前的最小可用实现，也是 S1 校验测试的策略桩；S2 直接以其为接入点。
-    """
-
-    def __init__(self, forbidden_device_ids: Iterable[str]) -> None:
-        self.forbidden_device_ids = frozenset(forbidden_device_ids)
-
-    def check(self, device_id: str, capability: str) -> str | None:
-        if device_id in self.forbidden_device_ids:
-            return f"设备 {device_id} 在当前场景策略下被禁止操作"
-        return None
 
 
 def device_is_online(device: DeviceState) -> bool:
@@ -145,13 +111,8 @@ def validate_command(
     device_id: str,
     capability: str,
     value: Any = None,
-    *,
-    policy: ScenarioPolicy | None = None,
 ) -> CommandFailure | None:
-    """六级顺序校验一条设备命令；通过返回 None，否则返回 §10.2 结构化失败。
-
-    ``policy`` 缺省视为 permissive（不设策略约束）；传入即在第 7 级参与判定。
-    """
+    """六级顺序校验一条设备命令；通过返回 None，否则返回 §10.2 结构化失败。"""
 
     # 1. device exists（§3.3）
     device = world.devices.get(device_id)
@@ -214,15 +175,5 @@ def validate_command(
             message=range_error,
             details={"device_id": device_id, "capability": capability, "value": value},
         )
-
-    # 7. scenario policy（§3.3；S1 默认 permissive，S2 §5.1 接入）
-    if policy is not None:
-        denial = policy.check(device_id, capability)
-        if denial is not None:
-            return CommandFailure(
-                code=CommandErrorCode.POLICY_DENIED,
-                message=denial,
-                details={"device_id": device_id, "capability": capability},
-            )
 
     return None

@@ -22,12 +22,12 @@ from pydantic import ValidationError
 
 from backend.config.device_registry import build_default_rooms, get_default_device_registry
 from backend.core.logging import log
-from backend.scenarios.spec import ScenarioSpec
-from backend.scenarios.versioning import (
+from backend.models.versioning import (
     SUPPORTED_SCENARIO_SCHEMA_VERSION,
     SchemaVersionError,
     check_schema_compatibility,
 )
+from backend.scenarios.spec import ScenarioSpec
 
 # 默认场景库目录。列表形式是有意的：S3/S4 追加目录时只改调用方传入的列表。
 DEFAULT_LIBRARY_DIRS: tuple[Path, ...] = (Path(__file__).resolve().parent / "library",)

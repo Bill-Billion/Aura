@@ -59,7 +59,7 @@ from dataclasses import dataclass
 from typing import Callable, Sequence
 
 from backend.core.logging import log
-from backend.execution.validation import CommandErrorCode, ScenarioPolicy, validate_command
+from backend.execution.validation import CommandErrorCode, validate_command
 from backend.engine.event_bus import SimEvent
 from backend.engine.state_manager import (
     INVARIANT_VIOLATION_EVENT_TYPE,
@@ -289,7 +289,7 @@ class CommandExecutor:
     由 SimulationEngine 持有一台（非全局单例），reset 时经 ``bind_state_manager`` 换绑新世界；
     UI 腿与 agent 腿共用它，各自把 publish 包装按次传给 ``submit``/``submit_batch``。
     ``publish_event`` 是缺省包装（不传按次 publish 时用它），可为 None——此时每次调用必须
-    显式传 ``publish=``。``policy`` 缺省 permissive；``effects`` 缺省 §3.4 各设备效果；
+    显式传 ``publish=``。``effects`` 缺省 §3.4 各设备效果；
     ``feedback_timeout`` 缺省 None（不设超时），设值后由 ``clock`` 测量下发到反馈的耗时判定。
     """
 
@@ -298,7 +298,6 @@ class CommandExecutor:
         state_manager: StateManager,
         publish_event: PublishEvent | None = None,
         *,
-        policy: ScenarioPolicy | None = None,
         effects: EffectHook | None = None,
         clock: Clock = time.monotonic,
         feedback_timeout: float | None = None,
@@ -306,7 +305,6 @@ class CommandExecutor:
     ) -> None:
         self.state_manager = state_manager
         self.publish_event = publish_event
-        self.policy = policy
         self.effects = effects if effects is not None else default_device_effects
         self.clock = clock
         self.feedback_timeout = feedback_timeout
@@ -590,7 +588,6 @@ class CommandExecutor:
             command.device_id,
             command.capability,
             command.value,
-            policy=self.policy,
         )
         if failure is not None:
             if record.is_terminal:

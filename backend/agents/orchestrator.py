@@ -57,7 +57,7 @@ from backend.agents.llm_modes import (
     EPISODE_BUDGET_ENV,
     resolve_mode_for_provider,
 )
-from backend.agents.types import AgentLLMDecision, LLMDecisionRequest
+from backend.agents.types import LLMDecisionRequest
 from backend.config.event_mapping import DeviceSearchSpace, get_device_search_space
 from backend.core.logging import log
 from backend.engine.event_types import (
@@ -86,7 +86,6 @@ __all__ = [
     "DOMAIN_PRIORITY",
     "INTENT_DOMAINS",
     "MIN_CONFIDENCE_ENV",
-    "ORCHESTRATOR_ENABLED_ENV",
     "ORCHESTRATOR_INTENT_SCHEMA",
     "ORCHESTRATOR_SYSTEM_PROMPT",
     "RULE_CONFIDENCE_BY_RESOLUTION",
@@ -95,7 +94,6 @@ __all__ = [
     "OrchestrationDecision",
     "RuleIntent",
     "classify_intent_rule_based",
-    "orchestrator_enabled",
     "resolve_min_confidence",
     "rule_based_confidence",
 ]
@@ -103,13 +101,6 @@ __all__ = [
 
 DEFAULT_ORCHESTRATOR_ID = "home_orchestrator"
 DEFAULT_ORCHESTRATOR_NAME = "Home Orchestrator"
-
-ORCHESTRATOR_ENABLED_ENV = "ORCHESTRATOR_ENABLED"
-"""strangler 逃生阀：置 0/false 时 runtime 回到 S2 的"全体相关 agent 扇出"路径。
-
-留这个开关不是为了长期共存，是为了让编排器上线的那一次可以**当场对照**：同一条根事件、
-同一个 seed，开关两边的事件流差在哪。阶段门通过后由 S3-T10 决定何时摘除。
-"""
 
 MIN_CONFIDENCE_ENV = "AGENT_MIN_CONFIDENCE"
 """低置信阈值（每 run 可配）。``OrchestrationPolicy.min_confidence`` 优先于它。"""
@@ -468,16 +459,6 @@ class OrchestrationDecision(BaseModel):
             "noop_reason": self.plan.noop_reason,
             "outcome": self.outcome.value,
         }
-
-
-def orchestrator_enabled(env: Mapping[str, str] | None = None) -> bool:
-    """strangler 开关，默认开。只有显式的 0/false/no/off 才关。"""
-
-    source = os.environ if env is None else env
-    raw = str(source.get(ORCHESTRATOR_ENABLED_ENV, "")).strip().lower()
-    if not raw:
-        return True
-    return raw not in {"0", "false", "no", "off"}
 
 
 def resolve_min_confidence(

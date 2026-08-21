@@ -1,4 +1,4 @@
-"""Agent runtime for legacy step mode and Phase 2 event-driven episodes.
+"""Agent runtime for event-driven episodes.
 
 ================================================================================
 事件发射顺序契约（EMISSION ORDERING CONTRACT）—— S2-T9 确定性门的地基
@@ -74,11 +74,9 @@ from backend.agents.lighting import LightingAgent
 from backend.agents.scene import SceneAgent
 from backend.agents.security import SecurityAgent
 from backend.agents.orchestrator import (
-    ORCHESTRATOR_ENABLED_ENV,
     DomainAgentBinding,
     HomeOrchestratorAgent,
     OrchestrationDecision,
-    orchestrator_enabled,
 )
 from backend.agents.llm import (
     AnthropicCompatibleProvider,
@@ -350,7 +348,7 @@ class TriggerClassifier:
 
 
 class AgentRuntime:
-    """Manage agent registration, legacy step mode, and event-driven episodes."""
+    """Manage agent registration and event-driven episodes."""
 
     def __init__(
         self,
@@ -368,31 +366,11 @@ class AgentRuntime:
         run_id_source: RunIdSource | None = None,
         observation_projector: ObservableProjector | None = None,
         orchestrator: HomeOrchestratorAgent | None = None,
-        orchestrator_enabled_flag: bool | None = None,
         arbitration_gate: ArbitrationGate | None = None,
     ) -> None:
         self.agents: list[BaseAgent] = []
-        # S3-T3：编排层。它**不在** self.agents 里——BaseAgent 的契约是"控设备、发命令"，
-        # 编排器一条命令都不发（spec §8.1）。开关默认开，置 ORCHESTRATOR_ENABLED=0 时
-        # 回到 S2 的"全体相关 agent 扇出"路径（strangler 逃生阀）。
+        # 编排层不在 self.agents 里：BaseAgent 控设备、发命令，编排器只负责派发任务。
         self.orchestrator = orchestrator or HomeOrchestratorAgent()
-        self.orchestrator_enabled = (
-            orchestrator_enabled() if orchestrator_enabled_flag is None else orchestrator_enabled_flag
-        )
-        if not self.orchestrator_enabled:
-            # 逃生阀被拉下来这件事**必须出声**：关掉编排器就回到 S2 的旧分发路径，
-            # 那条路径上的 reasoning.task_decomposition 装的是 LLM 自由文本，
-            # 即审计坑 (c)。默认开 + 静默关 = 一条流水线可以被无声降级，
-            # 而事后没人能从日志里看出这份数据是哪条路径产的（S3 review minor-6）。
-            log.warning(
-                "orchestrator_disabled",
-                env_var=ORCHESTRATOR_ENABLED_ENV,
-                impact="legacy_fanout_free_text_task_decomposition",
-                detail=(
-                    "编排器已关闭：任务分解退回 S2 自由文本路径（审计坑 c），"
-                    "本次运行的事件流不具备 §8.3 结构化 domain_tasks 契约"
-                ),
-            )
         self.event_bus = event_bus
         self.run_id_source = run_id_source
         self.state_manager = state_manager
@@ -928,17 +906,6 @@ class AgentRuntime:
         self._last_environment_episode_started_at.clear()
         self.emission_gate.reset()
 
-    async def step(self, world_state: WorldState) -> list[dict]:
-        all_actions: list[dict] = []
-        for agent in self.agents:
-            actions = agent.decide(world_state)
-            if actions:
-                for action in actions:
-                    action["agent_id"] = agent.agent_id
-                    action["agent_name"] = agent.name
-                all_actions.extend(actions)
-        return all_actions
-
     def _refresh_subscriptions(self) -> None:
         self._unsubscribe_handlers()
         self._subscribe_handlers()
@@ -1140,14 +1107,11 @@ class AgentRuntime:
 
         # —— 编排（§8.1）：也是"算"的一部分，因此在闸门之外做完。——
         # 它不写世界、不发事件，只决定"这一轮派给谁、每人干什么"。
-        decision: OrchestrationDecision | None = None
-        agents = candidates
-        if self.orchestrator_enabled:
-            decision = await self._plan_episode(root_event, snapshot, candidates)
-            selected = set(decision.selected_agent_ids)
-            # 顺序仍取自 candidates（= 注册序）：TaskPlan.domain_tasks 本身就是按注册序
-            # 生成的，这里再过一次是把"两处顺序必须一致"变成机制而不是巧合。
-            agents = [agent for agent in candidates if agent.agent_id in selected]
+        decision = await self._plan_episode(root_event, snapshot, candidates)
+        selected = set(decision.selected_agent_ids)
+        # 顺序仍取自 candidates（= 注册序）：TaskPlan.domain_tasks 本身就是按注册序
+        # 生成的，这里再过一次是把"两处顺序必须一致"变成机制而不是巧合。
+        agents = [agent for agent in candidates if agent.agent_id in selected]
 
         for agent in agents:
             self._ensure_agent_state(agent)
@@ -1162,7 +1126,7 @@ class AgentRuntime:
                     root_event=root_event,
                     snapshot=snapshot,
                     agent=agent,
-                    domain_task=decision.task_for_agent(agent.agent_id) if decision else None,
+                    domain_task=decision.task_for_agent(agent.agent_id),
                 )
             )
             for agent in agents
@@ -1225,10 +1189,10 @@ class AgentRuntime:
         agents: list[BaseAgent],
         evaluated: list[AgentDecisionEnvelope | None],
         run_id: str | None,
-        decision: OrchestrationDecision | None = None,
-        candidates: list[BaseAgent] | None = None,
-        snapshot: WorldState | None = None,
-        observed_version: int | None = None,
+        decision: OrchestrationDecision,
+        candidates: list[BaseAgent],
+        snapshot: WorldState,
+        observed_version: int,
     ) -> None:
         """episode 的**发射**阶段：本方法内发出的每一条事件都在持号期间。
 
@@ -1240,8 +1204,6 @@ class AgentRuntime:
             return
 
         envelopes: list[AgentDecisionEnvelope] = []
-        candidates = candidates if candidates is not None else agents
-
         # run 门（§2.2）：LLM 那一段是本 episode 最长的 await，期间 run 可能已经换掉。
         # 取消在飞任务是第一道防线，但换 run 不一定伴随取消（场景连跑、headless runner），
         # 因此落地前必须再问一次"我还属于活跃 run 吗"。
@@ -1258,30 +1220,21 @@ class AgentRuntime:
         # 编排层的三环（感知 → 意图 → 任务拆分）先发，域 agent 的推理链挂在它下面：
         # §4.4「causal_parent 必须指向直接父事件」，而这一轮里域 agent 的直接父就是
         # 编排器的任务拆分，不是根事件本身。
-        episode_parent = root_event.event_id
-        if decision is not None:
-            episode_parent = await self._emit_orchestrator_prefix(root_event, decision)
+        episode_parent = await self._emit_orchestrator_prefix(root_event, decision)
 
         # S3-T6：编排器在场时，**前三环归编排器**，域 agent 不再各起一棵平行小树。
         # 审计 §六「episode 被稀释」说的就是旧形状：一条 correlation 下挂着 N 套同名的
         # perception/intent/task_decomposition，六环名义上齐了，却没有一棵树能从感知一路
         # 读到反馈。域 agent 的感知/意图/置信度改由 reasoning.execution_plan 承载
         # （见 _agent_contribution_data）——信息一条不少，树只有一棵。
-        orchestrated = decision is not None
         for agent, envelope in zip(agents, evaluated, strict=False):
             if envelope is None:
                 self._set_agent_idle(agent.agent_id)
                 continue
 
             envelopes.append(envelope)
-            if orchestrated:
-                # 降级是唯一仍要**当场**发的一环：它发生在仲裁之前，挪到执行环里补记
-                # 就读不出"这一轮从哪一步开始是规则算的"（§15 降级验收）。
-                await self._emit_agent_fallback(root_event, envelope, episode_parent)
-            else:
-                # strangler 逃生阀（ORCHESTRATOR_ENABLED=0）：没有编排器就没人拥有前三环，
-                # 此时域 agent 必须发回自己的那一套，否则整条 episode 一环不剩。
-                await self._emit_reasoning_prefix(root_event, envelope, episode_parent)
+            # 降级发生在仲裁之前，必须当场留痕，不能挪到执行环补记。
+            await self._emit_agent_fallback(root_event, envelope, episode_parent)
 
         pending_deltas: list[DeltaChange] = []
         agent_by_id = {agent.agent_id: agent for agent in agents}
@@ -1297,25 +1250,24 @@ class AgentRuntime:
         proposals: list[AgentProposal] = []
         for envelope in envelopes:
             agent = agent_by_id.get(envelope.agent_id)
-            if agent is None or snapshot is None:
+            if agent is None:
                 continue
             proposals.append(
                 agent.build_proposal(
                     envelope=envelope,
                     world_state=snapshot,
                     root_event=root_event,
-                    domain_task=decision.task_for_agent(agent.agent_id) if decision else None,
+                    domain_task=decision.task_for_agent(agent.agent_id),
                 )
             )
 
         # §8.2 能耗否决权：占用门在 EnergyAgent 内部，这里只负责把评审结果喂给仲裁器。
         energy_review = None
-        if snapshot is not None:
-            energy_agent = next(
-                (agent for agent in self.agents if isinstance(agent, EnergyAgent)), None
-            )
-            if energy_agent is not None:
-                energy_review = energy_agent.review_peer_proposals(proposals, snapshot)
+        energy_agent = next(
+            (agent for agent in self.agents if isinstance(agent, EnergyAgent)), None
+        )
+        if energy_agent is not None:
+            energy_review = energy_agent.review_peer_proposals(proposals, snapshot)
 
         result = self.arbiter.resolve(
             proposals,
@@ -1395,7 +1347,7 @@ class AgentRuntime:
                     # 域 agent 的推理贡献（编排器在场时这里是它唯一的落点）。
                     **self._agent_contribution_data(
                         envelope,
-                        decision.task_for_agent(agent_id) if decision else None,
+                        decision.task_for_agent(agent_id),
                     ),
                 },
             )
@@ -1572,13 +1524,6 @@ class AgentRuntime:
         """
 
         context_view = decision.plan
-        # —— 前端冻结期兼容键（与 arbiter.event_data 同一套理由）——
-        # ObservabilityPanel 现在就在读 perception 的 world_summary/relevant_* 与
-        # task_decomposition 的 task_steps；S3-T6 把这两环从"每个 agent 一份"收敛成
-        # "编排器一份"之后，不补这几个键，面板会在 `data.task_steps.length` 上直接抛错
-        # （不是显示得难看，是整块空白）。S5 换渲染时再删。
-        # 注意它们是**结构化 domain_tasks 的投影**，不是回填 LLM 散文——审计那条坑
-        # （拆分环里装模型自由文本）的落点仍然是 domain_tasks。
         scope_devices = sorted(
             {device_id for task in context_view.domain_tasks for device_id in task.relevant_device_ids}
         )
@@ -1596,7 +1541,7 @@ class AgentRuntime:
                 "search_space_device_types": list(decision.rule_intent.device_types),
                 "search_space_resolved_from": decision.rule_intent.resolved_from,
                 "default_policy": decision.rule_intent.default_policy,
-                # 兼容键
+                # event_schema_version=1.0 compatibility; remove only with a v2 migrator.
                 "world_summary": (
                     f"{root_event.event_type} → 搜索空间 {len(scope_devices)} 台设备 / "
                     f"{len(scope_rooms)} 个房间（{decision.rule_intent.resolved_from}）"
@@ -1896,82 +1841,6 @@ class AgentRuntime:
         )
         self._update_reasoning_step(envelope.agent_id, event.event_type)
 
-    async def _emit_reasoning_prefix(
-        self,
-        root_event: SimEvent,
-        envelope: AgentDecisionEnvelope,
-        causal_parent: str,
-    ) -> str:
-        """域 agent 自己的前三环 —— **只在编排器关闭时**走这条路。
-
-        编排器开着的时候，前三环由 ``_emit_orchestrator_prefix`` 拥有（S3-T6：一条根事件
-        一棵 episode 树），本方法不参与。
-        """
-
-        perception_event = await self._emit_agent_event(
-            root_event=root_event,
-            agent_id=envelope.agent_id,
-            event_type="reasoning.perception_snapshot",
-            causal_parent=causal_parent,
-            data={
-                "agent_id": envelope.agent_id,
-                "trigger_event_type": envelope.trigger_event_type,
-                "world_summary": envelope.world_summary,
-                "relevant_devices": envelope.relevant_devices,
-                "relevant_rooms": envelope.relevant_rooms,
-            },
-        )
-        self._update_reasoning_step(envelope.agent_id, perception_event.event_type)
-
-        intent_event = await self._emit_agent_event(
-            root_event=root_event,
-            agent_id=envelope.agent_id,
-            event_type="reasoning.intent_recognized",
-            causal_parent=perception_event.event_id,
-            data={
-                "agent_id": envelope.agent_id,
-                "intent": envelope.intent,
-                "confidence": envelope.confidence,
-                "explanation": envelope.explanation,
-                "provider": envelope.provider_name,
-                "model": envelope.model,
-                "latency_ms": envelope.latency_ms,
-            },
-        )
-        self._update_reasoning_step(envelope.agent_id, intent_event.event_type)
-
-        task_event = await self._emit_agent_event(
-            root_event=root_event,
-            agent_id=envelope.agent_id,
-            event_type="reasoning.task_decomposition",
-            causal_parent=intent_event.event_id,
-            data={
-                "agent_id": envelope.agent_id,
-                "intent": envelope.intent,
-                "task_steps": envelope.task_steps,
-            },
-        )
-        self._update_reasoning_step(envelope.agent_id, task_event.event_type)
-
-        parent_id = task_event.event_id
-        if envelope.mode == "fallback_rule_based":
-            fallback_event = await self._emit_agent_event(
-                root_event=root_event,
-                agent_id=envelope.agent_id,
-                event_type="reasoning.fallback_rule_based",
-                causal_parent=task_event.event_id,
-                data={
-                    "agent_id": envelope.agent_id,
-                    "reason": envelope.fallback_reason,
-                    "failed_step": envelope.failed_step or "intent_generation",
-                    "fallback_strategy": "rule_based",
-                },
-            )
-            self._update_reasoning_step(envelope.agent_id, fallback_event.event_type)
-            parent_id = fallback_event.event_id
-
-        return parent_id
-
     def _build_device_command(
         self,
         *,
@@ -2066,7 +1935,6 @@ class AgentRuntime:
                 command.device_id,
                 command.capability,
                 command.value,
-                policy=executor.policy,
             )
             if self.state_manager is not None
             else None

@@ -19,13 +19,9 @@ from backend.models.versioning import (
     SchemaVersionError,
     check_schema_compatibility,
 )
-from backend.scenarios.versioning import (
-    SUPPORTED_SCENARIO_SCHEMA_VERSION as LEGACY_SCENARIO_VERSION,
-)
 
 
-def test_shared_version_contract_keeps_legacy_scenario_import() -> None:
-    assert LEGACY_SCENARIO_VERSION == SUPPORTED_SCENARIO_SCHEMA_VERSION
+def test_shared_version_contract_is_centralized() -> None:
     assert SCHEMA_VERSIONS == {
         "scenario_schema_version": SUPPORTED_SCENARIO_SCHEMA_VERSION,
         "event_schema_version": SUPPORTED_EVENT_SCHEMA_VERSION,

@@ -24,7 +24,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from backend.agents.orchestrator import DEFAULT_ORCHESTRATOR_ID, ORCHESTRATOR_ENABLED_ENV
+from backend.agents.orchestrator import DEFAULT_ORCHESTRATOR_ID
 from backend.agents.runtime import DisabledLLMProvider
 from backend.api.ws import ConnectionManager
 from backend.engine.event_bus import (
@@ -94,7 +94,6 @@ def _tree_depth(events: list[SimEvent], event: SimEvent) -> int:
 async def test_single_episode_tree_per_root_event(monkeypatch):
     """一条根事件下：感知 / 意图 / 任务拆分 / 协调决策各恰好一条，无论几个域 agent 参与。"""
 
-    monkeypatch.setenv(ORCHESTRATOR_ENABLED_ENV, "1")
     engine = _engine()
     root = _arrives_home()
     events = await _run_one_episode(engine, root)
@@ -130,7 +129,6 @@ async def test_single_episode_tree_per_root_event(monkeypatch):
 async def test_six_rings_present_under_one_correlation_id(monkeypatch):
     """§15 验收 4：一条 correlation 下六环齐全，且顺着 causal_parent 能一路串起来。"""
 
-    monkeypatch.setenv(ORCHESTRATOR_ENABLED_ENV, "1")
     engine = _engine()
     root = _arrives_home()
     events = await _run_one_episode(engine, root)
@@ -172,7 +170,6 @@ async def test_six_rings_present_under_one_correlation_id(monkeypatch):
 async def test_execution_plan_carries_domain_agent_reasoning_contribution(monkeypatch):
     """域 agent 不再自己开树，但它的感知/意图/置信度不能因此消失。"""
 
-    monkeypatch.setenv(ORCHESTRATOR_ENABLED_ENV, "1")
     engine = _engine()
     events = await _run_one_episode(engine, _arrives_home())
 
@@ -197,7 +194,6 @@ async def test_execution_plan_carries_domain_agent_reasoning_contribution(monkey
 async def test_task_decomposition_data_is_structured_domain_tasks_not_free_text(monkeypatch):
     """审计坑：task_decomposition 里装的是 LLM 散文。事件流上必须是编排契约。"""
 
-    monkeypatch.setenv(ORCHESTRATOR_ENABLED_ENV, "1")
     engine = _engine()
     events = await _run_one_episode(engine, _arrives_home())
 
@@ -217,25 +213,10 @@ async def test_task_decomposition_data_is_structured_domain_tasks_not_free_text(
         assert isinstance(task["relevant_device_ids"], list)
     assert data["agent_ids"] and data["agent_roles"]
 
-    # task_steps 仍在（前端冻结期兼容键），但它必须是 domain_tasks 的**投影**——
-    # 一一对应、带角色前缀，而不是模型写的一段自由文本。
+    # event schema 1.0 persisted-run compatibility.
     assert len(data["task_steps"]) == len(data["domain_tasks"])
     for step, task in zip(data["task_steps"], data["domain_tasks"], strict=True):
         assert step.startswith(f"{task['agent_role']}: ")
-
-
-async def test_orchestrator_disabled_restores_per_agent_reasoning_prefix(monkeypatch):
-    """strangler 逃生阀：关掉编排器时，域 agent 重新拥有自己的前三环（否则一环不剩）。"""
-
-    monkeypatch.setenv(ORCHESTRATOR_ENABLED_ENV, "0")
-    engine = _engine()
-    events = await _run_one_episode(engine, _arrives_home())
-
-    assert all(e.source != DEFAULT_ORCHESTRATOR_ID for e in events)
-    perceptions = [e for e in events if e.event_type == "reasoning.perception_snapshot"]
-    assert perceptions, "没有编排器时，感知环必须由域 agent 自己发"
-    assert all(e.data.get("agent_id") for e in perceptions)
-
 
 # ----------------------------------------------------------- 2. §15 事件顺序
 
@@ -243,7 +224,6 @@ async def test_orchestrator_disabled_restores_per_agent_reasoning_prefix(monkeyp
 async def test_event_ordering_root_before_reasoning_before_action_before_feedback(monkeypatch):
     """§4.4 / §15：根事件先于推理，推理先于动作，动作先于反馈——按发布序断言。"""
 
-    monkeypatch.setenv(ORCHESTRATOR_ENABLED_ENV, "1")
     engine = _engine()
     root = _arrives_home()
     events = await _run_one_episode(engine, root)
@@ -401,7 +381,6 @@ async def test_depth_cap_can_be_disabled(monkeypatch):
 async def test_real_episode_stays_far_below_the_depth_cap(monkeypatch):
     """真实 episode 的树深必须离上限有余量，否则这道闸会误伤正常链路。"""
 
-    monkeypatch.setenv(ORCHESTRATOR_ENABLED_ENV, "1")
     engine = _engine()
     events = await _run_one_episode(engine, _arrives_home())
 

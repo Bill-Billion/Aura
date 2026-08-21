@@ -672,7 +672,7 @@ def test_every_canonical_safety_constraint_has_an_executable_predicate() -> None
         if scenario.ground_truth is None or not scenario.ground_truth.safety_constraints:
             continue
         report = ScenarioEvaluator.from_scenario(scenario).evaluate(
-            [], scenario=scenario, scenario_id=scenario.id, seed=scenario.seed
+            [], scenario_id=scenario.id, seed=scenario.seed
         )
         safety_checks = report.metrics.user_intent_satisfied.details["safety_checks"]
         by_name = {item["constraint"]: item for item in safety_checks}
@@ -688,7 +688,7 @@ def test_unknown_required_metric_returns_explicit_error() -> None:
         update={"metrics": ["future_metric_not_implemented"]}
     )
     report = ScenarioEvaluator.from_scenario(scenario).evaluate(
-        complete_episode(), scenario=scenario
+        complete_episode()
     )
     assert report.outcome is EvalOutcome.ERROR
     assert report.failed_metrics == list(CANONICAL_METRIC_NAMES)
@@ -704,7 +704,7 @@ def test_library_required_metrics_are_canonical_and_reported_in_criteria() -> No
     for scenario in load_library().values():
         assert set(scenario.metrics) <= canonical, scenario.id
         report = ScenarioEvaluator.from_scenario(scenario).evaluate(
-            [], scenario=scenario, scenario_id=scenario.id, seed=scenario.seed
+            [], scenario_id=scenario.id, seed=scenario.seed
         )
         assert report.outcome is not EvalOutcome.ERROR, scenario.id
         metric_payload = report.metrics.to_dict()
@@ -819,7 +819,7 @@ def test_multi_user_conflict_contract_requires_at_least_one_real_conflict() -> N
     coordination["data"]["conflicts"] = []
 
     report = ScenarioEvaluator.from_scenario(fixture).evaluate(
-        zero_conflict_events, scenario=fixture
+        zero_conflict_events
     )
 
     assert report.metrics.conflict_count.value == 0
@@ -852,7 +852,7 @@ def test_latency_threshold_uses_worst_episode_not_mean() -> None:
             clone["wall_time"] = 100.350
         second.append(clone)
     report = ScenarioEvaluator.from_scenario(minimal_scenario()).evaluate(
-        events + second, scenario=minimal_scenario()
+        events + second
     )
     assert report.metrics.first_action_latency_ms.value == pytest.approx(237.5)
     assert report.metrics.first_action_latency_ms.details["max_latency_ms"] == pytest.approx(350.0)
@@ -865,7 +865,7 @@ def test_unterminated_command_ledger_cannot_pass_with_complete_effects() -> None
         item for item in complete_episode() if item["event_id"] != "succeeded"
     ]
     report = ScenarioEvaluator.from_scenario(minimal_scenario()).evaluate(
-        events, scenario=minimal_scenario()
+        events
     )
     assert report.metrics.episode_complete.value is True
     assert report.metrics.device_state_match_rate.value == 1.0

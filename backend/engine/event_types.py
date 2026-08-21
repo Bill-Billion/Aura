@@ -12,9 +12,8 @@
    场景校验放行的事件类型和运行期识别的事件类型迟早会分叉。
 2. **本模块零依赖**：只放字符串常量与纯函数，不 import 任何 engine/scenarios 模块，
    因此 agent 层、场景层、执行层都能安全引用它。
-3. **兼容期不砍旧名**：§4.1 明确"current event names may remain during migration"。
-   :data:`COMPAT_ALIAS` 给出富事件 → 旧兼容事件的回落映射，只订阅了旧名的消费者
-   （老前端过滤器、旧测试）据此仍能理解富事件属于哪一类。
+3. **兼容期不砍旧名**：§4.1 明确"current event names may remain during migration"，
+   因此旧生产者仍在使用的三个根事件继续属于运行期分类学。
 """
 
 from __future__ import annotations
@@ -49,8 +48,6 @@ __all__ = [
     "USER_MOVEMENT_EVENT_TYPES",
     "ENVIRONMENT_ROOT_EVENT_TYPES",
     "DEVICE_AVAILABILITY_EVENT_TYPES",
-    "COMPAT_ALIAS",
-    "compat_event_type",
     "is_root_event",
     "starts_agent_episode",
     "OUTSIDE_ROOM_ID",
@@ -143,34 +140,6 @@ ENVIRONMENT_ROOT_EVENT_TYPES: frozenset[str] = frozenset(
 )
 
 DEVICE_AVAILABILITY_EVENT_TYPES: frozenset[str] = frozenset({DEVICE_OFFLINE, DEVICE_RECOVERED})
-
-
-# 富事件 → 旧兼容事件（迁移期别名）。安防/安全/设备可用性事件没有旧对应物，
-# 它们在旧命名空间里根本不存在，故一律回落到 environment.state_refresh 之外的最近类别：
-#   - security.* / safety.* 是"世界状态变了"，回落 environment.state_refresh；
-#   - device.offline/recovered 同理（设备可用性也是世界状态）。
-COMPAT_ALIAS: dict[str, str] = {
-    USER_ARRIVES_HOME: USER_ACTIVITY_CHANGE,
-    USER_LEAVES_HOME: USER_ACTIVITY_CHANGE,
-    USER_ENTERS_ROOM: USER_ACTIVITY_CHANGE,
-    USER_EXITS_ROOM: USER_ACTIVITY_CHANGE,
-    USER_STARTS_ACTIVITY: USER_ACTIVITY_CHANGE,
-    USER_ENDS_ACTIVITY: USER_ACTIVITY_CHANGE,
-    ENVIRONMENT_WEATHER_CHANGE: ENVIRONMENT_STATE_REFRESH,
-    ENVIRONMENT_TEMPERATURE_THRESHOLD: ENVIRONMENT_STATE_REFRESH,
-    ENVIRONMENT_LIGHT_LEVEL_THRESHOLD: ENVIRONMENT_STATE_REFRESH,
-    SECURITY_PRESENCE_DETECTED: ENVIRONMENT_STATE_REFRESH,
-    SECURITY_DOOR_OPENED: ENVIRONMENT_STATE_REFRESH,
-    SAFETY_SMOKE_DETECTED: ENVIRONMENT_STATE_REFRESH,
-    DEVICE_OFFLINE: ENVIRONMENT_STATE_REFRESH,
-    DEVICE_RECOVERED: ENVIRONMENT_STATE_REFRESH,
-}
-
-
-def compat_event_type(event_type: str) -> str:
-    """富事件的迁移期别名；本身就是旧名（或未知类型）时原样返回。"""
-
-    return COMPAT_ALIAS.get(event_type, event_type)
 
 
 def is_root_event(event_type: str) -> bool:

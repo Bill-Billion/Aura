@@ -131,7 +131,7 @@ class SecurityAgent(BaseAgent):
         world_state: WorldState,
         root_event: SimEvent,
     ) -> PriorityLabel:
-        """迁移期的旧六值标签（AgentDecisionEnvelope 与旧 Arbiter 仍读它）。
+        """决策过程信封使用的旧六值标签。
 
         旧表**没有 security 这一档**，只能二选一，两边都是错的：
 

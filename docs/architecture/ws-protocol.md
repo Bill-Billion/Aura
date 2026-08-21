@@ -325,10 +325,6 @@ spec §4.3 的六环推理事件在 S3 之后有一条明确的所有权划分�
 
 降级环 `reasoning.fallback_rule_based` 是可选的第七类：编排器自己降级时由 `home_orchestrator` 发一条，域 agent 降级时各发一条。
 
-**S3 之前的形状（前端迁移注意）**：每个域 agent 都会各发一套 `perception_snapshot` / `intent_recognized` / `task_decomposition`，一条 correlation 下挂着 N 棵平行小树。现在前三环由编排器独占，域 agent 的感知与意图改由 `reasoning.execution_plan` 承载（见下）。按 `data.agent_id` 是否存在（或 `source` 是否等于 `home_orchestrator`）区分编排层与域层。
-
-关掉编排器（`ORCHESTRATOR_ENABLED=0`，strangler 逃生阀）时回到旧的扇出形状：域 agent 重新发自己的前三环。
-
 ### `reasoning.perception_snapshot`（编排层）
 
 ```json
@@ -337,14 +333,12 @@ spec §4.3 的六环推理事件在 S3 之后有一条明确的所有权划分�
   "trigger_event_type": "user.arrives_home",
   "search_space_device_types": ["light", "thermostat"],
   "search_space_resolved_from": "exact",
-  "default_policy": "comfort_first",
-  "world_summary": "user.arrives_home → 搜索空间 3 台设备 / 1 个房间（exact）",
-  "relevant_devices": ["light_living_01"],
-  "relevant_rooms": ["living_room"]
+  "default_policy": "comfort_first"
 }
 ```
 
-`world_summary` / `relevant_devices` / `relevant_rooms` 是前端冻结期的兼容键（面板当前直接读它们），值取自 `domain_tasks` 的并集，S5 换渲染后可删。
+`event_schema_version=1.0` 仍会同时携带 `world_summary`、`relevant_devices` 和
+`relevant_rooms`，供历史 run 与旧观察面板读取；这些字段只能随带迁移器的 v2 一起删除。
 
 ### `reasoning.intent_recognized`（编排层）
 
@@ -387,31 +381,37 @@ spec §4.3 的六环推理事件在 S3 之后有一条明确的所有权划分�
   "agent_roles": ["lighting"],
   "agent_ids": ["lighting_agent"],
   "noop_reason": null,
-  "outcome": "acted",
-  "task_steps": ["lighting: light the arrival path"]
+  "outcome": "acted"
 }
 ```
 
-`domain_tasks` 是权威：审计记下的坑是这一环里装的是 LLM 自由文本，S3 之后它是编排契约。`task_steps` 只是同一份契约的兼容投影（`"<role>: <task>"`），不是模型散文。
+`event_schema_version=1.0` 仍会携带由 `domain_tasks` 确定性投影得到的 `task_steps`。
 
 ### `reasoning.coordination_decision`
 
 ```json
 {
-  "agent_id": "lighting_agent",
-  "outcome": "approved",
-  "priority": "user_comfort",
-  "conflicts": [],
-  "winning_commands": [
+  "approved_commands": [
     {
+      "agent_id": "lighting_agent",
+      "agent_role": "lighting",
+      "priority": "comfort",
       "device_id": "light_living_01",
       "property": "extra.brightness",
       "value": 70,
       "reason": "occupied evening lighting"
     }
-  ]
+  ],
+  "rejected_commands": [],
+  "conflicts": [],
+  "winning_priority": "comfort",
+  "explanation": "lighting_agent proposal approved",
+  "per_agent": []
 }
 ```
+
+`event_schema_version=1.0` 还会输出 `agent_id`、`outcome`、`priority` 和
+`winning_commands`；§9.3 字段是权威表示，兼容键只能随带迁移器的 v2 一起删除。
 
 ### `reasoning.execution_plan`（域层，承载域 agent 的全部推理贡献）
 
