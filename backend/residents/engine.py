@@ -103,6 +103,10 @@ class ResidentEngine:
     def state_for(self, user_id: str) -> ResidentState | None:
         return self.states.get(user_id)
 
+    @property
+    def next_due_at_s(self) -> float | None:
+        return self._scheduled[0].at_sim_time_s if self._scheduled else None
+
     def inject_resident_state_change(
         self,
         user_id: str,

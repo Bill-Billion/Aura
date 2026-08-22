@@ -53,5 +53,11 @@ class SimTimeScheduler:
         self._sequence = itertools.count()
 
     @property
+    def next_due_at_s(self) -> float | None:
+        """Return the earliest deadline without consuming it."""
+
+        return self._queue[0].due_at_s if self._queue else None
+
+    @property
     def pending_count(self) -> int:
         return len(self._queue)

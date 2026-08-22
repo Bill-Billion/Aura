@@ -14,6 +14,7 @@ PublishEvent = Callable[[SimEvent], Awaitable[SimEvent]]
 # tick 体抛异常时的上报回调（SimulationEngine 注入）。返回后循环即停止：
 # "循环死了但 is_running 还是 True" 是 S2 之前的假活形态，绝不保留。
 TickErrorHandler = Callable[[BaseException], Awaitable[None]]
+BeforeTickHook = Callable[[int, float], Awaitable[None]]
 
 
 @dataclass(frozen=True)
@@ -35,9 +36,11 @@ class SimulatorTimer:
         default_mode: str = "observe",
         mode_specs: dict[str, SimulationModeSpec] | None = None,
         on_error: TickErrorHandler | None = None,
+        before_tick: BeforeTickHook | None = None,
     ) -> None:
         self._publish_event = publish_event
         self._on_error = on_error
+        self._before_tick = before_tick
         self.tick_interval = tick_interval
         self._mode_specs = mode_specs or {
             "observe": SimulationModeSpec(mode="observe", speed=1.0, simulated_dt=simulated_dt),
@@ -137,6 +140,8 @@ class SimulatorTimer:
 
     async def _emit_tick(self) -> SimEvent:
         self.current_tick += 1
+        if self._before_tick is not None:
+            await self._before_tick(self.current_tick, self.sim_time_s)
         return await self._publish_event(
             SimEvent(
                 event_type=TIMER_TICK_EVENT_TYPE,

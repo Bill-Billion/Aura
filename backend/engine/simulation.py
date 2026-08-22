@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from pathlib import Path
 from typing import Any, Iterable, Literal, Mapping
@@ -156,6 +157,7 @@ class SimulationEngine:
             # critic 修正③：tick 体的任何异常都必须把引擎停下并上报，而不是让循环
             # 静默死掉、is_running 继续说谎（"假活"）。
             on_error=self._handle_tick_error,
+            before_tick=self._advance_scheduled_runtimes,
         )
         # §4.5 三条生成产线（scripted/rule_based/stochastic）。默认 None＝交互式运行沿用
         # 既有 user_sim/env_sim 行为；场景 runner 在 reset 之后绑一份。
@@ -727,6 +729,40 @@ class SimulationEngine:
             # surrounding EventBus fan-out before finalization closes artifacts.
             self._is_processing_timer_tick = False
 
+    async def _advance_scheduled_runtimes(
+        self, timer_tick: int, sim_time_s: float
+    ) -> None:
+        """Publish due work before the tick that closes its time interval.
+
+        The simulator advances in coarse steps while devices retain exact
+        deadlines.  Draining after the closing tick would make persisted
+        ``sim_time_s`` move backwards.  Resident deadlines split the drain
+        into ordered intervals; ties remain resident-first so a safety event
+        can preempt a device completion at the same simulated instant.
+        """
+
+        resident_runtime = self.resident_engine
+        device_runtime = self.command_executor.device_runtime
+        world = self.state_manager.world
+        while resident_runtime is not None:
+            resident_due = resident_runtime.next_due_at_s
+            if resident_due is None or resident_due > sim_time_s:
+                break
+            await device_runtime.advance(
+                math.nextafter(resident_due, -math.inf),
+                tick=timer_tick,
+                active_run_id=self.run_id,
+            )
+            for resident_event in resident_runtime.advance(
+                world, sim_time_s=resident_due, tick=timer_tick
+            ):
+                await self._publish_sim_event(resident_event)
+        await device_runtime.advance(
+            sim_time_s,
+            tick=timer_tick,
+            active_run_id=self.run_id,
+        )
+
     async def _handle_timer_tick_body(self, event: SimEvent) -> None:
         world = self.state_manager.world
         self._pending_deltas = []
@@ -757,15 +793,6 @@ class SimulationEngine:
         )
 
         sim_time_s = self.sim_time_s
-        # Resident/safety perturbations are due before device completions at
-        # the same simulated instant.  This makes a scheduled safety event a
-        # real preemption boundary instead of an after-the-fact notification.
-        if self.resident_engine is not None:
-            for resident_event in self.resident_engine.advance(
-                world, sim_time_s=sim_time_s, tick=timer_tick
-            ):
-                await self._publish_sim_event(resident_event)
-        await self.command_executor.advance_device_runtime(sim_time_s, tick=timer_tick)
         sources = self.generation_sources
 
         # —— ① scripted：timeline 到点的根事件（+ 其设备命令，走 CommandExecutor）——
