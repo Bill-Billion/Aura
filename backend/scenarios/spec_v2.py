@@ -101,6 +101,8 @@ class ResidentStateChangePerturbation(_PerturbationBase):
     def _has_state_change(self) -> "ResidentStateChangePerturbation":
         if self.room_id is None and self.activity is None:
             raise ValueError("resident state change requires room_id or activity")
+        if self.at_sim_time_s is None:
+            raise ValueError("resident_state_change requires at_sim_time_s")
         return self
 
 
@@ -122,12 +124,24 @@ class ConflictingRequestPerturbation(_PerturbationBase):
     room_id: str = Field(min_length=1)
     intent: str = Field(min_length=1)
 
+    @model_validator(mode="after")
+    def _requires_absolute_time(self) -> "ConflictingRequestPerturbation":
+        if self.at_sim_time_s is None:
+            raise ValueError("conflicting_request requires at_sim_time_s")
+        return self
+
 
 class SafetyInterruptPerturbation(_PerturbationBase):
     type: Literal["safety_interrupt"] = "safety_interrupt"
     room_id: str = Field(min_length=1)
     event_type: Literal["safety.smoke_detected"] = "safety.smoke_detected"
     severity: Literal["warning", "critical"] = "critical"
+
+    @model_validator(mode="after")
+    def _requires_absolute_time(self) -> "SafetyInterruptPerturbation":
+        if self.at_sim_time_s is None:
+            raise ValueError("safety_interrupt requires at_sim_time_s")
+        return self
 
 
 class ObservationDelayPerturbation(_PerturbationBase):
@@ -218,6 +232,19 @@ class ScenarioSpecV2(ScenarioSpec):
                 "resident references must exist in initial_state.users: "
                 + ", ".join(unknown_residents)
             )
+        unknown_perturbation_users = sorted(
+            {
+                user_id
+                for item in self.perturbations
+                if (user_id := getattr(item, "user_id", None))
+                and user_id not in declared_users
+            }
+        )
+        if unknown_perturbation_users:
+            raise ValueError(
+                "resident perturbations must reference initial_state.users: "
+                + ", ".join(unknown_perturbation_users)
+            )
 
         if self.counterfactual.variant == "static" and self.perturbations:
             raise ValueError(
@@ -265,7 +292,7 @@ class ScenarioSpecV2(ScenarioSpec):
         }
 
 
-class DevicePerturbationRuntime(Protocol):
+class PerturbationRuntime(Protocol):
     def inject_device_failure(
         self, device_id: str, *, at_sim_time_s: float = 0.0
     ) -> None: ...
@@ -278,9 +305,36 @@ class DevicePerturbationRuntime(Protocol):
         at_sim_time_s: float = 0.0,
     ) -> None: ...
 
+    def inject_resident_state_change(
+        self,
+        user_id: str,
+        *,
+        room_id: str | None,
+        activity: str | None,
+        at_sim_time_s: float,
+    ) -> None: ...
+
+    def inject_conflicting_request(
+        self,
+        user_id: str,
+        *,
+        room_id: str,
+        intent: str,
+        at_sim_time_s: float,
+    ) -> None: ...
+
+    def inject_safety_interrupt(
+        self,
+        *,
+        room_id: str,
+        event_type: str,
+        severity: str,
+        at_sim_time_s: float,
+    ) -> None: ...
+
 
 def _handle_device_failure(
-    runtime: DevicePerturbationRuntime, perturbation: PerturbationSpec
+    runtime: PerturbationRuntime, perturbation: PerturbationSpec
 ) -> None:
     item = cast(DeviceFailurePerturbation, perturbation)
     runtime.inject_device_failure(
@@ -289,7 +343,7 @@ def _handle_device_failure(
 
 
 def _handle_feedback_loss(
-    runtime: DevicePerturbationRuntime, perturbation: PerturbationSpec
+    runtime: PerturbationRuntime, perturbation: PerturbationSpec
 ) -> None:
     item = cast(FeedbackLossPerturbation, perturbation)
     runtime.inject_feedback_loss(
@@ -299,13 +353,52 @@ def _handle_feedback_loss(
     )
 
 
+def _handle_resident_state_change(
+    runtime: PerturbationRuntime, perturbation: PerturbationSpec
+) -> None:
+    item = cast(ResidentStateChangePerturbation, perturbation)
+    runtime.inject_resident_state_change(
+        item.user_id,
+        room_id=item.room_id,
+        activity=item.activity,
+        at_sim_time_s=item.at_sim_time_s or 0.0,
+    )
+
+
+def _handle_conflicting_request(
+    runtime: PerturbationRuntime, perturbation: PerturbationSpec
+) -> None:
+    item = cast(ConflictingRequestPerturbation, perturbation)
+    runtime.inject_conflicting_request(
+        item.user_id,
+        room_id=item.room_id,
+        intent=item.intent,
+        at_sim_time_s=item.at_sim_time_s or 0.0,
+    )
+
+
+def _handle_safety_interrupt(
+    runtime: PerturbationRuntime, perturbation: PerturbationSpec
+) -> None:
+    item = cast(SafetyInterruptPerturbation, perturbation)
+    runtime.inject_safety_interrupt(
+        room_id=item.room_id,
+        event_type=item.event_type,
+        severity=item.severity,
+        at_sim_time_s=item.at_sim_time_s or 0.0,
+    )
+
+
 # Deliberately explicit and closed: PR-3 resident interventions are not silently ignored.
 PERTURBATION_HANDLER_REGISTRY = {
     "device_failure": _handle_device_failure,
     "feedback_loss": _handle_feedback_loss,
+    "resident_state_change": _handle_resident_state_change,
+    "conflicting_request": _handle_conflicting_request,
+    "safety_interrupt": _handle_safety_interrupt,
 }
 PerturbationHandler: TypeAlias = Callable[
-    [DevicePerturbationRuntime, PerturbationSpec], None
+    [PerturbationRuntime, PerturbationSpec], None
 ]
 CompiledPerturbation: TypeAlias = tuple[PerturbationHandler, PerturbationSpec]
 
@@ -318,15 +411,13 @@ def unsupported_perturbations(spec: ScenarioSpecV2) -> list[PerturbationSpec]:
     ]
 
 
-def configure_device_perturbations(
-    spec: ScenarioSpecV2, runtime: DevicePerturbationRuntime
+def configure_perturbations(
+    spec: ScenarioSpecV2, runtime: PerturbationRuntime
 ) -> None:
-    apply_compiled_device_perturbations(
-        compile_device_perturbations(spec), runtime
-    )
+    apply_compiled_perturbations(compile_perturbations(spec), runtime)
 
 
-def compile_device_perturbations(
+def compile_perturbations(
     spec: ScenarioSpecV2,
 ) -> tuple[CompiledPerturbation, ...]:
     """Resolve every handler before a run is committed."""
@@ -341,12 +432,19 @@ def compile_device_perturbations(
     )
 
 
-def apply_compiled_device_perturbations(
+def apply_compiled_perturbations(
     compiled: tuple[CompiledPerturbation, ...],
-    runtime: DevicePerturbationRuntime,
+    runtime: PerturbationRuntime,
 ) -> None:
     for handler, item in compiled:
         handler(runtime, item)
+
+
+# Compatibility names introduced by PR-2.  Keep them while callers migrate to
+# the now-generic registry that also includes resident perturbations.
+configure_device_perturbations = configure_perturbations
+compile_device_perturbations = compile_perturbations
+apply_compiled_device_perturbations = apply_compiled_perturbations
 
 
 __all__ = [
@@ -366,8 +464,11 @@ __all__ = [
     "ResidentStateChangePerturbation",
     "SafetyInterruptPerturbation",
     "ScenarioSpecV2",
+    "apply_compiled_perturbations",
     "apply_compiled_device_perturbations",
+    "compile_perturbations",
     "compile_device_perturbations",
+    "configure_perturbations",
     "configure_device_perturbations",
     "unsupported_perturbations",
 ]

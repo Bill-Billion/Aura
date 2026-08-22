@@ -33,8 +33,11 @@ from backend.execution.executor import (
 )
 from backend.scenarios.spec_v2 import (
     PERTURBATION_HANDLER_REGISTRY,
+    ConflictingRequestPerturbation,
     DeviceFailurePerturbation,
     FeedbackLossPerturbation,
+    ResidentStateChangePerturbation,
+    SafetyInterruptPerturbation,
 )
 
 
@@ -93,12 +96,33 @@ def test_scheduler_has_stable_tie_breaking() -> None:
 
 
 def test_device_perturbation_registry_is_explicit_and_requires_time() -> None:
-    assert set(PERTURBATION_HANDLER_REGISTRY) == {"device_failure", "feedback_loss"}
+    assert set(PERTURBATION_HANDLER_REGISTRY) == {
+        "device_failure",
+        "feedback_loss",
+        "resident_state_change",
+        "conflicting_request",
+        "safety_interrupt",
+    }
     with pytest.raises(ValidationError, match="requires at_sim_time_s"):
         DeviceFailurePerturbation(phase="during_execution", device_id="light")
     with pytest.raises(ValidationError, match="requires at_sim_time_s"):
         FeedbackLossPerturbation(
             phase="after_execution_before_feedback", device_id="light"
+        )
+    with pytest.raises(ValidationError, match="requires at_sim_time_s"):
+        ResidentStateChangePerturbation(
+            phase="after_plan_before_execution", user_id="user", activity="away"
+        )
+    with pytest.raises(ValidationError, match="requires at_sim_time_s"):
+        ConflictingRequestPerturbation(
+            phase="after_plan_before_execution",
+            user_id="user",
+            room_id="living_room",
+            intent="turn it off",
+        )
+    with pytest.raises(ValidationError, match="requires at_sim_time_s"):
+        SafetyInterruptPerturbation(
+            phase="during_execution", room_id="living_room"
         )
 
 
