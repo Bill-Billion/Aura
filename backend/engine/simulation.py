@@ -22,6 +22,7 @@ from backend.devices.latency import (
 )
 from backend.engine.event_bus import EventBus, SimEvent, WorldEvent
 from backend.engine.event_log import RunArtifactRecorder, attach_run_artifacts
+from backend.engine.provenance import ExperimentProvenance
 from backend.engine.event_types import (
     ENGINE_ERROR_EVENT_TYPE,
     ENVIRONMENT_STATE_REFRESH,
@@ -138,6 +139,7 @@ class SimulationEngine:
         connection_manager: ConnectionManager,
         llm_provider: LLMProvider | None = None,
         agent_episode_timeout_ms: int | None = None,
+        run_artifacts_root: Path | str | None = None,
     ) -> None:
         self.event_bus = event_bus
         self.state_manager = state_manager
@@ -209,7 +211,10 @@ class SimulationEngine:
         # §11 工件：run 一开就有目录，事件随发随落（data/runs/{run_id}/）。
         # 挂在 RunManager 上而不是挂在引擎方法上——场景 runner 会直接调
         # run_manager.end_run("completed")，那条路径同样必须把 run.json 收尾。
-        self.run_artifacts: RunArtifactRecorder = attach_run_artifacts(self.run_manager)
+        self.run_artifacts: RunArtifactRecorder = attach_run_artifacts(
+            self.run_manager,
+            root=run_artifacts_root,
+        )
         self._start_run(scenario_id=None, seed=None, clear_event_history=False)
 
         self._subscribe_handlers()
@@ -299,6 +304,7 @@ class SimulationEngine:
         counterfactual_group_id: str | None = None,
         counterfactual_variant: Literal["static", "dynamic"] | None = None,
         trace_spec_hash: str | None = None,
+        experiment: ExperimentProvenance | None = None,
         clear_event_history: bool = True,
     ) -> RunMetadata:
         """开一个新 run 并把 §11 元数据补齐（provider/model/agent 版本从运行期取）。
@@ -339,6 +345,7 @@ class SimulationEngine:
             counterfactual_group_id=counterfactual_group_id,
             counterfactual_variant=counterfactual_variant,
             trace_spec_hash=trace_spec_hash,
+            experiment=experiment,
             agent_versions=agent_versions,
             run_id=assigned_run_id,
             clear_event_history=clear_event_history,
@@ -442,6 +449,7 @@ class SimulationEngine:
         stochastic_overrides: Mapping[str, Any] | None = None,
         policy_selection: RuntimePolicySelection | None = None,
         duration_seconds: float | None = None,
+        experiment: ExperimentProvenance | None = None,
     ) -> None:
         """重置世界并开一个**新 run**（§11）。
 
@@ -591,6 +599,7 @@ class SimulationEngine:
             trace_spec_hash=(
                 scenario_trace_spec_fingerprint(spec) if spec is not None else None
             ),
+            experiment=experiment,
         )
         if isinstance(spec, ScenarioSpecV2):
             self.resident_engine = ResidentEngine(
