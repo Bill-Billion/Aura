@@ -161,6 +161,7 @@ class LifecycleTransition:
     detail: str | None
     tick: int
     wall_time: float
+    sim_time_s: float | None = None
 
 
 class CommandRecord:
@@ -218,6 +219,7 @@ class CommandRecord:
         *,
         detail: str | None = None,
         tick: int | None = None,
+        sim_time_s: float | None = None,
     ) -> SimEvent | None:
         """迁移到 *to*：先校验合法性、再落状态、最后发事件。
 
@@ -246,6 +248,7 @@ class CommandRecord:
             failure=failure,
             detail=detail,
             tick=tick,
+            sim_time_s=sim_time_s,
         )
 
     def build_lifecycle_event(
@@ -256,6 +259,7 @@ class CommandRecord:
         failure: str | None = None,
         detail: str | None = None,
         tick: int | None = None,
+        sim_time_s: float | None = None,
     ) -> SimEvent:
         """把一次迁移物化为 SimEvent（不发布，供纯数据/测试使用）。
 
@@ -286,6 +290,7 @@ class CommandRecord:
             correlation_id=self.command.correlation_id,
             causal_parent=self.command.causal_parent,
             priority=self.command.priority,
+            sim_time_s=sim_time_s,
             data=data,
         )
 
@@ -297,6 +302,7 @@ class CommandRecord:
         failure: str | None,
         detail: str | None,
         tick: int | None,
+        sim_time_s: float | None = None,
     ) -> SimEvent:
         event = self.build_lifecycle_event(
             from_status=from_status,
@@ -304,6 +310,7 @@ class CommandRecord:
             failure=failure,
             detail=detail,
             tick=tick,
+            sim_time_s=sim_time_s,
         )
         self.updated_at = event.wall_time
         self.history.append(
@@ -314,6 +321,7 @@ class CommandRecord:
                 detail=detail,
                 tick=int(event.timestamp),
                 wall_time=event.wall_time,
+                sim_time_s=event.sim_time_s,
             )
         )
         if self.publish_event is not None:

@@ -97,6 +97,12 @@ class SimulatorTimer:
         self.current_tick = 0
         self._stop_requested.clear()
 
+    @property
+    def sim_time_s(self) -> float:
+        """Run-relative simulated seconds; tick 1 is t=0 in both drive modes."""
+
+        return max(0, self.current_tick - 1) * float(self.simulated_dt)
+
     def set_mode(self, mode: str) -> None:
         spec = self._mode_specs.get(mode, self._mode_specs["observe"])
         self.mode = spec.mode

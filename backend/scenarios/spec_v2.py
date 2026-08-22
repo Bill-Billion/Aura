@@ -10,7 +10,8 @@ they do not execute perturbations or verify traces in PR-1.
 from __future__ import annotations
 
 import math
-from typing import Annotated, Any, Literal, TypeAlias
+from collections.abc import Callable
+from typing import Annotated, Any, Literal, Protocol, TypeAlias, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -108,6 +109,12 @@ class DeviceFailurePerturbation(_PerturbationBase):
     device_id: str = Field(min_length=1)
     failure: Literal["offline"] = "offline"
 
+    @model_validator(mode="after")
+    def _requires_absolute_time(self) -> "DeviceFailurePerturbation":
+        if self.at_sim_time_s is None:
+            raise ValueError("device_failure requires at_sim_time_s")
+        return self
+
 
 class ConflictingRequestPerturbation(_PerturbationBase):
     type: Literal["conflicting_request"] = "conflicting_request"
@@ -143,6 +150,12 @@ class FeedbackLossPerturbation(_PerturbationBase):
     type: Literal["feedback_loss"] = "feedback_loss"
     device_id: str = Field(min_length=1)
     drop_count: int = Field(default=1, ge=1, strict=True)
+
+    @model_validator(mode="after")
+    def _requires_absolute_time(self) -> "FeedbackLossPerturbation":
+        if self.at_sim_time_s is None:
+            raise ValueError("feedback_loss requires at_sim_time_s")
+        return self
 
 
 PerturbationSpec: TypeAlias = Annotated[
@@ -252,7 +265,92 @@ class ScenarioSpecV2(ScenarioSpec):
         }
 
 
+class DevicePerturbationRuntime(Protocol):
+    def inject_device_failure(
+        self, device_id: str, *, at_sim_time_s: float = 0.0
+    ) -> None: ...
+
+    def inject_feedback_loss(
+        self,
+        device_id: str,
+        *,
+        drop_count: int = 1,
+        at_sim_time_s: float = 0.0,
+    ) -> None: ...
+
+
+def _handle_device_failure(
+    runtime: DevicePerturbationRuntime, perturbation: PerturbationSpec
+) -> None:
+    item = cast(DeviceFailurePerturbation, perturbation)
+    runtime.inject_device_failure(
+        item.device_id, at_sim_time_s=item.at_sim_time_s or 0.0
+    )
+
+
+def _handle_feedback_loss(
+    runtime: DevicePerturbationRuntime, perturbation: PerturbationSpec
+) -> None:
+    item = cast(FeedbackLossPerturbation, perturbation)
+    runtime.inject_feedback_loss(
+        item.device_id,
+        drop_count=item.drop_count,
+        at_sim_time_s=item.at_sim_time_s or 0.0,
+    )
+
+
+# Deliberately explicit and closed: PR-3 resident interventions are not silently ignored.
+PERTURBATION_HANDLER_REGISTRY = {
+    "device_failure": _handle_device_failure,
+    "feedback_loss": _handle_feedback_loss,
+}
+PerturbationHandler: TypeAlias = Callable[
+    [DevicePerturbationRuntime, PerturbationSpec], None
+]
+CompiledPerturbation: TypeAlias = tuple[PerturbationHandler, PerturbationSpec]
+
+
+def unsupported_perturbations(spec: ScenarioSpecV2) -> list[PerturbationSpec]:
+    return [
+        item
+        for item in spec.perturbations
+        if item.type not in PERTURBATION_HANDLER_REGISTRY
+    ]
+
+
+def configure_device_perturbations(
+    spec: ScenarioSpecV2, runtime: DevicePerturbationRuntime
+) -> None:
+    apply_compiled_device_perturbations(
+        compile_device_perturbations(spec), runtime
+    )
+
+
+def compile_device_perturbations(
+    spec: ScenarioSpecV2,
+) -> tuple[CompiledPerturbation, ...]:
+    """Resolve every handler before a run is committed."""
+
+    unsupported = unsupported_perturbations(spec)
+    if unsupported:
+        names = ", ".join(sorted({item.type for item in unsupported}))
+        raise ValueError(f"unsupported perturbation handlers: {names}")
+    return tuple(
+        (PERTURBATION_HANDLER_REGISTRY[item.type], item)
+        for item in spec.perturbations
+    )
+
+
+def apply_compiled_device_perturbations(
+    compiled: tuple[CompiledPerturbation, ...],
+    runtime: DevicePerturbationRuntime,
+) -> None:
+    for handler, item in compiled:
+        handler(runtime, item)
+
+
 __all__ = [
+    "PERTURBATION_HANDLER_REGISTRY",
     "BenchmarkMetadata",
     "ConflictingRequestPerturbation",
     "CounterfactualFactor",
@@ -268,4 +366,8 @@ __all__ = [
     "ResidentStateChangePerturbation",
     "SafetyInterruptPerturbation",
     "ScenarioSpecV2",
+    "apply_compiled_device_perturbations",
+    "compile_device_perturbations",
+    "configure_device_perturbations",
+    "unsupported_perturbations",
 ]
