@@ -34,10 +34,15 @@ from backend.agents.llm import LLMProvider
 from backend.api.ws import ConnectionManager
 from backend.core.logging import log
 from backend.engine.event_bus import EventBus, SimEvent
+from backend.engine.provenance import (
+    ExperimentProvenance,
+    ExperimentRuntimeSelection,
+)
 from backend.engine.rng import SimRandom, validate_seed
 from backend.engine.run_manager import RunMetadata
 from backend.engine.simulation import SimulationEngine
 from backend.engine.state_manager import StateManager
+from backend.models.schemas import BaselinePolicy
 from backend.scenarios.apply import (
     InitialStateApplication,
     InitialStateApplyError,
@@ -158,6 +163,10 @@ class ScenarioRunner:
         episode_settle_timeout_s: float = EPISODE_SETTLE_TIMEOUT_S,
         stochastic_overrides: dict[str, Any] | None = None,
         seed: int | None = None,
+        baseline_policy: BaselinePolicy | None = None,
+        experiment: ExperimentProvenance | None = None,
+        experiment_runtime: ExperimentRuntimeSelection | None = None,
+        run_artifacts_root: Path | str | None = None,
     ) -> None:
         self.spec = spec
         self.seed = validate_seed(spec.seed if seed is None else seed)
@@ -170,6 +179,18 @@ class ScenarioRunner:
             raise ValueError("episode_settle_timeout_s 必须是有限正数")
         self.episode_settle_timeout_s = float(episode_settle_timeout_s)
         self.stochastic_overrides = stochastic_overrides
+        if experiment is not None:
+            if experiment_runtime is None:
+                raise ValueError(
+                    "experiment provenance requires an activated runtime condition"
+                )
+            experiment_runtime.validate_provenance(experiment)
+            if baseline_policy is not experiment_runtime.baseline_policy:
+                raise ValueError("baseline policy does not match the runtime condition")
+        elif experiment_runtime is not None:
+            raise ValueError("runtime experiment condition requires provenance")
+        self.baseline_policy = baseline_policy
+        self.experiment = experiment
         self._collected: list[SimEvent] = []
 
         self.state_manager, self.initial_state_application = self._build_world(spec)
@@ -183,6 +204,7 @@ class ScenarioRunner:
             # 悄悄发起真实网络调用（§11.1 的 mocked 模式才是本阶段门的对象）。
             llm_provider=llm_provider or _DisabledProvider(),
             agent_episode_timeout_ms=episode_timeout_ms,
+            run_artifacts_root=run_artifacts_root,
         )
         if tick_interval is not None:
             self.engine.timer.tick_interval = float(tick_interval)
@@ -229,12 +251,19 @@ class ScenarioRunner:
         # 传 ScenarioSpec 而非裸 id：reset 会核对场景出身、（幂等地）复摆 initial_state，
         # 并装上 §4.5 三条产线——装配只有那一处，活着的服务端与本 runner 共用它
         # （S2 review major-1/major-2）。
+        policy_selection = (
+            engine.agent_runtime.prepare_baseline_policy(self.baseline_policy)
+            if self.baseline_policy is not None
+            else None
+        )
         await engine.reset(
             new_state_manager=self.state_manager,
             scenario=self.spec,
             seed=self.seed,
             stochastic_overrides=self.stochastic_overrides,
             duration_seconds=duration,
+            policy_selection=policy_selection,
+            experiment=self.experiment,
         )
         engine.mode = scenario_world_mode(self.spec.mode)
 

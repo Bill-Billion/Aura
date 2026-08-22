@@ -721,6 +721,7 @@ class ScenarioEvaluator:
             "recording_source_run_id": run_metadata.get("recording_source_run_id"),
             "initial_state_hash": run_metadata.get("initial_state_hash"),
             "trace_spec_hash": run_metadata.get("trace_spec_hash"),
+            "experiment": run_metadata.get("experiment"),
             "required_metrics": list(scenario.metrics) if scenario is not None else [],
         }
 

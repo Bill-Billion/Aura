@@ -80,4 +80,3 @@ def goal_for_activity(activity: str) -> str:
     if normalized in {"away", "leaving"}:
         return "home_unoccupied"
     return "ambient_comfort"
-
