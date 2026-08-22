@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import re
 from dataclasses import dataclass, field
-from typing import Any, Mapping, TypeAlias
+from typing import Any, Literal, Mapping, TypeAlias
 
 from backend.engine.event_types import starts_agent_episode
 
@@ -88,6 +88,10 @@ class MetricsCollector:
     device_rooms: dict[str, str] = field(default_factory=dict)
     device_types: dict[str, str] = field(default_factory=dict)
     success_criteria: dict[str, Any] = field(default_factory=dict)
+    # Historical v1 reports are defined by the observable feedback stream.
+    # AuraBench v2 evaluates the physical result from device ground truth so a
+    # dropped feedback packet cannot turn an applied effect into a false miss.
+    state_evidence_source: Literal["feedback", "device_effect"] = "feedback"
     _by_type: dict[str, list[EventLike]] = field(default_factory=dict, init=False)
     _by_correlation: dict[str, list[EventLike]] = field(default_factory=dict, init=False)
 
@@ -496,13 +500,16 @@ def _read_path(state: Mapping[str, Any], path: str) -> Any:
     return value
 
 
-def _state_evidence(collector: MetricsCollector) -> tuple[dict[str, dict[str, Any]], dict[tuple[str, str], float]]:
+def _state_evidence(
+    collector: MetricsCollector,
+) -> tuple[dict[str, dict[str, Any]], dict[tuple[str, str], float]]:
     states = copy.deepcopy(collector.initial_device_states)
     change_times: dict[tuple[str, str], float] = {}
-    for event in collector.events_of_type("feedback.state_delta"):
-        match = _DEVICE_PATH_RE.match(str(_event_data(event, "path", "")))
+
+    def apply_delta(event: EventLike, delta: Mapping[str, Any]) -> None:
+        match = _DEVICE_PATH_RE.match(str(delta.get("path", "")))
         if not match:
-            continue
+            return
         device_id, property_path = match.groups()
         cursor = states.setdefault(device_id, {})
         parts = property_path.split(".")
@@ -512,8 +519,22 @@ def _state_evidence(collector: MetricsCollector) -> tuple[dict[str, dict[str, An
                 child = {}
                 cursor[part] = child
             cursor = child
-        cursor[parts[-1]] = _event_data(event, "new_value")
+        cursor[parts[-1]] = delta.get("new_value")
         change_times[(device_id, property_path)] = _sim_time(event)
+
+    if collector.state_evidence_source == "device_effect":
+        for event in collector.events_of_type("device.effect_applied"):
+            deltas = _event_data(event, "deltas", [])
+            if not isinstance(deltas, list):
+                continue
+            for delta in deltas:
+                if isinstance(delta, Mapping):
+                    apply_delta(event, delta)
+    else:
+        for event in collector.events_of_type("feedback.state_delta"):
+            data = _get(event, "data", {})
+            if isinstance(data, Mapping):
+                apply_delta(event, data)
     return states, change_times
 
 
