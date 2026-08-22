@@ -17,6 +17,7 @@ from pydantic import ValidationError
 
 from backend.engine.rng import MAX_JSON_SAFE_SEED
 from backend.models.versioning import (
+    LEGACY_SCENARIO_SCHEMA_VERSION,
     SUPPORTED_SCENARIO_SCHEMA_VERSION,
     SchemaVersionError,
     check_schema_compatibility,
@@ -34,7 +35,6 @@ from backend.scenarios.spec import (
     ScenarioSpec,
     SuccessCriteria,
 )
-
 
 # —— spec §5.2 原文示例（逐字复制，仅补 §5.1 要求但示例省略的 description）——
 SPEC_5_2_EXAMPLE = """
@@ -158,7 +158,7 @@ def test_spec_5_2_example_yaml_roundtrips(tmp_path):
     assert spec.seed == 1001
     assert spec.duration_seconds == 180
     assert spec.mode == "observe"  # 可选字段缺省
-    assert spec.scenario_schema_version == SUPPORTED_SCENARIO_SCHEMA_VERSION
+    assert spec.scenario_schema_version == LEGACY_SCENARIO_SCHEMA_VERSION
 
     assert spec.initial_state.time_of_day == "18:30"
     assert spec.initial_state.weather == "cloudy"
@@ -427,7 +427,7 @@ def test_check_schema_compatibility_three_branches():
 
 def test_higher_minor_with_extra_optional_field_accepted_and_logged(tmp_path):
     """高 MINOR 已知兼容：未知可选字段被接受并记日志（S4-T1 §14 兼容测试依赖此行为）。"""
-    major, minor = parse_schema_version(SUPPORTED_SCENARIO_SCHEMA_VERSION)
+    major, minor = parse_schema_version(LEGACY_SCENARIO_SCHEMA_VERSION)
     future = f"{major}.{minor + 5}"
     body = (
         SPEC_5_2_EXAMPLE

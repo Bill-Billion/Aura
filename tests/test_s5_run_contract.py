@@ -385,6 +385,7 @@ async def test_ambient_device_command_cannot_cross_into_concurrent_canonical_lau
         (ScenarioLaunchErrorCode.RECORDING_SOURCE_MISMATCH, 409),
         (ScenarioLaunchErrorCode.RECORDING_SOURCE_INVALID, 422),
         (ScenarioLaunchErrorCode.IDEMPOTENCY_CONFLICT, 409),
+        (ScenarioLaunchErrorCode.PERTURBATION_RUNTIME_UNAVAILABLE, 501),
     ],
 )
 async def test_launch_policy_errors_keep_their_structured_http_status(

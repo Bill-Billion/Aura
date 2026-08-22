@@ -5,8 +5,13 @@ from __future__ import annotations
 import hashlib
 import json
 
-from backend.config.device_registry import build_default_rooms, get_default_device_registry
+from backend.config.device_registry import (
+    build_default_rooms,
+    get_default_device_registry,
+)
 from backend.scenarios.spec import ScenarioSpec
+from backend.scenarios.spec_v2 import ScenarioSpecV2
+from backend.scenarios.trace_spec import trace_spec_fingerprint
 
 SCENARIO_CONTRACT_FINGERPRINT_VERSION = "1"
 
@@ -40,4 +45,16 @@ def scenario_contract_fingerprint(spec: ScenarioSpec) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-__all__ = ["SCENARIO_CONTRACT_FINGERPRINT_VERSION", "scenario_contract_fingerprint"]
+def scenario_trace_spec_fingerprint(spec: ScenarioSpec) -> str | None:
+    """Return the independently addressable TraceSpec digest for v2 scenarios."""
+
+    if not isinstance(spec, ScenarioSpecV2):
+        return None
+    return trace_spec_fingerprint(spec.trace_spec)
+
+
+__all__ = [
+    "SCENARIO_CONTRACT_FINGERPRINT_VERSION",
+    "scenario_contract_fingerprint",
+    "scenario_trace_spec_fingerprint",
+]

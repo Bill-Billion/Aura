@@ -31,12 +31,12 @@ from pydantic import (
 
 from backend.engine.event_types import (
     ALLOWED_TIMELINE_EVENT_TYPES,
-    COMPAT_ROOT_EVENT_TYPES,
-    ROOT_EVENT_TYPES,
+    COMPAT_ROOT_EVENT_TYPES,  # noqa: F401 - compatibility re-export
+    ROOT_EVENT_TYPES,  # noqa: F401 - public taxonomy re-export
 )
 from backend.engine.rng import MAX_JSON_SAFE_SEED
 from backend.execution.validation import CommandErrorCode
-from backend.models.versioning import SUPPORTED_SCENARIO_SCHEMA_VERSION
+from backend.models.versioning import LEGACY_SCENARIO_SCHEMA_VERSION
 
 # §10.2 失败码词表的字符串投影。场景层只需要"这个码是否合法"，不需要枚举成员本身；
 # 唯一来源仍是 backend/execution/validation.py::CommandErrorCode，这里绝不再抄一份。
@@ -419,7 +419,7 @@ class ScenarioSpec(_StrictModel):
     """§5.1 全字段场景契约。"""
 
     # §14 预埋。YAML 里请**加引号**写（1.10 不加引号会被 YAML 读成 float 1.1）。
-    scenario_schema_version: str = SUPPORTED_SCENARIO_SCHEMA_VERSION
+    scenario_schema_version: str = LEGACY_SCENARIO_SCHEMA_VERSION
 
     # —— 必填（§5.1 Required fields）——
     id: str = Field(min_length=1)

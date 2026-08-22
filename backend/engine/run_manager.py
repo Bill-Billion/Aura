@@ -37,7 +37,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -343,6 +343,9 @@ class RunMetadata(BaseModel):
     duration_seconds: float | None = None
     scenario_schema_version: str = SUPPORTED_SCENARIO_SCHEMA_VERSION
     scenario_contract_hash: str | None = None
+    counterfactual_group_id: str | None = None
+    counterfactual_variant: Literal["static", "dynamic"] | None = None
+    trace_spec_hash: str | None = None
     event_schema_version: str = SUPPORTED_EVENT_SCHEMA_VERSION
     command_schema_version: str = SUPPORTED_COMMAND_SCHEMA_VERSION
     device_registry_version: str = SUPPORTED_DEVICE_REGISTRY_VERSION
@@ -435,6 +438,9 @@ class RunManager:
         duration_seconds: float | None = None,
         scenario_schema_version: str | None = None,
         scenario_contract_hash: str | None = None,
+        counterfactual_group_id: str | None = None,
+        counterfactual_variant: Literal["static", "dynamic"] | None = None,
+        trace_spec_hash: str | None = None,
         agent_versions: Mapping[str, str] | None = None,
         run_id: str | None = None,
         clear_event_history: bool = True,
@@ -473,6 +479,9 @@ class RunManager:
                 scenario_schema_version or SUPPORTED_SCENARIO_SCHEMA_VERSION
             ),
             scenario_contract_hash=scenario_contract_hash,
+            counterfactual_group_id=counterfactual_group_id,
+            counterfactual_variant=counterfactual_variant,
+            trace_spec_hash=trace_spec_hash,
             initial_state_hash=compute_initial_state_hash(world),
         )
 

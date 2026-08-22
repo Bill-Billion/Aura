@@ -20,14 +20,19 @@ from typing import Any, Iterable, Sequence
 import yaml
 from pydantic import ValidationError
 
-from backend.config.device_registry import build_default_rooms, get_default_device_registry
+from backend.config.device_registry import (
+    build_default_rooms,
+    get_default_device_registry,
+)
 from backend.core.logging import log
 from backend.models.versioning import (
-    SUPPORTED_SCENARIO_SCHEMA_VERSION,
+    LEGACY_SCENARIO_SCHEMA_VERSION,
     SchemaVersionError,
-    check_schema_compatibility,
+    check_scenario_schema_compatibility,
 )
+from backend.scenarios.counterfactual import validate_counterfactual_pairs
 from backend.scenarios.spec import ScenarioSpec
+from backend.scenarios.spec_v2 import ScenarioSpecV2
 
 # 默认场景库目录。列表形式是有意的：S3/S4 追加目录时只改调用方传入的列表。
 DEFAULT_LIBRARY_DIRS: tuple[Path, ...] = (Path(__file__).resolve().parent / "library",)
@@ -140,6 +145,8 @@ def _validate_with_tolerance(
     *,
     strict: bool,
     path: Path | None,
+    model: type[ScenarioSpec] = ScenarioSpec,
+    supported_version: str = LEGACY_SCENARIO_SCHEMA_VERSION,
 ) -> ScenarioSpec:
     """严格模式直接校验；容忍模式（高 MINOR）剥离未知**可选**字段后重试并记日志。
 
@@ -152,7 +159,7 @@ def _validate_with_tolerance(
 
     for _ in range(8):  # 每轮会一次性剥掉本轮报出的全部未知字段，正常 1-2 轮收敛
         try:
-            spec = ScenarioSpec.model_validate(working)
+            spec = model.model_validate(working)
         except ValidationError as exc:
             if strict:
                 raise ScenarioLoadError(
@@ -188,7 +195,7 @@ def _validate_with_tolerance(
                 path=str(path) if path is not None else None,
                 scenario_id=spec.id,
                 declared_schema_version=spec.scenario_schema_version,
-                supported_schema_version=SUPPORTED_SCENARIO_SCHEMA_VERSION,
+                supported_schema_version=supported_version,
                 dropped_fields=dropped,
             )
         return spec
@@ -218,9 +225,9 @@ def parse_scenario_mapping(
             path=path,
         )
 
-    declared = data.get("scenario_schema_version", SUPPORTED_SCENARIO_SCHEMA_VERSION)
+    declared = data.get("scenario_schema_version", LEGACY_SCENARIO_SCHEMA_VERSION)
     try:
-        compatibility = check_schema_compatibility(declared)
+        compatibility = check_scenario_schema_compatibility(declared)
     except SchemaVersionError as exc:
         raise ScenarioLoadError(
             ScenarioLoadErrorCode.UNSUPPORTED_SCHEMA_VERSION,
@@ -229,7 +236,16 @@ def parse_scenario_mapping(
             details=exc.to_dict(),
         ) from exc
 
-    spec = _validate_with_tolerance(data, strict=compatibility.strict, path=path)
+    model: type[ScenarioSpec] = (
+        ScenarioSpecV2 if compatibility.declared[0] == 2 else ScenarioSpec
+    )
+    spec = _validate_with_tolerance(
+        data,
+        strict=compatibility.strict,
+        path=path,
+        model=model,
+        supported_version=f"{compatibility.supported[0]}.{compatibility.supported[1]}",
+    )
     if check_registry:
         _check_registry_references(spec, path)
     return spec
@@ -278,6 +294,7 @@ def load_library(
     dirs: Iterable[Path | str] | None = None,
     *,
     check_registry: bool = True,
+    validate_pairs: bool = False,
 ) -> dict[str, ScenarioSpec]:
     """加载若干目录下的全部场景，返回按 id 排序的 {scenario_id: ScenarioSpec}。
 
@@ -297,7 +314,11 @@ def load_library(
             )
         library[spec.id] = spec
         origin[spec.id] = file_path
-    return {scenario_id: library[scenario_id] for scenario_id in sorted(library)}
+    ordered = {scenario_id: library[scenario_id] for scenario_id in sorted(library)}
+    if validate_pairs:
+        v2_specs = [spec for spec in ordered.values() if isinstance(spec, ScenarioSpecV2)]
+        validate_counterfactual_pairs(v2_specs, require_complete=True)
+    return ordered
 
 
 def get_scenario(

@@ -61,7 +61,10 @@ from backend.engine.run_manager import (
     RunProvenanceErrorCode,
     baseline_policy_for_llm_mode,
 )
-from backend.engine.simulation import SimulationEngine
+from backend.engine.simulation import (
+    PerturbationRuntimeUnavailableError,
+    SimulationEngine,
+)
 from backend.engine.state_manager import DeltaChange, StateManager
 from backend.execution.command import CommandSource, DeviceCommand, PublishEvent
 from backend.execution.executor import CommandExecutor, FEEDBACK_EVENT_TYPE
@@ -840,6 +843,12 @@ async def start_scenario_run(payload: RunScenarioPayload) -> dict[str, Any]:
                 ScenarioLaunchErrorCode.INITIAL_STATE_INVALID,
                 f"场景 {payload.scenario_id} 的 initial_state 无法一致地应用：{exc.message}",
                 details={"scenario_id": payload.scenario_id, **exc.to_dict()},
+            ) from exc
+        except PerturbationRuntimeUnavailableError as exc:
+            raise ScenarioLaunchError(
+                ScenarioLaunchErrorCode.PERTURBATION_RUNTIME_UNAVAILABLE,
+                exc.message,
+                details=exc.to_dict()["details"],
             ) from exc
         except (TypeError, ValueError) as exc:  # validate_seed
             raise ScenarioLaunchError(

@@ -11,12 +11,15 @@ from backend.execution.command import (
     DeviceCommand,
 )
 from backend.models.versioning import (
+    LEGACY_SCENARIO_SCHEMA_VERSION,
     SCHEMA_VERSIONS,
     SUPPORTED_COMMAND_SCHEMA_VERSION,
     SUPPORTED_DEVICE_REGISTRY_VERSION,
     SUPPORTED_EVENT_SCHEMA_VERSION,
+    SUPPORTED_SCENARIO_SCHEMA_BY_MAJOR,
     SUPPORTED_SCENARIO_SCHEMA_VERSION,
     SchemaVersionError,
+    check_scenario_schema_compatibility,
     check_schema_compatibility,
 )
 
@@ -39,6 +42,16 @@ def test_schema_compatibility_reports_the_requested_field() -> None:
     )
     assert compatibility.tolerated is True
     assert compatibility.strict is False
+
+
+def test_scenario_versions_support_legacy_v1_and_aurabench_v2() -> None:
+    assert SUPPORTED_SCENARIO_SCHEMA_VERSION == "2.0"
+    assert LEGACY_SCENARIO_SCHEMA_VERSION == "1.1"
+    assert SUPPORTED_SCENARIO_SCHEMA_BY_MAJOR == {1: "1.1", 2: "2.0"}
+    assert check_scenario_schema_compatibility("1.0").supported == (1, 1)
+    assert check_scenario_schema_compatibility("2.0").supported == (2, 0)
+    with pytest.raises(SchemaVersionError, match="unknown major"):
+        check_scenario_schema_compatibility("9.0")
 
 
 @pytest.mark.parametrize("declared", ["1", "1.0.999", "1.x", "1.", ".1", " 1.0.0 "])
