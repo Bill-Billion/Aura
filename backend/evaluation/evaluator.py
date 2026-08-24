@@ -40,6 +40,7 @@ from backend.scenarios.fingerprint import (
 from backend.scenarios.loader import get_scenario
 from backend.scenarios.spec import ScenarioSpec
 from backend.scenarios.spec_v2 import ScenarioSpecV2
+from backend.scenarios.trace_spec import TraceSpec, trace_spec_fingerprint
 
 REPORT_SCHEMA_VERSION = SUPPORTED_REPORT_SCHEMA_VERSION
 CANONICAL_METRIC_NAMES: tuple[str, ...] = (
@@ -371,6 +372,16 @@ def _scenario_context(spec: ScenarioSpec) -> dict[str, Any]:
     }
 
 
+@dataclass(frozen=True)
+class _InterventionEvaluationView:
+    events: tuple[dict[str, Any], ...]
+    initial_device_states: dict[str, dict[str, Any]]
+    expected_device_effects: list[dict[str, Any]]
+    ground_truth: dict[str, Any]
+    trace_spec: TraceSpec
+    metadata: dict[str, Any]
+
+
 class ScenarioEvaluator:
     """Compute the seven canonical metrics against one ScenarioSpec contract."""
 
@@ -392,24 +403,6 @@ class ScenarioEvaluator:
         run_metadata: dict[str, Any] | None = None,
     ) -> EvalReport:
         scenario = self._scenario
-        if (
-            isinstance(scenario, ScenarioSpecV2)
-            and scenario.intervention_response is not None
-        ):
-            return _error_report(
-                run_id,
-                "ScenarioSpec intervention_response evaluation is not implemented",
-                scenario_id=scenario_id or scenario.id,
-                seed=seed,
-                provenance=self._provenance(
-                    run_id=run_id,
-                    scenario=scenario,
-                    scenario_id=scenario_id or scenario.id,
-                    seed=seed,
-                    run_metadata=run_metadata or {},
-                    events=events,
-                ),
-            )
         unknown_metrics = sorted(set(scenario.metrics) - set(CANONICAL_METRIC_NAMES))
         if unknown_metrics:
             return _error_report(
@@ -430,8 +423,10 @@ class ScenarioEvaluator:
         context = _scenario_context(scenario)
         scenario_id = scenario_id or scenario.id
         criteria = self._criteria
-
-        collector = MetricsCollector(
+        state_evidence_source = (
+            "device_effect" if isinstance(scenario, ScenarioSpecV2) else "feedback"
+        )
+        run_collector = MetricsCollector(
             events=events,
             scenario_id=scenario_id,
             seed=seed,
@@ -443,27 +438,120 @@ class ScenarioEvaluator:
             device_rooms=context["device_rooms"],
             device_types=context["device_types"],
             success_criteria=criteria,
-            state_evidence_source=(
-                "device_effect" if isinstance(scenario, ScenarioSpecV2) else "feedback"
-            ),
+            state_evidence_source=state_evidence_source,
         )
-        device_match = compute_device_state_match_rate(collector)
+        evaluation_collector = run_collector
+        trace_events = events
+        trace_spec = (
+            scenario.trace_spec if isinstance(scenario, ScenarioSpecV2) else None
+        )
+        intervention_metadata: dict[str, Any] | None = None
+        if (
+            isinstance(scenario, ScenarioSpecV2)
+            and scenario.intervention_response is not None
+        ):
+            from backend.evaluation.temporal import _trace_suffix_from_trigger
+            from backend.evaluation.trace_index import TraceValidationError
+
+            response = scenario.intervention_response
+            try:
+                triggered_trace = _trace_suffix_from_trigger(response.trigger, events)
+            except (TraceValidationError, RecursionError) as exc:
+                return _error_report(
+                    run_id,
+                    f"intervention_response is unevaluable: {exc}",
+                    scenario_id=scenario_id,
+                    seed=seed,
+                    provenance=self._provenance(
+                        run_id=run_id,
+                        scenario=scenario,
+                        scenario_id=scenario_id,
+                        seed=seed,
+                        run_metadata=run_metadata or {},
+                        events=events,
+                    ),
+                )
+            state_at_trigger = MetricsCollector(
+                events=events[: triggered_trace.trigger_seq],
+                initial_device_states=context["initial_device_states"],
+                state_evidence_source=state_evidence_source,
+            ).replayed_device_states()
+            response_ground_truth = dict(context["ground_truth"] or {})
+            # The response postcondition decides whether doing nothing is valid;
+            # intent recognition and role selection happened before the trigger.
+            response_ground_truth.update(
+                acceptable_noop=True,
+                expected_intent=None,
+                required_agent_roles=[],
+            )
+            view = _InterventionEvaluationView(
+                events=triggered_trace.events,
+                initial_device_states=state_at_trigger,
+                expected_device_effects=[
+                    effect.model_dump(mode="json")
+                    for effect in response.expected_device_effects
+                ],
+                ground_truth=response_ground_truth,
+                trace_spec=response.obligations,
+                metadata={
+                    "trigger_event_id": triggered_trace.trigger_event_id,
+                    "trigger_seq": triggered_trace.trigger_seq,
+                    "trigger_sim_time_s": triggered_trace.trigger_sim_time_s,
+                    "evaluated_event_count": len(triggered_trace.events),
+                    "time_origin": response.time_origin,
+                    "metric_scopes": {
+                        "whole_run": [
+                            "episode_complete",
+                            "first_action_latency_ms",
+                            "command_failure_count",
+                            "fallback_count",
+                            "conflict_count",
+                        ],
+                        "trigger_relative": [
+                            "user_intent_satisfied",
+                            "device_state_match_rate",
+                            "final_state_success",
+                            "trajectory_properties_satisfied",
+                            "trajectory_safe_success",
+                        ],
+                    },
+                },
+            )
+            evaluation_collector = MetricsCollector(
+                events=list(view.events),
+                scenario_id=scenario_id,
+                seed=seed,
+                run_id=run_id,
+                expected_device_effects=view.expected_device_effects,
+                initial_device_states=view.initial_device_states,
+                ground_truth=view.ground_truth,
+                device_rooms=context["device_rooms"],
+                device_types=context["device_types"],
+                success_criteria=criteria,
+                state_evidence_source=state_evidence_source,
+            )
+            trace_events = list(view.events)
+            trace_spec = view.trace_spec
+            intervention_metadata = view.metadata
+
+        device_match = compute_device_state_match_rate(evaluation_collector)
         metrics = EvalMetrics(
-            episode_complete=compute_episode_complete(collector),
-            first_action_latency_ms=compute_first_action_latency_ms(collector),
-            command_failure_count=compute_command_failure_count(collector),
-            fallback_count=compute_fallback_count(collector),
-            conflict_count=compute_conflict_count(collector),
+            episode_complete=compute_episode_complete(run_collector),
+            first_action_latency_ms=compute_first_action_latency_ms(run_collector),
+            command_failure_count=compute_command_failure_count(run_collector),
+            fallback_count=compute_fallback_count(run_collector),
+            conflict_count=compute_conflict_count(run_collector),
             user_intent_satisfied=compute_user_intent_satisfied(
-                collector, device_state_match_rate=device_match
+                evaluation_collector, device_state_match_rate=device_match
             ),
             device_state_match_rate=device_match,
         )
+        evaluation_ground_truth = evaluation_collector.ground_truth or {}
         checks, failed_metrics, reasons = self._check_criteria(
             metrics,
             criteria,
-            has_expected_effects=bool(context["expected_device_effects"]),
-            acceptable_noop=bool((context["ground_truth"] or {}).get("acceptable_noop", False)),
+            has_expected_effects=bool(evaluation_collector.expected_device_effects),
+            acceptable_noop=bool(evaluation_ground_truth.get("acceptable_noop", False)),
             has_expected_failures=bool(context["expected_failures"]),
             required_metrics=list(scenario.metrics),
         )
@@ -475,13 +563,14 @@ class ScenarioEvaluator:
         if isinstance(scenario, ScenarioSpecV2):
             from backend.evaluation.temporal import VerificationStatus, verify_trace
 
-            if context["expected_device_effects"]:
+            if evaluation_collector.expected_device_effects:
                 final_state_success = device_match.value == 1.0
             else:
                 final_state_success = bool(
-                    (context["ground_truth"] or {}).get("acceptable_noop", False)
+                    evaluation_ground_truth.get("acceptable_noop", False)
                 )
-            verification = verify_trace(scenario.trace_spec, events)
+            assert trace_spec is not None
+            verification = verify_trace(trace_spec, trace_events)
             trace_verification = verification.to_dict()
             if verification.hard_status is VerificationStatus.PASS:
                 trajectory_properties_satisfied = True
@@ -539,11 +628,16 @@ class ScenarioEvaluator:
             trace_verification=trace_verification,
             metadata={
                 "total_events": len(events),
-                "total_episodes": len(collector.agent_episode_ids),
-                "total_commands": len(collector.final_command_events),
+                "total_episodes": len(run_collector.agent_episode_ids),
+                "total_commands": len(run_collector.final_command_events),
                 "final_state_blind_spot": (
                     final_state_success is True
                     and trajectory_properties_satisfied is False
+                ),
+                **(
+                    {"intervention_response": intervention_metadata}
+                    if intervention_metadata is not None
+                    else {}
                 ),
             },
         )
@@ -739,6 +833,16 @@ class ScenarioEvaluator:
             "recording_source_run_id": run_metadata.get("recording_source_run_id"),
             "initial_state_hash": run_metadata.get("initial_state_hash"),
             "trace_spec_hash": run_metadata.get("trace_spec_hash"),
+            "evaluation_trace_spec_hash": (
+                trace_spec_fingerprint(
+                    scenario.intervention_response.obligations
+                    if isinstance(scenario, ScenarioSpecV2)
+                    and scenario.intervention_response is not None
+                    else scenario.trace_spec
+                )
+                if isinstance(scenario, ScenarioSpecV2)
+                else None
+            ),
             "experiment": run_metadata.get("experiment"),
             "required_metrics": list(scenario.metrics) if scenario is not None else [],
         }

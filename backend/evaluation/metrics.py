@@ -151,6 +151,12 @@ class MetricsCollector:
                 final[command_id] = event
         return final
 
+    def replayed_device_states(self) -> dict[str, dict[str, Any]]:
+        """Return device state after replaying this collector's evidence."""
+
+        states, _ = _state_evidence(self)
+        return states
+
 
 def compute_episode_complete(collector: MetricsCollector) -> MetricDatum:
     episodes: dict[str, Any] = {}

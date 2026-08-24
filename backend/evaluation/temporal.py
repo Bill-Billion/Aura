@@ -114,6 +114,16 @@ class TraceVerification:
         }
 
 
+@dataclass(frozen=True)
+class _TriggeredTrace:
+    """Canonical trace suffix whose simulated clock starts at its trigger."""
+
+    events: tuple[dict[str, Any], ...]
+    trigger_event_id: str
+    trigger_seq: int
+    trigger_sim_time_s: float
+
+
 def _unique(events: tuple[TraceEvent, ...] | list[TraceEvent]) -> tuple[TraceEvent, ...]:
     seen: set[str] = set()
     result: list[TraceEvent] = []
@@ -262,6 +272,47 @@ def _selector_matches(
         ):
             return False
     return True
+
+
+def _trace_suffix_from_trigger(
+    selector: EventSelector, events: list[Any]
+) -> _TriggeredTrace:
+    """Select one trigger and return its re-based, canonical trace suffix.
+
+    Building the suffix from a validated ``TraceIndex`` keeps trigger matching
+    identical to TraceSpec evaluation.  Sequence numbers and simulated time are
+    re-based because the suffix is itself a finite canonical trace; causal
+    parents before the trigger become external roots.
+    """
+
+    index = TraceIndex(events)
+    matches = [
+        event for event in index.events if _selector_matches(selector, event)
+    ]
+    if len(matches) != 1:
+        raise TraceValidationError(
+            "intervention response trigger must match exactly one event; "
+            f"matched {len(matches)}"
+        )
+
+    trigger = matches[0]
+    suffix = tuple(event for event in index.events if event.seq >= trigger.seq)
+    suffix_ids = {event.event_id for event in suffix}
+    normalized: list[dict[str, Any]] = []
+    for seq, event in enumerate(suffix):
+        payload = dict(event.payload)
+        payload["seq"] = seq
+        payload["sim_time_s"] = event.sim_time_s - trigger.sim_time_s
+        if event.causal_parent not in suffix_ids:
+            payload["causal_parent"] = None
+        normalized.append(payload)
+
+    return _TriggeredTrace(
+        events=tuple(normalized),
+        trigger_event_id=trigger.event_id,
+        trigger_seq=trigger.seq,
+        trigger_sim_time_s=trigger.sim_time_s,
+    )
 
 
 class _Verifier:

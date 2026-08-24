@@ -94,15 +94,21 @@ async def test_runner_executes_dynamic_v2_resident_state_change() -> None:
         for event in result.events
         if event.generation_rule_id == "perturbation.resident_state_change"
     )
+    injection_marker = next(
+        event
+        for event in result.events
+        if event.event_type == "benchmark.perturbation_injected"
+    )
     assert perturbation.event_generation_mode == "scripted"
     assert perturbation.sim_time_s == 0
     assert result.run_metadata.scenario_id == dynamic.id
     assert runner.state_manager.world.users["user_01"].location is None
 
     report = evaluate_run(result.run_id, scenario_dirs=[PILOT_DIR])
-    assert report.outcome is EvalOutcome.ERROR
-    assert "intervention_response evaluation is not implemented" in (
-        report.failure_reasons[0]
+    assert report.outcome is not EvalOutcome.ERROR
+    assert report.trajectory_properties_satisfied is True
+    assert report.metadata["intervention_response"]["trigger_event_id"] == (
+        injection_marker.event_id
     )
 
 
