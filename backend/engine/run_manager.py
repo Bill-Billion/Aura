@@ -39,9 +39,10 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from backend.engine.event_bus import EventBus
+from backend.engine.provenance import ExperimentProvenance
 from backend.engine.rng import SimRandom, validate_seed
 from backend.engine.state import WorldState
 from backend.models.schemas import BaselinePolicy
@@ -346,6 +347,7 @@ class RunMetadata(BaseModel):
     counterfactual_group_id: str | None = None
     counterfactual_variant: Literal["static", "dynamic"] | None = None
     trace_spec_hash: str | None = None
+    experiment: ExperimentProvenance | None = None
     event_schema_version: str = SUPPORTED_EVENT_SCHEMA_VERSION
     command_schema_version: str = SUPPORTED_COMMAND_SCHEMA_VERSION
     device_registry_version: str = SUPPORTED_DEVICE_REGISTRY_VERSION
@@ -357,6 +359,26 @@ class RunMetadata(BaseModel):
     events_integrity: EventLogIntegrity | None = None
     ended_at: str | None = None
     end_reason: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_experiment_model_selection(self) -> "RunMetadata":
+        if self.experiment is None:
+            return self
+        expected_policy = (
+            BaselinePolicy.RULE_BASED
+            if self.experiment.model == "rule_based"
+            else BaselinePolicy.LLM_MOCKED
+        )
+        expected_mode = (
+            LLMMode.RULE_BASED
+            if self.experiment.model == "rule_based"
+            else LLMMode.MOCKED
+        )
+        if self.baseline_policy is not expected_policy or self.llm_mode is not expected_mode:
+            raise ValueError(
+                "experiment model must match baseline_policy and llm_mode"
+            )
+        return self
 
     @property
     def is_active(self) -> bool:
@@ -441,6 +463,7 @@ class RunManager:
         counterfactual_group_id: str | None = None,
         counterfactual_variant: Literal["static", "dynamic"] | None = None,
         trace_spec_hash: str | None = None,
+        experiment: ExperimentProvenance | None = None,
         agent_versions: Mapping[str, str] | None = None,
         run_id: str | None = None,
         clear_event_history: bool = True,
@@ -482,6 +505,7 @@ class RunManager:
             counterfactual_group_id=counterfactual_group_id,
             counterfactual_variant=counterfactual_variant,
             trace_spec_hash=trace_spec_hash,
+            experiment=experiment,
             initial_state_hash=compute_initial_state_hash(world),
         )
 

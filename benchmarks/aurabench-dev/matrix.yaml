@@ -1,0 +1,23 @@
+matrix_schema_version: "1.0"
+matrix_id: aurabench_dev_pilot
+
+# A deliberately small, real-runtime pilot: the static/dynamic pair is crossed
+# with the two zero-cost deterministic model modes and two repetitions.  The
+# remaining axes are fixed to the only adapters implemented by this PR.
+axes:
+  scenario:
+    - episodes/read_then_leave_static.yaml
+    - episodes/read_then_leave_dynamic.yaml
+  seed: [21001]
+  model: [rule_based, mocked]
+  topology: [domain_multi]
+  governance: [aura]
+  observation: [stale_offline]
+  repetition: [0, 1]
+
+exclude: []
+max_cells: 8
+max_total_cost_usd: 0.0
+cost_per_model_usd:
+  rule_based: 0.0
+  mocked: 0.0
