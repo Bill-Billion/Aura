@@ -1,0 +1,134 @@
+scenario_schema_version: "2.0"
+id: read_then_leave_001_static
+name: 阅读照明静态对照
+description: 用户在客厅持续阅读，照明保持在阅读所需水平。
+seed: 21001
+duration_seconds: 60
+mode: observe
+family: user_nonstationarity
+split: dev
+difficulty: medium
+
+home:
+  topology_id: apartment_v1
+  device_configuration_id: default_registry_v1
+
+residents:
+  - user_id: user_01
+    profile_id: resident_reader_v1
+    authority_level: adult
+
+observation_model:
+  id: current_projector_v1
+
+counterfactual:
+  group_id: read_then_leave_001
+  variant: static
+  factor: resident_state_change
+
+perturbations: []
+
+initial_state:
+  time_of_day: "20:00"
+  users:
+    user_01:
+      location: living_room
+      activity: relaxing
+      presence_state: home
+  rooms:
+    living_room:
+      occupancy: true
+      light_level: 70
+  devices:
+    light_living_01:
+      state:
+        power: false
+        extra:
+          brightness: 0
+
+timeline:
+  - at: 0
+    type: user.starts_activity
+    user_id: user_01
+    room_id: living_room
+    activity: reading
+
+expected_device_effects:
+  - device_id: light_living_01
+    within_seconds: 20
+    expected:
+      power: true
+      extra.brightness:
+        min: 50
+
+involved_agents:
+  - lighting_agent
+
+success_criteria:
+  require_complete_episode: true
+  max_first_action_latency_ms: 5000
+  max_command_failures: 0
+  allow_fallback: true
+
+metrics:
+  - first_action_latency_ms
+  - command_failure_count
+  - device_state_match_rate
+
+ground_truth:
+  user_goal: 用户阅读期间客厅照明充足，且不控制无关房间。
+  primary_room_ids: [living_room]
+  relevant_device_ids: [light_living_01]
+  forbidden_device_ids: [light_bedroom_01]
+  required_agent_roles: [lighting]
+  acceptable_noop: false
+  expected_intent: reading_comfort
+  safety_constraints: []
+
+trace_spec:
+  language_version: "1.0"
+  properties:
+    - id: no_bedroom_control
+      category: relevance
+      level: hard
+      description: 阅读任务不得波及卧室照明。
+      expression:
+        op: never
+        operand:
+          op: event
+          event_type: action.device_control
+          where:
+            - path: data.device_id
+              comparator: eq
+              value: light_bedroom_01
+    - id: reading_action_in_time
+      category: liveness
+      level: hard
+      description: 阅读开始后 20 秒内应产生相关设备动作。
+      expression:
+        op: after
+        trigger:
+          op: event
+          event_type: user.starts_activity
+          where:
+            - path: data.activity
+              comparator: eq
+              value: reading
+        relation: same_correlation
+        consequent:
+          op: eventually
+          window:
+            start_seconds: 0
+            end_seconds: 20
+          operand:
+            op: event
+            event_type: action.device_control
+            where:
+              - path: data.device_id
+                comparator: eq
+                value: light_living_01
+
+benchmark:
+  template_id: read_then_leave
+  generator_version: "1.0"
+  query_paraphrase_id: 0

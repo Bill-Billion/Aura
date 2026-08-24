@@ -104,6 +104,7 @@ class ScenarioLaunchErrorCode(str, Enum):
     SCENARIO_LIBRARY_INVALID = "scenario_library_invalid"
     INITIAL_STATE_INVALID = "initial_state_invalid"
     INVALID_SEED = "invalid_seed"
+    PERTURBATION_RUNTIME_UNAVAILABLE = "perturbation_runtime_unavailable"
     ENGINE_UNAVAILABLE = "engine_unavailable"
     RUN_ALREADY_ACTIVE = "run_already_active"
     IDEMPOTENCY_CONFLICT = "idempotency_conflict"

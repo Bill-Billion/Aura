@@ -1041,7 +1041,9 @@ async def test_incompatible_run_metadata_schema_version_is_not_evaluable(
     result = await run_scenario("user_arrives_home_evening")
     metadata_path = run_dir(result.run_id) / RUN_METADATA_FILENAME
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    metadata[field_name] = "2.0"
+    # Scenario artifacts deliberately support both persisted v1 and AuraBench
+    # v2.  The other public schemas remain single-major contracts.
+    metadata[field_name] = "9.0" if field_name == "scenario_schema_version" else "2.0"
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
 
     report = evaluate_run(result.run_id)

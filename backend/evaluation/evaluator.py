@@ -30,6 +30,7 @@ from backend.evaluation.metrics import (
 from backend.models.versioning import (
     SCHEMA_VERSIONS,
     SUPPORTED_REPORT_SCHEMA_VERSION,
+    check_scenario_schema_compatibility,
     check_schema_compatibility,
 )
 from backend.scenarios.fingerprint import scenario_contract_fingerprint
@@ -162,9 +163,12 @@ def _validate_artifact_versions(
         if field_name not in metadata or metadata[field_name] is None:
             raise ValueError(f"run metadata is missing required {field_name}")
     for field_name, supported in SCHEMA_VERSIONS.items():
-        check_schema_compatibility(
-            metadata[field_name], supported=supported, field=field_name
-        )
+        if field_name == "scenario_schema_version":
+            check_scenario_schema_compatibility(metadata[field_name])
+        else:
+            check_schema_compatibility(
+                metadata[field_name], supported=supported, field=field_name
+            )
 
     if events is None:
         return
@@ -763,7 +767,7 @@ def evaluate_run(
     ):
         return _error_report(
             run_id,
-            "ScenarioSpec schema version drift: "
+            "ScenarioSpec scenario_schema_version drift: "
             f"run recorded {declared_scenario_version!r}, current library has "
             f"{scenario.scenario_schema_version!r}",
             scenario_id=metadata_scenario_id,

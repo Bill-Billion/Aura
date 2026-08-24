@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Literal, Mapping
 
 from backend.agents.llm import LLMProvider
 from backend.agents.llm_modes import resolve_mode_for_provider
@@ -16,6 +16,7 @@ from backend.agents.runtime import (
 from backend.api.ws import ConnectionManager
 from backend.core.logging import log
 from backend.engine.event_bus import EventBus, SimEvent, WorldEvent
+from backend.engine.event_log import RunArtifactRecorder, attach_run_artifacts
 from backend.engine.event_types import (
     ENGINE_ERROR_EVENT_TYPE,
     ENVIRONMENT_STATE_REFRESH,
@@ -23,7 +24,6 @@ from backend.engine.event_types import (
     USER_ACTIVITY_CHANGE,
     USER_MOVEMENT_EVENT_TYPES,
 )
-from backend.engine.event_log import RunArtifactRecorder, attach_run_artifacts
 from backend.engine.rng import SimRandom, validate_seed
 from backend.engine.run_manager import (
     RunManager,
@@ -47,6 +47,10 @@ from backend.execution.executor import (
 )
 from backend.models.schemas import BaselinePolicy, WSMessage
 from backend.scenarios.apply import apply_scenario_initial_state
+from backend.scenarios.fingerprint import (
+    scenario_contract_fingerprint,
+    scenario_trace_spec_fingerprint,
+)
 from backend.scenarios.generator import (
     FAILURE_INJECTION_CAUSED_BY,
     DeviceAvailabilityWrite,
@@ -55,14 +59,56 @@ from backend.scenarios.generator import (
     GenerationSources,
     build_generation_sources,
 )
-from backend.scenarios.fingerprint import scenario_contract_fingerprint
 from backend.scenarios.spec import ScenarioSpec
+from backend.scenarios.spec_v2 import ScenarioSpecV2
 from backend.simulators.environment import EnvironmentSimulator
 from backend.simulators.user_behavior import UserBehaviorSimulator
 
 # 引擎主循环停摆的 WS 广播类型（前端据此把"仿真已死"与普通错误区分开）。
 # 纯增类型：schemas.MessageType 是 `str | Literal[...]`，旧前端不认识就直接忽略。
 ENGINE_ERROR_WS_TYPE = "ENGINE_ERROR"
+
+
+class PerturbationRuntimeUnavailableError(RuntimeError):
+    """A v2 intervention was declared but no runtime consumer exists yet.
+
+    PR-1 freezes the intervention schema only.  Letting such a scenario continue
+    would silently execute the dynamic member as its static counterfactual, so
+    every engine entry point fails before pausing the active run or opening a
+    new artifact.  PR-2/PR-3 replace this gate with an explicit handler
+    registry; there is deliberately no bypass flag.
+    """
+
+    code = "perturbation_runtime_unavailable"
+
+    def __init__(self, spec: ScenarioSpecV2) -> None:
+        self.scenario_id = spec.id
+        self.unsupported_perturbation_types = tuple(
+            sorted({item.type for item in spec.perturbations})
+        )
+        self.unsupported_perturbation_phases = tuple(
+            sorted({item.phase for item in spec.perturbations})
+        )
+        self.message = (
+            f"scenario {spec.id!r} declares perturbations, but this runtime "
+            "does not have perturbation consumers"
+        )
+        super().__init__(self.message)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "code": self.code,
+            "message": self.message,
+            "details": {
+                "scenario_id": self.scenario_id,
+                "unsupported_perturbation_types": list(
+                    self.unsupported_perturbation_types
+                ),
+                "unsupported_perturbation_phases": list(
+                    self.unsupported_perturbation_phases
+                ),
+            },
+        }
 
 
 class SimulationEngine:
@@ -226,6 +272,9 @@ class SimulationEngine:
         duration_seconds: float | None = None,
         scenario_schema_version: str | None = None,
         scenario_contract_hash: str | None = None,
+        counterfactual_group_id: str | None = None,
+        counterfactual_variant: Literal["static", "dynamic"] | None = None,
+        trace_spec_hash: str | None = None,
         clear_event_history: bool = True,
     ) -> RunMetadata:
         """开一个新 run 并把 §11 元数据补齐（provider/model/agent 版本从运行期取）。
@@ -263,6 +312,9 @@ class SimulationEngine:
             duration_seconds=duration_seconds,
             scenario_schema_version=scenario_schema_version,
             scenario_contract_hash=scenario_contract_hash,
+            counterfactual_group_id=counterfactual_group_id,
+            counterfactual_variant=counterfactual_variant,
+            trace_spec_hash=trace_spec_hash,
             agent_versions=agent_versions,
             run_id=assigned_run_id,
             clear_event_history=clear_event_history,
@@ -385,6 +437,8 @@ class SimulationEngine:
         # 解析放在最前面：未知场景 id 必须在 pause/取消/换世界**之前**被拒，
         # 否则一次拼错的启动会把正在跑的 run 拆掉再报错。
         spec = resolve_run_scenario(scenario, dirs=scenario_dirs)
+        if isinstance(spec, ScenarioSpecV2) and spec.perturbations:
+            raise PerturbationRuntimeUnavailableError(spec)
         resolved_seed = seed if seed is not None else (spec.seed if spec is not None else None)
         if resolved_seed is not None:
             # Validate before pause/cancel/world swap.  A late failure in
@@ -482,6 +536,19 @@ class SimulationEngine:
             ),
             scenario_contract_hash=(
                 scenario_contract_fingerprint(spec) if spec is not None else None
+            ),
+            counterfactual_group_id=(
+                spec.counterfactual.group_id
+                if isinstance(spec, ScenarioSpecV2)
+                else None
+            ),
+            counterfactual_variant=(
+                spec.counterfactual.variant
+                if isinstance(spec, ScenarioSpecV2)
+                else None
+            ),
+            trace_spec_hash=(
+                scenario_trace_spec_fingerprint(spec) if spec is not None else None
             ),
         )
         # 产线绑定必须在 _start_run 之后：GenerationContext 盖的是**新** run 的章，

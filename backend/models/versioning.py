@@ -10,8 +10,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-
-SUPPORTED_SCENARIO_SCHEMA_VERSION = "1.1"
+# ``SUPPORTED_*`` is the newest schema emitted by new benchmark tooling.
+# Scenario loading is deliberately multi-major: v1 remains readable so sealed
+# historical runs keep resolving to their original contract and fingerprint.
+LEGACY_SCENARIO_SCHEMA_VERSION = "1.1"
+SUPPORTED_SCENARIO_SCHEMA_VERSION = "2.0"
+LATEST_SCENARIO_SCHEMA_VERSION = SUPPORTED_SCENARIO_SCHEMA_VERSION
+SUPPORTED_SCENARIO_SCHEMA_BY_MAJOR: dict[int, str] = {
+    1: LEGACY_SCENARIO_SCHEMA_VERSION,
+    2: SUPPORTED_SCENARIO_SCHEMA_VERSION,
+}
 SUPPORTED_EVENT_SCHEMA_VERSION = "1.0"
 SUPPORTED_COMMAND_SCHEMA_VERSION = "1.0"
 SUPPORTED_DEVICE_REGISTRY_VERSION = "1.0"
@@ -161,8 +169,44 @@ def check_schema_compatibility(
     )
 
 
+def check_scenario_schema_compatibility(declared: object) -> VersionCompatibility:
+    """Dispatch ScenarioSpec compatibility by declared major version.
+
+    Generic event/command/report schemas still support exactly one major and
+    use :func:`check_schema_compatibility` directly.  Scenarios are different:
+    AuraBench 2.0 is additive at runtime, while persisted v1 scenarios must
+    remain loadable for historical run evaluation.
+    """
+
+    declared_pair = parse_schema_version(
+        declared,
+        supported=SUPPORTED_SCENARIO_SCHEMA_VERSION,
+        field="scenario_schema_version",
+    )
+    supported = SUPPORTED_SCENARIO_SCHEMA_BY_MAJOR.get(declared_pair[0])
+    if supported is None:
+        raise SchemaVersionError(
+            declared=str(declared).strip(),
+            supported=SUPPORTED_SCENARIO_SCHEMA_VERSION,
+            field="scenario_schema_version",
+            reason=(
+                f"unknown major version {declared_pair[0]} (supported majors are "
+                f"{sorted(SUPPORTED_SCENARIO_SCHEMA_BY_MAJOR)}); an explicit migration "
+                "is required"
+            ),
+        )
+    return check_schema_compatibility(
+        declared,
+        supported=supported,
+        field="scenario_schema_version",
+    )
+
+
 __all__ = [
+    "LATEST_SCENARIO_SCHEMA_VERSION",
+    "LEGACY_SCENARIO_SCHEMA_VERSION",
     "SCHEMA_VERSIONS",
+    "SUPPORTED_SCENARIO_SCHEMA_BY_MAJOR",
     "SUPPORTED_COMMAND_SCHEMA_VERSION",
     "SUPPORTED_DEVICE_REGISTRY_VERSION",
     "SUPPORTED_EVENT_SCHEMA_VERSION",
@@ -170,6 +214,7 @@ __all__ = [
     "SUPPORTED_SCENARIO_SCHEMA_VERSION",
     "SchemaVersionError",
     "VersionCompatibility",
+    "check_scenario_schema_compatibility",
     "check_schema_compatibility",
     "parse_schema_version",
 ]

@@ -159,6 +159,7 @@ _LAUNCH_ERROR_STATUS: dict[ScenarioLaunchErrorCode, int] = {
     ScenarioLaunchErrorCode.SCENARIO_LIBRARY_INVALID: 500,
     ScenarioLaunchErrorCode.INITIAL_STATE_INVALID: 400,
     ScenarioLaunchErrorCode.INVALID_SEED: 400,
+    ScenarioLaunchErrorCode.PERTURBATION_RUNTIME_UNAVAILABLE: 501,
     ScenarioLaunchErrorCode.ENGINE_UNAVAILABLE: 503,
     ScenarioLaunchErrorCode.RUN_ALREADY_ACTIVE: 409,
     ScenarioLaunchErrorCode.IDEMPOTENCY_CONFLICT: 409,
