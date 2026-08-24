@@ -45,14 +45,14 @@ async def test_v2_artifact_persists_pair_and_trace_provenance_and_is_evaluable()
     metadata = json.loads(
         (run_dir(result.run_id) / RUN_METADATA_FILENAME).read_text(encoding="utf-8")
     )
-    assert metadata["scenario_schema_version"] == "2.0"
+    assert metadata["scenario_schema_version"] == "2.1"
     assert metadata["counterfactual_group_id"] == "read_then_leave_001"
     assert metadata["counterfactual_variant"] == "static"
     assert len(metadata["trace_spec_hash"]) == 64
 
     report = evaluate_run(result.run_id, scenario_dirs=[PILOT_DIR])
     assert report.outcome is not EvalOutcome.ERROR
-    assert report.provenance["scenario_schema_version"] == "2.0"
+    assert report.provenance["scenario_schema_version"] == "2.1"
     assert report.final_state_success is not None
     assert report.trajectory_properties_satisfied is not None
     assert report.trajectory_safe_success == (
@@ -95,9 +95,15 @@ async def test_runner_executes_dynamic_v2_resident_state_change() -> None:
         if event.generation_rule_id == "perturbation.resident_state_change"
     )
     assert perturbation.event_generation_mode == "scripted"
-    assert perturbation.sim_time_s == 10
+    assert perturbation.sim_time_s == 0
     assert result.run_metadata.scenario_id == dynamic.id
     assert runner.state_manager.world.users["user_01"].location is None
+
+    report = evaluate_run(result.run_id, scenario_dirs=[PILOT_DIR])
+    assert report.outcome is EvalOutcome.ERROR
+    assert "intervention_response evaluation is not implemented" in (
+        report.failure_reasons[0]
+    )
 
 
 @pytest.mark.anyio

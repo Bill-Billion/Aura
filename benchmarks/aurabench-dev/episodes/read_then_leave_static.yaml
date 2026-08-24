@@ -1,4 +1,4 @@
-scenario_schema_version: "2.0"
+scenario_schema_version: "2.1"
 id: read_then_leave_001_static
 name: 阅读照明静态对照
 description: 用户在客厅持续阅读，照明保持在阅读所需水平。
@@ -25,6 +25,12 @@ counterfactual:
   group_id: read_then_leave_001
   variant: static
   factor: resident_state_change
+
+shared_goal:
+  user_goal: 用户阅读期间客厅照明充足，且不控制无关房间。
+  relevant_room_ids: [living_room]
+  forbidden_room_ids: [bedroom]
+  safety_constraints: []
 
 perturbations: []
 

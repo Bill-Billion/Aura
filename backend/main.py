@@ -79,6 +79,7 @@ from backend.models.schemas import (
 from backend.scenarios.apply import InitialStateApplyError, apply_initial_state
 from backend.scenarios.fingerprint import scenario_contract_fingerprint
 from backend.scenarios.loader import ScenarioLoadError, load_library
+from backend.scenarios.phase_controller import PerturbationPhaseError
 from backend.scenarios.runner import scenario_duration_seconds, scenario_world_mode
 from backend.scenarios.spec import InitialState
 
@@ -500,6 +501,11 @@ async def _finalize_scenario_run(run_id: str, duration_seconds: float) -> None:
                 return
             await engine.pause()
             settled = await engine.agent_runtime.wait_for_idle(timeout=30.0)
+            if end_reason == "completed":
+                try:
+                    await engine.finalize_perturbation_phase()
+                except PerturbationPhaseError:
+                    end_reason = "perturbation_phase_invalid"
             cleanup_reason = (
                 "run_duration_elapsed" if end_reason == "completed" else end_reason
             )

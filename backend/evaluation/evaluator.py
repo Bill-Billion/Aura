@@ -392,6 +392,24 @@ class ScenarioEvaluator:
         run_metadata: dict[str, Any] | None = None,
     ) -> EvalReport:
         scenario = self._scenario
+        if (
+            isinstance(scenario, ScenarioSpecV2)
+            and scenario.intervention_response is not None
+        ):
+            return _error_report(
+                run_id,
+                "ScenarioSpec intervention_response evaluation is not implemented",
+                scenario_id=scenario_id or scenario.id,
+                seed=seed,
+                provenance=self._provenance(
+                    run_id=run_id,
+                    scenario=scenario,
+                    scenario_id=scenario_id or scenario.id,
+                    seed=seed,
+                    run_metadata=run_metadata or {},
+                    events=events,
+                ),
+            )
         unknown_metrics = sorted(set(scenario.metrics) - set(CANONICAL_METRIC_NAMES))
         if unknown_metrics:
             return _error_report(

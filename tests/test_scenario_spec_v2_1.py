@@ -8,7 +8,6 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from backend.engine.simulation import PerturbationRuntimeUnavailableError
 from backend.scenarios.counterfactual import (
     CounterfactualPairError,
     validate_counterfactual_pairs,
@@ -16,10 +15,8 @@ from backend.scenarios.counterfactual import (
 from backend.scenarios.fingerprint import scenario_contract_fingerprint
 from backend.scenarios.loader import load_library
 from backend.scenarios.spec_v2 import (
-    EVENT_RELATIVE_PHASE_RUNTIME,
     ScenarioSpecV2,
     compile_perturbations,
-    unavailable_perturbation_capabilities,
     unsupported_perturbations,
 )
 
@@ -34,93 +31,46 @@ _SHARED_GOAL = {
     "safety_constraints": [],
 }
 
-_RESPONSE = {
-    "trigger": {
-        "event_type": "benchmark.perturbation_injected",
-        "where": [
-            {
-                "path": "data.perturbation_type",
-                "comparator": "eq",
-                "value": "resident_state_change",
-            }
-        ],
-    },
-    "expected_device_effects": [
-        {
-            "device_id": "light_living_01",
-            "within_seconds": 5,
-            "expected": {"power": False},
-        }
-    ],
-    "obligations": {
-        "properties": [
-            {
-                "id": "no_stale_reading_action",
-                "category": "relevance",
-                "level": "hard",
-                "expression": {
-                    "op": "never",
-                    "operand": {
-                        "op": "event",
-                        "event_type": "action.device_control",
-                        "where": [
-                            {
-                                "path": "data.device_id",
-                                "comparator": "eq",
-                                "value": "light_living_01",
-                            }
-                        ],
-                    },
-                },
-            }
-        ]
-    },
-}
-
-
 def _v2_payloads() -> tuple[dict, dict]:
     library = load_library([PILOT_DIR])
     static = library["read_then_leave_001_static"].model_dump(mode="json")
     dynamic = library["read_then_leave_001_dynamic"].model_dump(mode="json")
-    return static, dynamic
-
-
-def _v2_1_pair() -> tuple[ScenarioSpecV2, ScenarioSpecV2]:
-    static, dynamic = _v2_payloads()
     for payload in (static, dynamic):
-        payload["scenario_schema_version"] = "2.1"
-        payload["shared_goal"] = deepcopy(_SHARED_GOAL)
-
+        payload["scenario_schema_version"] = "2.0"
+        payload["shared_goal"] = None
+        payload["intervention_response"] = None
     dynamic["perturbations"] = [
         {
             "type": "resident_state_change",
             "phase": "after_plan_before_execution",
-            "anchor": {
-                "event_type": "reasoning.execution_plan",
-                "relation": "same_correlation",
-                "occurrence": "first",
-            },
-            "offset_seconds": 0,
-            "must_precede": {"event_type": "action.device_control"},
+            "at_sim_time_s": 10,
             "user_id": "user_01",
             "room_id": "outside",
             "activity": "away",
         }
     ]
-    dynamic["intervention_response"] = deepcopy(_RESPONSE)
-    return ScenarioSpecV2.model_validate(static), ScenarioSpecV2.model_validate(dynamic)
+    return static, dynamic
+
+
+def _v2_1_pair() -> tuple[ScenarioSpecV2, ScenarioSpecV2]:
+    library = load_library([PILOT_DIR])
+    return (
+        library["read_then_leave_001_static"],
+        library["read_then_leave_001_dynamic"],
+    )
 
 
 def test_v2_0_pilot_remains_readable_and_fingerprint_stable() -> None:
     static, dynamic = _v2_payloads()
     assert ScenarioSpecV2.model_validate(static).scenario_schema_version == "2.0"
     assert ScenarioSpecV2.model_validate(dynamic).scenario_schema_version == "2.0"
-    library = load_library([PILOT_DIR])
+    static_spec = ScenarioSpecV2.model_validate(static)
+    dynamic_spec = ScenarioSpecV2.model_validate(dynamic)
     assert scenario_contract_fingerprint(
-        library["read_then_leave_001_static"]
+        static_spec
     ) == "ddce7cd266aec236eea0732833d8d33e8d1e9dc6053401a7710643e62871d957"
     assert scenario_contract_fingerprint(
-        library["read_then_leave_001_dynamic"]
+        dynamic_spec
     ) == "727f3ecf1a07a1e63b8b0a5a81bd1955da34b9c0cb9a96d6d3395ca396ae3fd9"
 
     alternate_spelling = static | {"scenario_schema_version": " 2.0 "}
@@ -263,22 +213,10 @@ def test_pair_allows_only_explicit_dynamic_response_to_differ() -> None:
         validate_counterfactual_pairs([static, changed_goal])
 
 
-def test_event_relative_contract_fails_closed_before_phase_runtime() -> None:
+def test_event_relative_contract_is_owned_by_phase_runtime() -> None:
     _, dynamic = _v2_1_pair()
     assert unsupported_perturbations(dynamic) == []
-    assert unavailable_perturbation_capabilities(dynamic) == (
-        EVENT_RELATIVE_PHASE_RUNTIME,
-    )
-    with pytest.raises(ValueError, match="event_relative_phase_runtime"):
-        compile_perturbations(dynamic)
-    error = PerturbationRuntimeUnavailableError(dynamic)
-    assert error.unsupported_perturbation_types == ()
-    assert error.unsupported_perturbation_phases == (
-        "after_plan_before_execution",
-    )
-    assert error.unavailable_runtime_capabilities == (
-        EVENT_RELATIVE_PHASE_RUNTIME,
-    )
+    assert compile_perturbations(dynamic) == ()
 
 
 def test_v2_0_cannot_smuggle_v2_1_fields() -> None:

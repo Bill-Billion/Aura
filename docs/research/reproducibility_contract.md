@@ -6,6 +6,7 @@
 
 - scenario ID、schema version 与 contract hash；
 - counterfactual group、variant 与 TraceSpec hash；
+- event-relative 干预的 anchor event ID、注入 `seq`/模拟时间和预期前后继；
 - seed、初始状态 hash 与命名 RNG 子流约定；
 - source、simulator、Agent、evaluator 与 resolver revision；
 - 模型/provider/prompt hash/temperature/token cap/timeout；

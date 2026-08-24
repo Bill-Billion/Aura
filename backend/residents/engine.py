@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import heapq
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Literal, Protocol
+from typing import Any, Literal, Protocol
 
 from backend.engine.event_bus import SimEvent
 from backend.engine.event_types import (
@@ -31,7 +32,6 @@ from .state import (
     permissions_for,
     resolve_profile,
 )
-
 
 PolicyKind = Literal["scripted", "responsive", "seeded_stochastic"]
 
@@ -183,6 +183,28 @@ class ResidentEngine:
             intervention = heapq.heappop(self._scheduled)
             events.append(self._intervention_event(intervention, world, tick))
         return events
+
+    def intervention_event(
+        self,
+        kind: str,
+        data: dict[str, Any],
+        world: WorldState,
+        *,
+        sim_time_s: float,
+        tick: int,
+        causal_parent: str,
+        correlation_id: str,
+    ) -> SimEvent:
+        """Build an immediate intervention causally linked to phase evidence."""
+
+        event = self._intervention_event(
+            _ScheduledIntervention(float(sim_time_s), 0, kind, dict(data)),
+            world,
+            tick,
+        )
+        event.causal_parent = causal_parent
+        event.correlation_id = correlation_id
+        return event
 
     def handle_event(
         self, world: WorldState, event: SimEvent, *, sim_time_s: float

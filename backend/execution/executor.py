@@ -664,6 +664,8 @@ class CommandExecutor:
         if record.is_terminal:
             return record
         await record.transition(CommandStatus.EXECUTING, tick=tick)
+        if record.is_terminal:
+            return record
         action_event = await self._emit_action(command, tick, publish=publish)
 
         # 动作已下发但世界尚未变更：此刻被取代 → 世界零变更收工（apply 绝不能再跑）。

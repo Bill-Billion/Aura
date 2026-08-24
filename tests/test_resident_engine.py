@@ -23,7 +23,6 @@ from backend.engine.state import (
     UserState,
     WorldState,
 )
-from backend.engine.state_manager import StateManager
 from backend.execution.command import CommandSource, CommandStatus, DeviceCommand
 from backend.residents import ResidentEngine
 from backend.residents.policy import (
@@ -35,7 +34,6 @@ from backend.scenarios.loader import load_library
 from backend.scenarios.runner import ScenarioRunner
 from backend.scenarios.spec_v2 import ResidentReference, ScenarioSpecV2
 from backend.scenarios.trace import canonical_trace_text
-
 
 PILOT_DIR = (
     Path(__file__).resolve().parents[1] / "benchmarks" / "aurabench-dev" / "episodes"
@@ -82,6 +80,17 @@ def _reference(user_id: str) -> ResidentReference:
         profile_id="resident_reader_v1",
         authority_level="adult",
     )
+
+
+def _legacy_dynamic_payload() -> dict:
+    dynamic = load_library([PILOT_DIR], validate_pairs=True)[
+        "read_then_leave_001_dynamic"
+    ]
+    payload = dynamic.model_dump(mode="json")
+    payload["scenario_schema_version"] = "2.0"
+    payload["shared_goal"] = None
+    payload["intervention_response"] = None
+    return payload
 
 
 def _trigger(sim_time_s: float, *, event_type: str = "environment.state_refresh") -> SimEvent:
@@ -177,10 +186,7 @@ async def test_dynamic_resident_trace_replays_byte_identically() -> None:
 
 @pytest.mark.anyio
 async def test_observation_delay_remains_fail_closed() -> None:
-    dynamic = load_library([PILOT_DIR], validate_pairs=True)[
-        "read_then_leave_001_dynamic"
-    ]
-    payload = dynamic.model_dump(mode="json")
+    payload = _legacy_dynamic_payload()
     payload["counterfactual"]["factor"] = "observation_delay"
     payload["perturbations"] = [
         {
@@ -210,10 +216,7 @@ async def test_observation_delay_remains_fail_closed() -> None:
 
 @pytest.mark.anyio
 async def test_scheduled_safety_interrupt_preempts_equal_time_operation() -> None:
-    dynamic = load_library([PILOT_DIR], validate_pairs=True)[
-        "read_then_leave_001_dynamic"
-    ]
-    payload = dynamic.model_dump(mode="json")
+    payload = _legacy_dynamic_payload()
     payload["counterfactual"]["factor"] = "safety_interrupt"
     payload["perturbations"] = [
         {
