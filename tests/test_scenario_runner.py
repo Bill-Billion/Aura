@@ -17,13 +17,19 @@ import pytest
 
 from backend.agents.llm import LLMProvider, LLMProviderError
 from backend.api.ws import ConnectionManager
+from backend.devices.latency import DeviceRuntimeProfile
 from backend.engine.event_bus import EventBus
 from backend.engine.event_log import read_run_events, read_run_metadata
 from backend.engine.simulation import ENGINE_ERROR_WS_TYPE, SimulationEngine
 from backend.engine.event_types import ALL_ROOT_EVENT_TYPES, ENGINE_ERROR_EVENT_TYPE
 from backend.engine.state import Location3D, RoomState, WorldState
 from backend.engine.state_manager import StateManager
-from backend.execution.command import LIFECYCLE_EVENT_TYPE
+from backend.execution.command import (
+    LIFECYCLE_EVENT_TYPE,
+    CommandSource,
+    CommandStatus,
+    DeviceCommand,
+)
 from backend.models.schemas import WSMessage
 from backend.scenarios.loader import get_scenario
 from backend.scenarios.runner import (
@@ -177,6 +183,50 @@ async def test_scenario_timeline_command_traverses_executor_with_scenario_source
     ]
     assert len(action) == 1
     assert action[0].data["capability"] == "open_percent"
+
+
+@pytest.mark.anyio
+async def test_runner_cancels_device_work_left_beyond_scenario_horizon(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    runner = ScenarioRunner(_spec(), llm_provider=_DisabledProvider())
+    original_drive = runner._drive_headless
+    submitted = []
+
+    async def drive_then_submit_delayed_command(total_ticks: int) -> None:
+        await original_drive(total_ticks)
+        runner.engine.command_executor.runtime_profile = lambda _command: (
+            DeviceRuntimeProfile(start_delay_s=100)
+        )
+        submitted.append(
+            await runner.engine.command_executor.submit(
+                DeviceCommand(
+                    source=CommandSource.SCENARIO,
+                    device_id="curtain_living_01",
+                    capability="open_percent",
+                    value=0,
+                ),
+                tick=runner.engine.timer.current_tick,
+                publish=runner.engine._publish_sim_event,
+            )
+        )
+
+    monkeypatch.setattr(runner, "_drive_headless", drive_then_submit_delayed_command)
+    try:
+        result = await runner.run()
+    finally:
+        await runner.engine.close()
+
+    assert submitted[0].status is CommandStatus.CANCELLED
+    assert submitted[0].detail == "scenario_horizon_reached"
+    assert runner.engine.command_executor.pending == {}
+    assert runner.engine.command_executor.device_runtime.operations == {}
+    assert any(
+        event.event_type == LIFECYCLE_EVENT_TYPE
+        and event.data["command_id"] == submitted[0].command.command_id
+        and event.data["to_status"] == "cancelled"
+        for event in result.events
+    )
 
 
 @pytest.mark.anyio

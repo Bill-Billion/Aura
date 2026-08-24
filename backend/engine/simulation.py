@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from pathlib import Path
 from typing import Any, Iterable, Literal, Mapping
@@ -15,11 +16,17 @@ from backend.agents.runtime import (
 )
 from backend.api.ws import ConnectionManager
 from backend.core.logging import log
+from backend.devices.latency import (
+    legacy_runtime_profile,
+    simulated_v2_runtime_profile,
+)
 from backend.engine.event_bus import EventBus, SimEvent, WorldEvent
 from backend.engine.event_log import RunArtifactRecorder, attach_run_artifacts
+from backend.engine.provenance import ExperimentProvenance, ExperimentRuntimeSelection
 from backend.engine.event_types import (
     ENGINE_ERROR_EVENT_TYPE,
     ENVIRONMENT_STATE_REFRESH,
+    SAFETY_SMOKE_DETECTED,
     TIMER_TICK_EVENT_TYPE,
     USER_ACTIVITY_CHANGE,
     USER_MOVEMENT_EVENT_TYPES,
@@ -60,7 +67,14 @@ from backend.scenarios.generator import (
     build_generation_sources,
 )
 from backend.scenarios.spec import ScenarioSpec
-from backend.scenarios.spec_v2 import ScenarioSpecV2
+from backend.scenarios.spec_v2 import (
+    ScenarioSpecV2,
+    apply_compiled_perturbations,
+    compile_perturbations,
+    unsupported_perturbations,
+)
+from backend.residents import ResidentEngine
+from backend.residents.policy import RESPONSIVE_EVENT_TYPES
 from backend.simulators.environment import EnvironmentSimulator
 from backend.simulators.user_behavior import UserBehaviorSimulator
 
@@ -82,12 +96,13 @@ class PerturbationRuntimeUnavailableError(RuntimeError):
     code = "perturbation_runtime_unavailable"
 
     def __init__(self, spec: ScenarioSpecV2) -> None:
+        unsupported = unsupported_perturbations(spec)
         self.scenario_id = spec.id
         self.unsupported_perturbation_types = tuple(
-            sorted({item.type for item in spec.perturbations})
+            sorted({item.type for item in unsupported})
         )
         self.unsupported_perturbation_phases = tuple(
-            sorted({item.phase for item in spec.perturbations})
+            sorted({item.phase for item in unsupported})
         )
         self.message = (
             f"scenario {spec.id!r} declares perturbations, but this runtime "
@@ -124,6 +139,7 @@ class SimulationEngine:
         connection_manager: ConnectionManager,
         llm_provider: LLMProvider | None = None,
         agent_episode_timeout_ms: int | None = None,
+        run_artifacts_root: Path | str | None = None,
     ) -> None:
         self.event_bus = event_bus
         self.state_manager = state_manager
@@ -132,6 +148,10 @@ class SimulationEngine:
 
         self.env_sim = EnvironmentSimulator()
         self.user_sim = UserBehaviorSimulator()
+        # v1 continues to use ``user_sim`` unchanged.  A v2 reset installs one
+        # deterministic resident runtime whose latent profile never enters
+        # WorldState (and therefore never enters the agent observation).
+        self.resident_engine: ResidentEngine | None = None
         self.timer = SimulatorTimer(
             publish_event=self._publish_sim_event,
             tick_interval=self.TICK_INTERVAL,
@@ -139,6 +159,7 @@ class SimulationEngine:
             # critic 修正③：tick 体的任何异常都必须把引擎停下并上报，而不是让循环
             # 静默死掉、is_running 继续说谎（"假活"）。
             on_error=self._handle_tick_error,
+            before_tick=self._advance_scheduled_runtimes,
         )
         # §4.5 三条生成产线（scripted/rule_based/stochastic）。默认 None＝交互式运行沿用
         # 既有 user_sim/env_sim 行为；场景 runner 在 reset 之后绑一份。
@@ -163,8 +184,13 @@ class SimulationEngine:
         # 会让 _pending 注册表没有生产寿命——cancel_pending 无事可取消、跨调用取代不成立。
         # 不在此处绑 publish：引擎自身不发命令，包装归各条腿所有。
         self.command_executor = CommandExecutor(
-            self.state_manager, invariant_debounce=self._invariant_report
+            self.state_manager,
+            invariant_debounce=self._invariant_report,
+            sim_time_source=lambda: self.sim_time_s,
+            run_id_source=lambda: self.run_id,
+            device_failure_handler=self._activate_runtime_device_failure,
         )
+        self.device_execution_model = "legacy_sync_v1"
 
         self.agent_runtime = AgentRuntime(
             llm_provider=llm_provider,
@@ -185,7 +211,10 @@ class SimulationEngine:
         # §11 工件：run 一开就有目录，事件随发随落（data/runs/{run_id}/）。
         # 挂在 RunManager 上而不是挂在引擎方法上——场景 runner 会直接调
         # run_manager.end_run("completed")，那条路径同样必须把 run.json 收尾。
-        self.run_artifacts: RunArtifactRecorder = attach_run_artifacts(self.run_manager)
+        self.run_artifacts: RunArtifactRecorder = attach_run_artifacts(
+            self.run_manager,
+            root=run_artifacts_root,
+        )
         self._start_run(scenario_id=None, seed=None, clear_event_history=False)
 
         self._subscribe_handlers()
@@ -226,7 +255,7 @@ class SimulationEngine:
         方式下同一拍的 sim_time 完全一致（这是双模式一致性的全部实现）。
         """
 
-        return max(0, self.timer.current_tick - 1) * float(self.timer.simulated_dt)
+        return self.timer.sim_time_s
 
     def bind_generation_sources(self, sources: GenerationSources | None) -> None:
         """挂上（或摘掉）本 run 的三条 §4.5 生成产线。
@@ -275,6 +304,7 @@ class SimulationEngine:
         counterfactual_group_id: str | None = None,
         counterfactual_variant: Literal["static", "dynamic"] | None = None,
         trace_spec_hash: str | None = None,
+        experiment: ExperimentProvenance | None = None,
         clear_event_history: bool = True,
     ) -> RunMetadata:
         """开一个新 run 并把 §11 元数据补齐（provider/model/agent 版本从运行期取）。
@@ -315,6 +345,7 @@ class SimulationEngine:
             counterfactual_group_id=counterfactual_group_id,
             counterfactual_variant=counterfactual_variant,
             trace_spec_hash=trace_spec_hash,
+            experiment=experiment,
             agent_versions=agent_versions,
             run_id=assigned_run_id,
             clear_event_history=clear_event_history,
@@ -418,6 +449,7 @@ class SimulationEngine:
         stochastic_overrides: Mapping[str, Any] | None = None,
         policy_selection: RuntimePolicySelection | None = None,
         duration_seconds: float | None = None,
+        experiment: ExperimentProvenance | None = None,
     ) -> None:
         """重置世界并开一个**新 run**（§11）。
 
@@ -437,8 +469,18 @@ class SimulationEngine:
         # 解析放在最前面：未知场景 id 必须在 pause/取消/换世界**之前**被拒，
         # 否则一次拼错的启动会把正在跑的 run 拆掉再报错。
         spec = resolve_run_scenario(scenario, dirs=scenario_dirs)
-        if isinstance(spec, ScenarioSpecV2) and spec.perturbations:
+        if isinstance(spec, ScenarioSpecV2) and unsupported_perturbations(spec):
             raise PerturbationRuntimeUnavailableError(spec)
+        compiled_perturbations = (
+            compile_perturbations(spec)
+            if isinstance(spec, ScenarioSpecV2)
+            else ()
+        )
+        resolved_execution_model = (
+            "simulated_time_v2"
+            if isinstance(spec, ScenarioSpecV2)
+            else "legacy_sync_v1"
+        )
         resolved_seed = seed if seed is not None else (spec.seed if spec is not None else None)
         if resolved_seed is not None:
             # Validate before pause/cancel/world swap.  A late failure in
@@ -451,6 +493,20 @@ class SimulationEngine:
             # this reset, leaving an explicit live/recorded run could leak paid
             # calls or replay state into later anonymous 3D interactions.
             policy_selection = self.agent_runtime.prepare_baseline_policy(None)
+
+        if experiment is not None:
+            if policy_selection.baseline_policy is BaselinePolicy.RULE_BASED:
+                experiment_model = "rule_based"
+            elif policy_selection.baseline_policy is BaselinePolicy.LLM_MOCKED:
+                experiment_model = "mocked"
+            else:
+                raise ValueError(
+                    "experiment provenance only supports rule_based or mocked runtime"
+                )
+            ExperimentRuntimeSelection(
+                model=experiment_model,
+                baseline_policy=policy_selection.baseline_policy,
+            ).validate_provenance(experiment)
 
         if spec is not None:
             # Construct the complete generation graph before pausing the old run
@@ -499,6 +555,7 @@ class SimulationEngine:
         self.timer.reset()
         self.timer.set_mode(self.DEFAULT_MODE)
         self.user_sim = UserBehaviorSimulator()
+        self.resident_engine = None
         self.last_engine_error = None
         self._pending_deltas = []
         # 换了世界（或清了世界）之后旧违规不再成立，去抖状态必须跟着复位。
@@ -510,6 +567,12 @@ class SimulationEngine:
         # 万一还有残留，bind_state_manager 会带生命周期事件地取消，绝不静默丢）。
         await self.command_executor.bind_state_manager(
             self.state_manager, reason="simulation_reset"
+        )
+        self.device_execution_model = resolved_execution_model
+        self.command_executor.runtime_profile = (
+            simulated_v2_runtime_profile
+            if isinstance(spec, ScenarioSpecV2)
+            else legacy_runtime_profile
         )
         self.agent_runtime.update_state_manager(self.state_manager)
         self.agent_runtime.reset()
@@ -550,11 +613,25 @@ class SimulationEngine:
             trace_spec_hash=(
                 scenario_trace_spec_fingerprint(spec) if spec is not None else None
             ),
+            experiment=experiment,
         )
+        if isinstance(spec, ScenarioSpecV2):
+            self.resident_engine = ResidentEngine(
+                spec.residents,
+                world=self.state_manager.world,
+                policy_kind="responsive",
+                # Share the run's named-stream registry so any future seeded
+                # resident policy is represented in run provenance.
+                rng=self.run_manager.rng,
+            )
         # 产线绑定必须在 _start_run 之后：GenerationContext 盖的是**新** run 的章，
         # 随机子流取自新 run 的 SimRandom（一 run 一 seed）。没有场景就摘干净——
         # 留着上一个场景的产线，等于用旧场景的 timeline 驱动一个匿名的新实验。
         try:
+            if isinstance(spec, ScenarioSpecV2):
+                apply_compiled_perturbations(
+                    compiled_perturbations, self
+                )
             if spec is not None:
                 self._install_generation_sources(spec, stochastic_overrides=stochastic_overrides)
             else:
@@ -614,9 +691,14 @@ class SimulationEngine:
             return
 
         self.event_bus.subscribe(TIMER_TICK_EVENT_TYPE, self._handle_timer_tick)
+        self.event_bus.subscribe(SAFETY_SMOKE_DETECTED, self._handle_safety_interrupt)
         for event_type in self._USER_MOVEMENT_SUBSCRIPTIONS:
             self.event_bus.subscribe(event_type, self._handle_user_activity_change)
         self.event_bus.subscribe(ENVIRONMENT_STATE_REFRESH, self._handle_environment_refresh)
+        for event_type in sorted(RESPONSIVE_EVENT_TYPES):
+            self.event_bus.subscribe(event_type, self._handle_resident_input)
+        for event_type in self._RESIDENT_STATE_EVENT_TYPES:
+            self.event_bus.subscribe(event_type, self._handle_resident_state_event)
         # 工件写入订阅在总线的 wildcard 上（而不是包在 _publish_sim_event 里）：
         # 只有这样才能连"不经引擎、直接 bus.publish"的事件（main.py 的 UI 根事件）
         # 一起收进工件，且拿到的是已经盖好 seq/run_id 章的那一份。
@@ -628,9 +710,14 @@ class SimulationEngine:
             return
 
         self.event_bus.unsubscribe(TIMER_TICK_EVENT_TYPE, self._handle_timer_tick)
+        self.event_bus.unsubscribe(SAFETY_SMOKE_DETECTED, self._handle_safety_interrupt)
         for event_type in self._USER_MOVEMENT_SUBSCRIPTIONS:
             self.event_bus.unsubscribe(event_type, self._handle_user_activity_change)
         self.event_bus.unsubscribe(ENVIRONMENT_STATE_REFRESH, self._handle_environment_refresh)
+        for event_type in sorted(RESPONSIVE_EVENT_TYPES):
+            self.event_bus.unsubscribe(event_type, self._handle_resident_input)
+        for event_type in self._RESIDENT_STATE_EVENT_TYPES:
+            self.event_bus.unsubscribe(event_type, self._handle_resident_state_event)
         self.event_bus.unsubscribe("*", self._record_event_artifact)
         self._subscriptions_registered = False
 
@@ -665,9 +752,45 @@ class SimulationEngine:
             # surrounding EventBus fan-out before finalization closes artifacts.
             self._is_processing_timer_tick = False
 
+    async def _advance_scheduled_runtimes(
+        self, timer_tick: int, sim_time_s: float
+    ) -> None:
+        """Publish due work before the tick that closes its time interval.
+
+        The simulator advances in coarse steps while devices retain exact
+        deadlines.  Draining after the closing tick would make persisted
+        ``sim_time_s`` move backwards.  Resident deadlines split the drain
+        into ordered intervals; ties remain resident-first so a safety event
+        can preempt a device completion at the same simulated instant.
+        """
+
+        resident_runtime = self.resident_engine
+        device_runtime = self.command_executor.device_runtime
+        world = self.state_manager.world
+        while resident_runtime is not None:
+            resident_due = resident_runtime.next_due_at_s
+            if resident_due is None or resident_due > sim_time_s:
+                break
+            await device_runtime.advance(
+                math.nextafter(resident_due, -math.inf),
+                tick=timer_tick,
+                active_run_id=self.run_id,
+            )
+            for resident_event in resident_runtime.advance(
+                world, sim_time_s=resident_due, tick=timer_tick
+            ):
+                await self._publish_sim_event(resident_event)
+        await device_runtime.advance(
+            sim_time_s,
+            tick=timer_tick,
+            active_run_id=self.run_id,
+        )
+
     async def _handle_timer_tick_body(self, event: SimEvent) -> None:
         world = self.state_manager.world
-        self._pending_deltas = []
+        # before_tick may have produced exact-time device/resident deltas.  The
+        # previous tick already flushed its batch, so retain these new deltas
+        # and send them atomically with the current tick's state update.
 
         timer_tick = int(event.data["tick"])
         simulated_dt = float(event.data["simulated_dt"])
@@ -854,6 +977,166 @@ class SimulationEngine:
             )
         )
 
+    async def _activate_runtime_device_failure(
+        self, device_id: str, sim_time_s: float, tick: int | None
+    ) -> None:
+        """Materialize a due v2 device failure as world truth plus a root event."""
+
+        event = await self._publish_sim_event(
+            SimEvent(
+                event_type="device.offline",
+                source=FAILURE_INJECTION_CAUSED_BY,
+                timestamp=float(tick if tick is not None else self.timer.current_tick),
+                priority=2,
+                event_generation_mode="scripted",
+                generation_rule_id="perturbation.device_failure",
+                sim_time_s=sim_time_s,
+                data={
+                    "device_id": device_id,
+                    "online": False,
+                    "at_sim_time_s": sim_time_s,
+                    "reason": "v2 device_failure perturbation",
+                },
+            )
+        )
+        self._apply_availability_write(
+            DeviceAvailabilityWrite(
+                device_id=device_id,
+                online=False,
+                reason="v2 device_failure perturbation",
+            ),
+            event,
+        )
+
+    # ScenarioSpecV2 perturbation-runtime protocol.  Device interventions are
+    # delegated to PR-2's runtime; resident and safety interventions share the
+    # resident simulated-time queue so equal-time ordering stays deterministic.
+    def inject_device_failure(
+        self, device_id: str, *, at_sim_time_s: float = 0.0
+    ) -> None:
+        self.command_executor.device_runtime.inject_device_failure(
+            device_id, at_sim_time_s=at_sim_time_s
+        )
+
+    def inject_feedback_loss(
+        self,
+        device_id: str,
+        *,
+        drop_count: int = 1,
+        at_sim_time_s: float = 0.0,
+    ) -> None:
+        self.command_executor.device_runtime.inject_feedback_loss(
+            device_id,
+            drop_count=drop_count,
+            at_sim_time_s=at_sim_time_s,
+        )
+
+    def inject_resident_state_change(
+        self,
+        user_id: str,
+        *,
+        room_id: str | None,
+        activity: str | None,
+        at_sim_time_s: float,
+    ) -> None:
+        if self.resident_engine is None:
+            raise RuntimeError("resident perturbation requires a v2 resident runtime")
+        self.resident_engine.inject_resident_state_change(
+            user_id,
+            room_id=room_id,
+            activity=activity,
+            at_sim_time_s=at_sim_time_s,
+        )
+
+    def inject_conflicting_request(
+        self,
+        user_id: str,
+        *,
+        room_id: str,
+        intent: str,
+        at_sim_time_s: float,
+    ) -> None:
+        if self.resident_engine is None:
+            raise RuntimeError("conflicting request requires a v2 resident runtime")
+        self.resident_engine.inject_conflicting_request(
+            user_id,
+            room_id=room_id,
+            intent=intent,
+            at_sim_time_s=at_sim_time_s,
+        )
+
+    def inject_safety_interrupt(
+        self,
+        *,
+        room_id: str,
+        event_type: str,
+        severity: str,
+        at_sim_time_s: float,
+    ) -> None:
+        if self.resident_engine is None:
+            raise RuntimeError("safety interrupt requires a v2 resident runtime")
+        self.resident_engine.inject_safety_interrupt(
+            room_id=room_id,
+            event_type=event_type,
+            severity=severity,
+            at_sim_time_s=at_sim_time_s,
+        )
+
+    async def _handle_safety_interrupt(self, event: SimEvent) -> None:
+        """A safety root event preempts every currently executing device operation."""
+
+        await self.command_executor.interrupt_device_operations(
+            reason=f"safety interrupt: {event.event_type}",
+            tick=self.state_manager.world.simulation_tick,
+            sim_time_s=event.sim_time_s,
+        )
+
+    _RESIDENT_STATE_EVENT_TYPES: tuple[str, ...] = (
+        "resident.satisfied",
+        "resident.dissatisfied",
+        "resident.regret",
+        "resident.correction",
+        "resident.override",
+    )
+
+    async def _handle_resident_input(self, event: SimEvent) -> None:
+        runtime = self.resident_engine
+        if runtime is None:
+            return
+        for response_event in runtime.handle_event(
+            self.state_manager.world,
+            event,
+            sim_time_s=float(event.sim_time_s if event.sim_time_s is not None else self.sim_time_s),
+        ):
+            await self._publish_sim_event(response_event)
+
+    async def _handle_resident_state_event(self, event: SimEvent) -> None:
+        """Expose satisfaction only; profile/preferences stay latent."""
+
+        user_id = str(event.data.get("user_id") or "")
+        user = self.state_manager.world.users.get(user_id)
+        if user is None:
+            return
+        satisfaction = event.data.get("satisfaction")
+        if isinstance(satisfaction, bool) or not isinstance(satisfaction, (int, float)):
+            return
+        self._pending_deltas.extend(
+            self.state_manager.apply_path_update(
+                caused_by=event.source,
+                path=f"users[{user_id}].comfort_score",
+                new_value=float(satisfaction),
+                reason="resident satisfaction response",
+                caused_by_event_id=event.event_id,
+            )
+        )
+        if not self._is_processing_timer_tick:
+            await self._flush_pending_deltas()
+            await self._report_world_invariants(
+                phase="resident_state_response",
+                attributed_to=event.source,
+                root_event=event,
+            )
+
     # ------------------------------------------------------------------
     # 主循环故障（critic 修正③：绝不假活）
     # ------------------------------------------------------------------
@@ -875,6 +1158,7 @@ class SimulationEngine:
             "tick": self.timer.current_tick,
             "run_id": self.run_id,
             "scenario_id": self.scenario_id,
+            "device_execution_model": self.device_execution_model,
         }
         self.last_engine_error = detail
         log.error("engine_tick_failed", **detail)
@@ -910,7 +1194,13 @@ class SimulationEngine:
 
         updates: list[tuple[str, Any]] = []
         if target_room:
-            updates.append((f"users[{user_id}].location", Location3D(room=target_room)))
+            location = (
+                None
+                if target_room == "outside"
+                and event.data.get("perturbation_type") == "resident_state_change"
+                else Location3D(room=target_room)
+            )
+            updates.append((f"users[{user_id}].location", location))
         if activity:
             updates.append((f"users[{user_id}].activity", activity))
 
@@ -942,6 +1232,12 @@ class SimulationEngine:
                 caused_by=event.source,
                 updates=updates,
                 reason="apply user activity change",
+                caused_by_event_id=(
+                    event.event_id
+                    if event.data.get("perturbation_type")
+                    == "resident_state_change"
+                    else None
+                ),
             )
         )
 
@@ -1119,6 +1415,7 @@ class SimulationEngine:
             # 但研究者从此能在任意一条状态消息上回答"我现在看的是哪次实验"（§18）。
             "run_id": self.run_id,
             "scenario_id": self.scenario_id,
+            "device_execution_model": self.device_execution_model,
             "seed": metadata.seed if metadata is not None else None,
             "baseline_policy": (
                 metadata.baseline_policy.value

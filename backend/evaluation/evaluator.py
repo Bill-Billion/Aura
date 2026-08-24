@@ -33,9 +33,13 @@ from backend.models.versioning import (
     check_scenario_schema_compatibility,
     check_schema_compatibility,
 )
-from backend.scenarios.fingerprint import scenario_contract_fingerprint
+from backend.scenarios.fingerprint import (
+    scenario_contract_fingerprint,
+    scenario_trace_spec_fingerprint,
+)
 from backend.scenarios.loader import get_scenario
 from backend.scenarios.spec import ScenarioSpec
+from backend.scenarios.spec_v2 import ScenarioSpecV2
 
 REPORT_SCHEMA_VERSION = SUPPORTED_REPORT_SCHEMA_VERSION
 CANONICAL_METRIC_NAMES: tuple[str, ...] = (
@@ -98,6 +102,10 @@ class EvalReport:
     failure_reasons: list[str] = field(default_factory=list)
     provenance: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+    final_state_success: bool | None = None
+    trajectory_properties_satisfied: bool | None = None
+    trajectory_safe_success: bool | None = None
+    trace_verification: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -110,6 +118,14 @@ class EvalReport:
             "criteria_checks": self.criteria_checks,
             "failed_metrics": list(self.failed_metrics),
             "failure_reasons": list(self.failure_reasons),
+            "final_state_success": self.final_state_success,
+            "trajectory_properties_satisfied": self.trajectory_properties_satisfied,
+            "trajectory_safe_success": self.trajectory_safe_success,
+            "trace_verification": (
+                dict(self.trace_verification)
+                if self.trace_verification is not None
+                else None
+            ),
             "provenance": dict(self.provenance),
             "metadata": dict(self.metadata),
         }
@@ -409,6 +425,9 @@ class ScenarioEvaluator:
             device_rooms=context["device_rooms"],
             device_types=context["device_types"],
             success_criteria=criteria,
+            state_evidence_source=(
+                "device_effect" if isinstance(scenario, ScenarioSpecV2) else "feedback"
+            ),
         )
         device_match = compute_device_state_match_rate(collector)
         metrics = EvalMetrics(
@@ -430,6 +449,50 @@ class ScenarioEvaluator:
             has_expected_failures=bool(context["expected_failures"]),
             required_metrics=list(scenario.metrics),
         )
+        final_state_success: bool | None = None
+        trajectory_properties_satisfied: bool | None = None
+        trajectory_safe_success: bool | None = None
+        trace_verification: dict[str, Any] | None = None
+        trace_unevaluable = False
+        if isinstance(scenario, ScenarioSpecV2):
+            from backend.evaluation.temporal import VerificationStatus, verify_trace
+
+            if context["expected_device_effects"]:
+                final_state_success = device_match.value == 1.0
+            else:
+                final_state_success = bool(
+                    (context["ground_truth"] or {}).get("acceptable_noop", False)
+                )
+            verification = verify_trace(scenario.trace_spec, events)
+            trace_verification = verification.to_dict()
+            if verification.hard_status is VerificationStatus.PASS:
+                trajectory_properties_satisfied = True
+            elif verification.hard_status is VerificationStatus.FAIL:
+                trajectory_properties_satisfied = False
+                failed_metrics.append("trajectory_properties_satisfied")
+                reasons.extend(
+                    f"TraceSpec {item.property_id}: {item.message}"
+                    for item in verification.properties
+                    if item.level == "hard" and item.status is VerificationStatus.FAIL
+                )
+            else:
+                trace_unevaluable = True
+                reasons.extend(
+                    f"TraceSpec {item.property_id}: {item.message}"
+                    for item in verification.properties
+                    if item.level == "hard"
+                    and item.status is VerificationStatus.UNEVALUABLE
+                )
+            checks["final_state_success"] = final_state_success
+            checks["trajectory_properties_satisfied"] = (
+                trajectory_properties_satisfied is True
+            )
+            trajectory_safe_success = (
+                final_state_success and trajectory_properties_satisfied
+                if trajectory_properties_satisfied is not None
+                else None
+            )
+            checks["trajectory_safe_success"] = trajectory_safe_success is True
         provenance = self._provenance(
             run_id=run_id,
             scenario=scenario,
@@ -442,16 +505,28 @@ class ScenarioEvaluator:
             run_id=run_id,
             scenario_id=scenario_id,
             seed=seed,
-            outcome=EvalOutcome.FAIL if failed_metrics else EvalOutcome.PASS,
+            outcome=(
+                EvalOutcome.ERROR
+                if trace_unevaluable
+                else (EvalOutcome.FAIL if failed_metrics else EvalOutcome.PASS)
+            ),
             metrics=metrics,
             criteria_checks=checks,
             failed_metrics=failed_metrics,
             failure_reasons=reasons,
             provenance=provenance,
+            final_state_success=final_state_success,
+            trajectory_properties_satisfied=trajectory_properties_satisfied,
+            trajectory_safe_success=trajectory_safe_success,
+            trace_verification=trace_verification,
             metadata={
                 "total_events": len(events),
                 "total_episodes": len(collector.agent_episode_ids),
                 "total_commands": len(collector.final_command_events),
+                "final_state_blind_spot": (
+                    final_state_success is True
+                    and trajectory_properties_satisfied is False
+                ),
             },
         )
 
@@ -645,6 +720,8 @@ class ScenarioEvaluator:
             "baseline_policy": run_metadata.get("baseline_policy"),
             "recording_source_run_id": run_metadata.get("recording_source_run_id"),
             "initial_state_hash": run_metadata.get("initial_state_hash"),
+            "trace_spec_hash": run_metadata.get("trace_spec_hash"),
+            "experiment": run_metadata.get("experiment"),
             "required_metrics": list(scenario.metrics) if scenario is not None else [],
         }
 
@@ -675,6 +752,7 @@ def evaluate_run(
         "scenario_id": metadata_scenario_id,
         "seed": metadata_seed,
         "scenario_contract_hash": metadata.get("scenario_contract_hash"),
+        "trace_spec_hash": metadata.get("trace_spec_hash"),
         "source_revision": metadata.get("source_revision"),
         "evaluator_source_revision": read_source_revision(),
     }
@@ -795,6 +873,23 @@ def evaluate_run(
             seed=metadata_seed,
             provenance=base_provenance,
         )
+    if isinstance(scenario, ScenarioSpecV2):
+        recorded_trace_hash = metadata.get("trace_spec_hash")
+        current_trace_hash = scenario_trace_spec_fingerprint(scenario)
+        if (
+            not isinstance(recorded_trace_hash, str)
+            or len(recorded_trace_hash) != 64
+            or recorded_trace_hash != current_trace_hash
+        ):
+            return _error_report(
+                run_id,
+                "TraceSpec evaluation contract drift: "
+                f"run recorded {recorded_trace_hash!r}, current library resolves "
+                f"{current_trace_hash!r}",
+                scenario_id=metadata_scenario_id,
+                seed=metadata_seed,
+                provenance=base_provenance,
+            )
     try:
         events, _ = read_run_events(
             run_id, root=data_root, verify_integrity=False

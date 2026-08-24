@@ -25,6 +25,7 @@ from backend.agents.runtime import (
     DisabledLLMProvider,
 )
 from backend.api.ws import ConnectionManager
+from backend.devices.latency import DeviceRuntimeProfile
 from backend.engine.event_bus import EventBus
 from backend.engine.event_log import (
     EVENTS_FILENAME,
@@ -38,6 +39,7 @@ from backend.engine.event_log import (
 from backend.engine.rng import MAX_JSON_SAFE_SEED, MAX_SEED
 from backend.engine.run_manager import effective_llm_mode_for_policy
 from backend.engine.simulation import SimulationEngine
+from backend.execution.command import CommandSource, CommandStatus, DeviceCommand
 from backend.main import app
 from backend.models.schemas import (
     BaselinePolicy,
@@ -741,6 +743,38 @@ async def test_old_finalizer_cannot_end_a_new_run():
     assert engine.run_manager.current is not None
     assert engine.run_manager.current.ended_at is None
     await engine.close()
+
+
+async def test_production_finalizer_cancels_device_work_beyond_horizon():
+    engine = SimulationEngine(
+        EventBus(), main_module._init_default_state(), ConnectionManager()
+    )
+    run_id = engine.run_id
+    assert run_id is not None
+    engine.command_executor.runtime_profile = lambda _command: DeviceRuntimeProfile(
+        start_delay_s=100
+    )
+    record = await engine.command_executor.submit(
+        DeviceCommand(
+            source=CommandSource.SCENARIO,
+            device_id="light_living_01",
+            capability="power",
+            value=True,
+        ),
+        publish=engine._publish_sim_event,
+    )
+    assert record.status is CommandStatus.EXECUTING
+
+    main_module.simulation_engine = engine
+    try:
+        await main_module._finalize_scenario_run(run_id, 0.0)
+    finally:
+        await engine.close()
+
+    assert record.status is CommandStatus.CANCELLED
+    assert record.detail == "run_duration_elapsed"
+    assert engine.command_executor.pending == {}
+    assert engine.command_executor.device_runtime.operations == {}
 
 
 async def test_finished_run_clears_bus_and_ws_start_opens_anonymous_run(monkeypatch):

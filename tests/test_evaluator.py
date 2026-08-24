@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -31,6 +32,11 @@ from backend.main import app
 from backend.scenarios.loader import load_library
 from backend.scenarios.runner import run_scenario
 from backend.scenarios.spec import ScenarioSpec
+
+
+AURABENCH_PILOT_DIR = (
+    Path(__file__).resolve().parents[1] / "benchmarks" / "aurabench-dev" / "episodes"
+)
 
 
 def event(
@@ -435,6 +441,107 @@ def test_device_match_rate_counts_fields_from_flat_feedback_and_deadlines() -> N
     )
     assert late.value == pytest.approx(2 / 3)
     assert late.details["fields"][1]["deadline_matched"] is False
+
+
+def test_v2_state_evidence_uses_physical_effect_when_feedback_is_lost() -> None:
+    applied = event(
+        "device.effect_applied",
+        seq=0,
+        event_id="effect",
+        parent=None,
+        sim_time_s=4.0,
+        data={
+            "deltas": [
+                {
+                    "path": "devices[light_living_01].state.power",
+                    "old_value": False,
+                    "new_value": True,
+                }
+            ]
+        },
+    )
+    contract = {
+        "device_id": "light_living_01",
+        "within_seconds": 5,
+        "expected": {"power": {"equals": True}},
+    }
+
+    physical = compute_device_state_match_rate(
+        MetricsCollector(
+            events=[applied],
+            initial_device_states={"light_living_01": {"power": False}},
+            expected_device_effects=[contract],
+            state_evidence_source="device_effect",
+        )
+    )
+    historical_feedback = compute_device_state_match_rate(
+        MetricsCollector(
+            events=[applied],
+            initial_device_states={"light_living_01": {"power": False}},
+            expected_device_effects=[contract],
+        )
+    )
+
+    assert physical.value == 1.0
+    assert historical_feedback.value == 0.0
+
+
+def test_v2_report_exposes_final_state_blind_spot() -> None:
+    scenario = load_library([AURABENCH_PILOT_DIR])["read_then_leave_001_static"]
+    events = [
+        event(
+            "user.starts_activity",
+            seq=0,
+            event_id="root",
+            parent=None,
+            sim_time_s=0,
+            data={"activity": "reading", "room_id": "living_room"},
+        ),
+        event(
+            "action.device_control",
+            seq=1,
+            event_id="living-action",
+            parent="root",
+            sim_time_s=1,
+            data={"device_id": "light_living_01", "capability": "power", "value": True},
+        ),
+        event(
+            "device.effect_applied",
+            seq=2,
+            event_id="effect",
+            parent="living-action",
+            sim_time_s=2,
+            data={
+                "deltas": [
+                    {
+                        "path": "devices[light_living_01].state.power",
+                        "new_value": True,
+                    },
+                    {
+                        "path": "devices[light_living_01].state.extra.brightness",
+                        "new_value": 70,
+                    },
+                ]
+            },
+        ),
+        event(
+            "action.device_control",
+            seq=3,
+            event_id="bedroom-action",
+            parent="root",
+            sim_time_s=3,
+            data={"device_id": "light_bedroom_01", "capability": "power", "value": True},
+        ),
+    ]
+
+    report = ScenarioEvaluator(scenario).evaluate(events)
+
+    assert report.final_state_success is True
+    assert report.trajectory_properties_satisfied is False
+    assert report.trajectory_safe_success is False
+    assert report.metadata["final_state_blind_spot"] is True
+    assert report.trace_verification is not None
+    assert report.trace_verification["hard_status"] == "fail"
 
 
 def test_empty_effects_and_unknown_safety_constraint_do_not_default_pass() -> None:

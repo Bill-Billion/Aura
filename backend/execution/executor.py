@@ -56,9 +56,12 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
-from typing import Callable, Sequence
+from typing import Awaitable, Callable, Sequence
 
 from backend.core.logging import log
+from backend.devices.latency import DeviceRuntimeProfile, legacy_runtime_profile
+from backend.devices.operation import DeviceOperation
+from backend.devices.runtime import DeviceRuntime
 from backend.execution.validation import CommandErrorCode, validate_command
 from backend.engine.event_bus import SimEvent
 from backend.engine.state_manager import (
@@ -85,6 +88,7 @@ from backend.simulators.environment import calculate_room_light_level
 
 # executor 派生事件类型（均复用既有 SIM_EVENT 通道，前端零改动可见）。
 ACTION_EVENT_TYPE = "action.device_control"
+DEVICE_EFFECT_APPLIED_EVENT_TYPE = "device.effect_applied"
 FEEDBACK_EVENT_TYPE = "feedback.state_delta"
 COMMAND_FAILED_EVENT_TYPE = "device.command_failed"
 # §2.2 不变式违规的失败码（事件类型定义在状态层，此处 re-export 保持既有导入路径）。
@@ -152,6 +156,8 @@ PreSubmitHook = Callable[[DeviceCommand], "PreSubmitDecision | None"]
 
 # 可注入时钟：默认单调钟，测试注入假钟以诚实触发反馈超时。
 Clock = Callable[[], float]
+RuntimeProfileResolver = Callable[[DeviceCommand], DeviceRuntimeProfile]
+DeviceFailureHandler = Callable[[str, float, int | None], Awaitable[None]]
 
 
 def _property_path(capability: str) -> str:
@@ -302,12 +308,23 @@ class CommandExecutor:
         clock: Clock = time.monotonic,
         feedback_timeout: float | None = None,
         invariant_debounce: InvariantReportDebounce | None = None,
+        device_runtime: DeviceRuntime | None = None,
+        runtime_profile: RuntimeProfileResolver = legacy_runtime_profile,
+        sim_time_source: Callable[[], float] = lambda: 0.0,
+        run_id_source: Callable[[], str | None] = lambda: None,
+        device_failure_handler: DeviceFailureHandler | None = None,
     ) -> None:
         self.state_manager = state_manager
         self.publish_event = publish_event
         self.effects = effects if effects is not None else default_device_effects
         self.clock = clock
         self.feedback_timeout = feedback_timeout
+        self.runtime_profile = runtime_profile
+        self.sim_time_source = sim_time_source
+        self.run_id_source = run_id_source
+        self.device_failure_handler = device_failure_handler
+        self.device_runtime = device_runtime or DeviceRuntime()
+        self.device_runtime.bind_driver(self)
         # 与仿真写入路径共用的违规上报去抖（引擎注入同一实例）；独立构造时自带一份。
         self.invariant_debounce = (
             invariant_debounce if invariant_debounce is not None else InvariantReportDebounce()
@@ -340,12 +357,35 @@ class CommandExecutor:
         """
 
         cancelled = await self.cancel_pending(reason, tick=tick)
+        self.device_runtime.reset()
         self.state_manager = state_manager
         # cancel_pending 已逐条注销；这里兜底清掉不可合法取消的残留（终态记录）。
         self._pending.clear()
         # 换了世界，旧世界的违规不再成立：去抖签名必须跟着复位，否则新世界的同名违规会被吞掉。
         self.invariant_debounce.reset()
         return cancelled
+
+    async def advance_device_runtime(
+        self, sim_time_s: float, *, tick: int | None = None
+    ) -> None:
+        """Advance device work to *sim_time_s* without consulting wall time."""
+
+        await self.device_runtime.advance(
+            sim_time_s, tick=tick, active_run_id=self.run_id_source()
+        )
+
+    async def interrupt_device_operations(
+        self,
+        *,
+        reason: str = "safety_interrupt",
+        tick: int | None = None,
+        sim_time_s: float | None = None,
+    ) -> list[DeviceOperation]:
+        return await self.device_runtime.interrupt(
+            reason=reason,
+            tick=tick,
+            sim_time_s=sim_time_s,
+        )
 
     # ------------------------------------------------------------------
     # 公共入口
@@ -629,9 +669,52 @@ class CommandExecutor:
         # 动作已下发但世界尚未变更：此刻被取代 → 世界零变更收工（apply 绝不能再跑）。
         if record.is_terminal:
             return record
+        now = float(self.sim_time_source())
+        self.device_runtime.schedule(
+            record,
+            publish=publish,
+            action_event_id=action_event.event_id,
+            profile=self.runtime_profile(command),
+            sim_time_s=now,
+            run_id=self.run_id_source(),
+        )
+        # The default profile drains at the current simulated instant, preserving
+        # the v1 API contract that submit() returns a terminal record.
+        await self.advance_device_runtime(now, tick=tick)
+        return record
 
-        # 步骤7 前置守卫：§2.2 命令级不变式（离线设备写 / 只读能力被非仿真源写）。
-        # 与六级校验重叠是有意的——那道守入口，这道守状态层，先抛先拦，世界零变更。
+    async def apply_device_operation(
+        self, operation: DeviceOperation, *, sim_time_s: float, tick: int | None
+    ) -> bool:
+        """Apply ground truth for a due operation; runtime itself cannot mutate it."""
+
+        record = operation.record
+        command = operation.command
+        publish = operation.publish
+        # Revalidate only if simulated time could have advanced since admission.
+        # The zero-delay v1 path keeps its historical single validation call.
+        failure = None
+        if (
+            operation.start_at_s > operation.issued_at_s
+            or operation.finish_at_s > operation.issued_at_s
+        ):
+            failure = validate_command(
+                self.state_manager.world,
+                command.device_id,
+                command.capability,
+                command.value,
+            )
+        if failure is not None:
+            await self.fail_device_operation(
+                operation,
+                status=CommandStatus.FAILED,
+                failure_code=failure.code.value,
+                detail=failure.message,
+                tick=tick,
+                sim_time_s=sim_time_s,
+            )
+            return False
+
         device = self.state_manager.world.devices.get(command.device_id)
         if device is not None:
             try:
@@ -640,71 +723,62 @@ class CommandExecutor:
                 )
             except InvariantViolation as exc:
                 await self._fail_on_invariant(
-                    record, command, exc, action_event.event_id, (), tick, publish=publish
+                    record,
+                    command,
+                    exc,
+                    operation.action_event_id,
+                    (),
+                    tick,
+                    publish=publish,
+                    sim_time_s=sim_time_s,
                 )
-                return record
+                return False
 
-        # 归因基线：apply 之前先探一次不变式。世界若在本命令落地前就已不一致，说明是仿真
-        # （或任何非命令写入方）改坏的——那条违规必须记在仿真头上并照常放行本命令，否则
-        # 一次仿真写坏会让此后每条无辜命令连锁 failed，世界永久卡死（审计 finding 3）。
-        # 上报走与仿真侧共用的签名去抖：同一条未修复的违规只报一次，而不是每条命令补一条
-        # （review2 finding-3 的事件洪水）；世界恢复一致后签名复位，重新可报。
         pre_existing = find_world_invariant_violation(self.state_manager.world)
-        # should_report 带副作用（记账/复位签名），世界一致时也必须传 None 调用它，
-        # 因此不能把 is-not-None 前移短路；None 情形它自身已返回 False。
         if self.invariant_debounce.should_report(pre_existing):
             await self._emit_invariant_violation(
                 command,
                 pre_existing,
-                action_event.event_id,
+                operation.action_event_id,
                 (),
                 tick,
                 publish=publish,
                 pre_existing=True,
+                sim_time_s=sim_time_s,
             )
             if record.is_terminal:
-                return record
+                return False
 
-        # 步骤7：唯一的世界变更入口。校验通过后设备仍可能并发消失（reset）——
-        # 转结构化 failed，绝不静默吞（根治缺陷①）。
-        dispatch_at = self.clock()
+        dispatch_at = (
+            self.clock()
+            if operation.legacy_wall_clock_timeout
+            and self.feedback_timeout is not None
+            else None
+        )
         try:
             deltas = self.state_manager.apply_action(
-                # 归因到具体执行者：delta.caused_by 与 device.last_changed_by 由此承载 agent 身份。
                 agent_id=command_actor(command),
                 device_id=command.device_id,
                 property_path=_property_path(command.capability),
                 new_value=command.value,
                 reason=command.reason or "",
-                caused_by_event_id=action_event.event_id,
+                caused_by_event_id=operation.action_event_id,
             )
         except KeyError as exc:
-            await record.transition(
-                CommandStatus.FAILED,
-                failure=CommandErrorCode.UNKNOWN_DEVICE.value,
+            await self.fail_device_operation(
+                operation,
+                status=CommandStatus.FAILED,
+                failure_code=CommandErrorCode.UNKNOWN_DEVICE.value,
                 detail=str(exc),
                 tick=tick,
+                sim_time_s=sim_time_s,
             )
-            await self._emit_command_failed(
-                command,
-                error_code=CommandErrorCode.UNKNOWN_DEVICE.value,
-                reason=str(exc),
-                causal_parent=action_event.event_id,
-                tick=tick,
-                publish=publish,
-            )
-            self._deregister(record)
-            return record
+            return False
 
-        # 反馈超时：动作已下发但确认超出预算窗口 → 诚实标 timed_out（注入时钟触发）。
-        # 语义取「回滚」：§10.2 明令失败命令不得改动世界，而 timed_out 就是 execution_timeout
-        # 这一失败码的终态。若提交却不发 feedback，世界与事件流会分叉（前端与 S4 指标从事件流
-        # 重建的状态跟真实世界对不上）；因此逆序回滚本命令落地的 delta，并在 command_failed 上
-        # 报 reverted_paths 留痕——与相邻的不变式违规分支同构（禁止静默纠正）。
-        feedback_at = self.clock()
         if (
-            self.feedback_timeout is not None
-            and (feedback_at - dispatch_at) > self.feedback_timeout
+            dispatch_at is not None
+            and self.feedback_timeout is not None
+            and self.clock() - dispatch_at > self.feedback_timeout
         ):
             reverted = self.state_manager.revert(deltas)
             await record.transition(
@@ -717,34 +791,18 @@ class CommandExecutor:
                 command,
                 error_code=CommandErrorCode.EXECUTION_TIMEOUT.value,
                 reason="state feedback exceeded budget",
-                causal_parent=action_event.event_id,
+                causal_parent=operation.action_event_id,
                 reverted_paths=reverted,
                 tick=tick,
                 publish=publish,
             )
             self._deregister(record)
-            return record
+            return False
 
-        # 统一 effect 钩子（房间光照重算）追加派生 delta。
         deltas = list(deltas) + list(self.effects(self.state_manager, command, deltas))
-        # §2.2 第7条：effect 钩子按既有签名产出的 delta 也必须归因到同一条 action 事件。
         for delta in deltas:
             if delta.caused_by_event_id is None:
-                delta.caused_by_event_id = action_event.event_id
-
-        # 步骤7.5：§2.2 世界级不变式后置校验，但只对「本命令造成的」违规问责：
-        #   - apply 前世界干净 → 违规必是本命令引入 → 逆序回滚全部 delta + executing→failed
-        #     + system.invariant_violation（禁止静默纠正）；不发反馈。
-        #   - apply 前世界就已不一致 → 已发过 pre_existing 违规事件，此处不再叠加责任。
-        #
-        # **已声明的边界（review2 finding-2，S2 交接项）**：当世界在 apply 前就已不一致时，
-        # 一条真的把世界改得**更坏**（新增了另一条违规）的命令，当前既不回滚、也不 failed、
-        # 也不会被归因为命令造成——只有那条 pre_existing/仿真归因的事件出现。也就是说
-        # §2.2「命令不得留下被改坏的世界」这条保证，在仿真引入的不一致存续期间是**挂起**的。
-        # 为什么现在不收紧：find_world_invariant_violation 只返回**首条**违规（短路求值），
-        # 拿不到违规集合，无法判定"集合是否变大"；只比签名会误判——首条违规的身份可能因为
-        # 无关的写入而改变，反而把仿真的锅扣到无辜命令头上，那正是审计 finding 3 要根治的。
-        # 正解需要"apply 前后的世界快照 diff + 违规集合枚举"，属 S2 run 模型的能力。
+                delta.caused_by_event_id = operation.action_event_id
         violation = find_world_invariant_violation(self.state_manager.world)
         if violation is not None and pre_existing is None:
             reverted = self.state_manager.revert(deltas)
@@ -752,29 +810,81 @@ class CommandExecutor:
                 record,
                 command,
                 violation,
-                action_event.event_id,
+                operation.action_event_id,
                 reverted,
                 tick,
                 publish=publish,
+                sim_time_s=sim_time_s,
             )
-            return record
+            return False
 
-        # 步骤8：逐 delta 发 feedback.state_delta，因果挂在 action 之下。
-        # 循环中途被取代也照发完：变更已经落地，不上报世界与事件流就分叉了（S4 从事件流
-        # 重建的状态会跟真实世界对不上）。
-        for delta in deltas:
+        operation.deltas = deltas
+        operation.effect_applied_at_s = sim_time_s
+        effect = await self._emit_device_effect(operation, sim_time_s, tick)
+        operation.effect_event_id = effect.event_id
+        return True
+
+    async def deliver_device_feedback(
+        self, operation: DeviceOperation, *, sim_time_s: float, tick: int | None
+    ) -> None:
+        record = operation.record
+        for delta in operation.deltas:
             await self._emit_feedback(
-                command, delta, action_event.event_id, tick, publish=publish
+                operation.command,
+                delta,
+                (
+                    operation.effect_event_id
+                    if operation.feedback_causal_parent_effect
+                    else operation.action_event_id
+                )
+                or operation.action_event_id,
+                tick,
+                publish=operation.publish,
+                sim_time_s=sim_time_s,
             )
-
-        # apply 之后才被取代：保留已落地的变更（上面已如实上报），只是不再叠加 succeeded。
-        # 这里绝不回滚——取代者写的是同一个控制点且通常已经落地，回滚会用本命令的 old_value
-        # 覆盖那条更新的合法写入；timed_out 分支能回滚是因为它的 apply 与回滚之间没有 await。
-        if record.is_terminal:
-            return record
-        await record.transition(CommandStatus.SUCCEEDED, tick=tick)
+        if not record.is_terminal:
+            await record.transition(
+                CommandStatus.SUCCEEDED, tick=tick, sim_time_s=sim_time_s
+            )
         self._deregister(record)
-        return record
+
+    async def activate_device_failure(
+        self, device_id: str, *, sim_time_s: float, tick: int | None
+    ) -> None:
+        """Delegate availability ground truth to the engine's simulator path."""
+
+        if self.device_failure_handler is not None:
+            await self.device_failure_handler(device_id, sim_time_s, tick)
+
+    async def fail_device_operation(
+        self,
+        operation: DeviceOperation,
+        *,
+        status: CommandStatus,
+        failure_code: str,
+        detail: str,
+        tick: int | None,
+        sim_time_s: float | None = None,
+    ) -> None:
+        record = operation.record
+        if not record.is_terminal:
+            await record.transition(
+                status,
+                failure=failure_code,
+                detail=detail,
+                tick=tick,
+                sim_time_s=sim_time_s,
+            )
+            await self._emit_command_failed(
+                operation.command,
+                error_code=failure_code,
+                reason=detail,
+                causal_parent=operation.effect_event_id or operation.action_event_id,
+                tick=tick,
+                publish=operation.publish,
+                sim_time_s=sim_time_s,
+            )
+        self._deregister(record)
 
     # ------------------------------------------------------------------
     # 内部工具
@@ -894,6 +1004,7 @@ class CommandExecutor:
         tick: int | None,
         *,
         publish: PublishEvent | None = None,
+        sim_time_s: float | None = None,
     ) -> SimEvent:
         data = delta.model_dump()
         data["device_id"] = command.device_id
@@ -906,9 +1017,46 @@ class CommandExecutor:
             correlation_id=command.correlation_id,
             causal_parent=action_event_id,
             priority=command.priority,
+            sim_time_s=sim_time_s,
             data=data,
         )
         return await self._resolve_publish(publish)(event)
+
+    async def _emit_device_effect(
+        self, operation: DeviceOperation, sim_time_s: float, tick: int | None
+    ) -> SimEvent:
+        """Publish ground truth separately from the fallible feedback channel."""
+
+        command = operation.command
+        event = SimEvent(
+            event_type=DEVICE_EFFECT_APPLIED_EVENT_TYPE,
+            source="device_runtime",
+            timestamp=float(tick if tick is not None else command.issued_tick),
+            correlation_id=command.correlation_id,
+            causal_parent=operation.action_event_id,
+            priority=command.priority,
+            sim_time_s=sim_time_s,
+            data={
+                "operation_id": operation.operation_id,
+                "operation_kind": operation.kind.value,
+                "command_id": command.command_id,
+                "device_id": command.device_id,
+                "capability": command.capability,
+                "source": command.source.value,
+                "effect_applied_at_sim_time_s": sim_time_s,
+                "issued_at_sim_time_s": operation.issued_at_s,
+                "scheduled_start_at_sim_time_s": operation.start_at_s,
+                "scheduled_finish_at_sim_time_s": operation.finish_at_s,
+                "feedback_deadline_at_sim_time_s": (
+                    sim_time_s + operation.feedback_timeout_s
+                ),
+                "feedback_delay_s": operation.feedback_delay_s,
+                "feedback_timeout_s": operation.feedback_timeout_s,
+                "deltas": [delta.model_dump(mode="json") for delta in operation.deltas],
+                **_actor_fields(command),
+            },
+        )
+        return await self._resolve_publish(operation.publish)(event)
 
     async def _fail_on_invariant(
         self,
@@ -920,6 +1068,7 @@ class CommandExecutor:
         tick: int | None,
         *,
         publish: PublishEvent | None = None,
+        sim_time_s: float | None = None,
     ) -> None:
         """不变式违规的统一收口：命令 failed + 结构化违规事件 + 同码 device.command_failed。"""
 
@@ -928,9 +1077,16 @@ class CommandExecutor:
             failure=INVARIANT_VIOLATION_ERROR_CODE,
             detail=violation.message,
             tick=tick,
+            sim_time_s=sim_time_s,
         )
         await self._emit_invariant_violation(
-            command, violation, causal_parent, reverted_paths, tick, publish=publish
+            command,
+            violation,
+            causal_parent,
+            reverted_paths,
+            tick,
+            publish=publish,
+            sim_time_s=sim_time_s,
         )
         await self._emit_command_failed(
             command,
@@ -939,6 +1095,7 @@ class CommandExecutor:
             causal_parent=causal_parent,
             tick=tick,
             publish=publish,
+            sim_time_s=sim_time_s,
         )
         self._deregister(record)
 
@@ -952,6 +1109,7 @@ class CommandExecutor:
         *,
         publish: PublishEvent | None = None,
         pre_existing: bool = False,
+        sim_time_s: float | None = None,
     ) -> SimEvent:
         event = SimEvent(
             event_type=INVARIANT_VIOLATION_EVENT_TYPE,
@@ -961,6 +1119,7 @@ class CommandExecutor:
             causal_parent=causal_parent,
             # 系统级故障恒取最高优先级，保证在可观测性面板里不被普通事件淹没。
             priority=3,
+            sim_time_s=sim_time_s,
             data={
                 "invariant": violation.invariant,
                 "message": violation.message,
@@ -995,6 +1154,7 @@ class CommandExecutor:
         reverted_paths: Sequence[str] = (),
         tick: int | None,
         publish: PublishEvent | None = None,
+        sim_time_s: float | None = None,
     ) -> SimEvent:
         event = SimEvent(
             event_type=COMMAND_FAILED_EVENT_TYPE,
@@ -1003,6 +1163,7 @@ class CommandExecutor:
             correlation_id=command.correlation_id,
             causal_parent=causal_parent,
             priority=command.priority,
+            sim_time_s=sim_time_s,
             data={
                 "command_id": command.command_id,
                 "device_id": command.device_id,

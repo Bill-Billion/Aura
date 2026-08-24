@@ -119,6 +119,11 @@ def _normalize(value: Any, symbols: _SymbolTable) -> Any:
     """递归归一：删易变键、改写身份值、其余原样。"""
 
     if isinstance(value, str):
+        # Device operations deliberately retain their command-derived identity
+        # for auditability.  Symbolize the opaque suffix with the same table so
+        # ``operation:<command_id>`` preserves that relationship across runs.
+        if value.startswith("operation:") and _is_opaque_identifier(value[10:]):
+            return f"operation:{symbols.symbol(value[10:])}"
         return symbols.symbol(value) if _is_opaque_identifier(value) else value
     if isinstance(value, Mapping):
         return {
