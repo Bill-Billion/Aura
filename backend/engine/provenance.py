@@ -21,10 +21,21 @@ class ResearchRuntimeProfile(str, Enum):
     AURA = "aura"
 
 
+class ObservationCondition(str, Enum):
+    """Independent agent-observation treatments implemented by the runtime."""
+
+    PERFECT = "perfect"
+    STALE_OFFLINE = "stale_offline"
+
+
+SUPPORTED_OBSERVATION_CONDITIONS: frozenset[ObservationCondition] = frozenset(
+    ObservationCondition
+)
+
+
 RuntimeAxes = tuple[
     Literal["single", "domain_multi"],
     Literal["none", "flat_priority", "aura"],
-    Literal["stale_offline"],
 ]
 
 RESEARCH_RUNTIME_PROFILES: Mapping[ResearchRuntimeProfile, RuntimeAxes] = (
@@ -33,27 +44,23 @@ RESEARCH_RUNTIME_PROFILES: Mapping[ResearchRuntimeProfile, RuntimeAxes] = (
             ResearchRuntimeProfile.SINGLE_DIRECT: (
                 "single",
                 "none",
-                "stale_offline",
             ),
             ResearchRuntimeProfile.NO_ARBITER: (
                 "domain_multi",
                 "none",
-                "stale_offline",
             ),
             ResearchRuntimeProfile.FLAT_PRIORITY: (
                 "domain_multi",
                 "flat_priority",
-                "stale_offline",
             ),
             ResearchRuntimeProfile.AURA: (
                 "domain_multi",
                 "aura",
-                "stale_offline",
             ),
         }
     )
 )
-_PROFILE_BY_AXES: dict[tuple[str, str, str], ResearchRuntimeProfile] = {
+_PROFILE_BY_AXES: dict[tuple[str, str], ResearchRuntimeProfile] = {
     axes: profile for profile, axes in RESEARCH_RUNTIME_PROFILES.items()
 }
 
@@ -62,11 +69,28 @@ def research_runtime_profile_for_axes(
     *,
     topology: str,
     governance: str,
-    observation: str,
+    observation: str | ObservationCondition = ObservationCondition.STALE_OFFLINE,
 ) -> ResearchRuntimeProfile:
-    """Resolve one implemented profile; reject unsupported axis cross-products."""
+    """Resolve topology/governance while independently validating observation.
 
-    axes = (topology, governance, observation)
+    ``observation`` remains in the call signature so existing matrix/fairness
+    callers do not need a flag day.  It is deliberately absent from the profile
+    lookup key: observation is a separate experimental treatment, not a hidden
+    part of controller topology.
+    """
+
+    try:
+        ObservationCondition(observation)
+    except ValueError as exc:
+        supported_observations = ", ".join(
+            sorted(item.value for item in SUPPORTED_OBSERVATION_CONDITIONS)
+        )
+        raise ValueError(
+            f"unsupported observation condition {observation!r}; "
+            f"implemented values: {supported_observations}"
+        ) from exc
+
+    axes = (topology, governance)
     try:
         return _PROFILE_BY_AXES[axes]
     except KeyError as exc:
@@ -77,7 +101,7 @@ def research_runtime_profile_for_axes(
         raise ValueError(
             "runtime axes do not identify an implemented research profile: "
             f"topology={topology!r}, governance={governance!r}, "
-            f"observation={observation!r}; supported profiles: {supported}"
+            f"observation={str(observation)!r}; supported profiles: {supported}"
         ) from exc
 
 
@@ -94,7 +118,7 @@ class ExperimentProvenance(BaseModel):
     model: Literal["rule_based", "mocked"]
     topology: Literal["single", "domain_multi"]
     governance: Literal["none", "flat_priority", "aura"]
-    observation: Literal["perfect", "stale_offline"]
+    observation: ObservationCondition
     repetition: int = Field(ge=0)
 
     @model_validator(mode="after")
@@ -120,7 +144,7 @@ class ExperimentRuntimeSelection(BaseModel):
     model: Literal["rule_based", "mocked"]
     topology: Literal["single", "domain_multi"] = "domain_multi"
     governance: Literal["none", "flat_priority", "aura"] = "aura"
-    observation: Literal["stale_offline"] = "stale_offline"
+    observation: ObservationCondition = ObservationCondition.STALE_OFFLINE
     baseline_policy: BaselinePolicy
 
     @model_validator(mode="after")
@@ -150,14 +174,17 @@ class ExperimentRuntimeSelection(BaseModel):
         *,
         model: Literal["rule_based", "mocked"],
         baseline_policy: BaselinePolicy,
+        observation: ObservationCondition | Literal["perfect", "stale_offline"] = (
+            ObservationCondition.STALE_OFFLINE
+        ),
     ) -> "ExperimentRuntimeSelection":
-        topology, governance, observation = RESEARCH_RUNTIME_PROFILES[profile]
+        topology, governance = RESEARCH_RUNTIME_PROFILES[profile]
         return cls(
             runtime_profile=profile,
             model=model,
             topology=topology,
             governance=governance,
-            observation=observation,
+            observation=ObservationCondition(observation),
             baseline_policy=baseline_policy,
         )
 
@@ -184,8 +211,10 @@ class ExperimentRuntimeSelection(BaseModel):
 
 __all__ = [
     "RESEARCH_RUNTIME_PROFILES",
+    "SUPPORTED_OBSERVATION_CONDITIONS",
     "ExperimentProvenance",
     "ExperimentRuntimeSelection",
+    "ObservationCondition",
     "ResearchRuntimeProfile",
     "research_runtime_profile_for_axes",
 ]

@@ -8,6 +8,7 @@ profile; independently mixing otherwise known axis values is not accepted.
 from __future__ import annotations
 
 import hashlib
+import math
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -19,12 +20,21 @@ from backend.engine.event_log import (
 )
 from backend.engine.provenance import (
     RESEARCH_RUNTIME_PROFILES,
+    SUPPORTED_OBSERVATION_CONDITIONS,
     ExperimentProvenance,
     ExperimentRuntimeSelection,
+    ObservationCondition,
     ResearchRuntimeProfile,
     research_runtime_profile_for_axes,
 )
+from backend.engine.observation import (
+    OBSERVATION_STALE_KEY,
+    OBSERVATION_UNAVAILABLE_KEY,
+    device_reports_online,
+    observation_model_metadata,
+)
 from backend.engine.run_manager import canonical_json, read_source_revision
+from backend.engine.state import WorldState
 from backend.evaluation.evaluator import EvalOutcome, evaluate_run
 from backend.models.schemas import BaselinePolicy
 from backend.scenarios.fingerprint import scenario_contract_fingerprint
@@ -47,7 +57,7 @@ SUPPORTED_GOVERNANCE = frozenset(
     axes[1] for axes in RESEARCH_RUNTIME_PROFILES.values()
 )
 SUPPORTED_OBSERVATIONS = frozenset(
-    axes[2] for axes in RESEARCH_RUNTIME_PROFILES.values()
+    condition.value for condition in SUPPORTED_OBSERVATION_CONDITIONS
 )
 
 _BASELINE_BY_MODEL = {
@@ -180,7 +190,179 @@ class AuraCellExecutor:
             runtime_profile,
             model=cast(Literal["rule_based", "mocked"], cell.model),
             baseline_policy=_BASELINE_BY_MODEL[cell.model],
+            observation=cast(Literal["perfect", "stale_offline"], cell.observation),
         )
+
+    @staticmethod
+    def _observation_snapshot_matches(
+        condition: ObservationCondition,
+        frame: Mapping[str, Any],
+    ) -> bool:
+        raw_snapshot = frame.get("observable_snapshot")
+        if not isinstance(raw_snapshot, Mapping):
+            return False
+        try:
+            world = WorldState.model_validate(dict(raw_snapshot))
+        except (TypeError, ValueError):
+            return False
+        if world.model_dump(mode="json", exclude={"agents"}) != raw_snapshot:
+            return False
+
+        stale = frame.get("stale_device_ids")
+        unavailable = frame.get("unavailable_device_ids")
+        if not isinstance(stale, list) or not isinstance(unavailable, list):
+            return False
+        stale_ids = set(stale)
+        unavailable_ids = set(unavailable)
+        if not unavailable_ids.issubset(stale_ids):
+            return False
+        if not stale_ids.issubset(world.devices):
+            return False
+
+        for device_id, device in world.devices.items():
+            marked_stale = device.state.extra.get(OBSERVATION_STALE_KEY) is True
+            marked_unavailable = (
+                device.state.extra.get(OBSERVATION_UNAVAILABLE_KEY) is True
+            )
+            if condition is ObservationCondition.PERFECT:
+                if marked_stale or marked_unavailable:
+                    return False
+                continue
+            offline = not device_reports_online(device)
+            if marked_stale != offline or (device_id in stale_ids) != offline:
+                return False
+            if marked_unavailable != (device_id in unavailable_ids):
+                return False
+        return condition is not ObservationCondition.PERFECT or not (
+            stale_ids or unavailable_ids
+        )
+
+    @staticmethod
+    def _observation_evidence_matches(
+        cell: ExperimentCell,
+        decision: Mapping[str, Any],
+        events_by_id: Mapping[str, Mapping[str, Any]],
+    ) -> bool:
+        data = decision.get("data")
+        if not isinstance(data, Mapping):
+            return False
+        try:
+            condition = ObservationCondition(cell.observation)
+        except ValueError:
+            return False
+        expected = observation_model_metadata(condition)
+        if (
+            data.get("observation_condition") != condition.value
+            or data.get("observation_model_id") != expected["model_id"]
+            or data.get("observation_contract_version")
+            != expected["contract_version"]
+            or data.get("observation_model_hash") != expected["model_hash"]
+        ):
+            return False
+
+        perception_id = data.get("observation_perception_event_id")
+        if not isinstance(perception_id, str):
+            return False
+        perception = events_by_id.get(perception_id)
+        if (
+            perception is None
+            or perception.get("event_type") != "reasoning.perception_snapshot"
+            or perception.get("correlation_id") != decision.get("correlation_id")
+        ):
+            return False
+        perception_data = perception.get("data")
+        if not isinstance(perception_data, Mapping):
+            return False
+        capture_id = data.get("observation_capture_event_id")
+        if (
+            not isinstance(capture_id, str)
+            or perception_data.get("observation_capture_event_id") != capture_id
+        ):
+            return False
+        capture = events_by_id.get(capture_id)
+        if (
+            capture is None
+            or capture.get("event_type") != "observation.frame_captured"
+            or capture.get("source") != "observation_projector"
+            or capture.get("correlation_id") != decision.get("correlation_id")
+        ):
+            return False
+        capture_data = capture.get("data")
+        if not isinstance(capture_data, Mapping):
+            return False
+        frame = capture_data.get("observation_frame")
+        frame_hash = capture_data.get("observation_frame_hash")
+        if not isinstance(frame, Mapping) or not isinstance(frame_hash, str):
+            return False
+        recomputed_frame_hash = hashlib.sha256(
+            canonical_json(frame).encode("utf-8")
+        ).hexdigest()
+        if (
+            frame_hash != recomputed_frame_hash
+            or data.get("observation_frame_hash") != frame_hash
+            or perception_data.get("observation_frame_hash") != frame_hash
+            or frame.get("observation_condition") != condition.value
+            or frame.get("observation_model_id") != expected["model_id"]
+            or frame.get("observation_contract_version")
+            != expected["contract_version"]
+            or frame.get("observation_model_hash") != expected["model_hash"]
+            or frame.get("observable_snapshot_projection")
+            != "world_state_without_agent_diagnostics.v1"
+            or frame.get("observable_snapshot") != data.get("observable_snapshot")
+            or not isinstance(frame.get("observed_root_event"), Mapping)
+        ):
+            return False
+        root_id = capture.get("causal_parent")
+        root = events_by_id.get(root_id) if isinstance(root_id, str) else None
+        root_seq = root.get("seq") if root is not None else None
+        capture_seq = capture.get("seq")
+        perception_seq = perception.get("seq")
+        decision_seq = decision.get("seq")
+        if (
+            root is None
+            or perception.get("causal_parent") != root_id
+            or root.get("correlation_id") != decision.get("correlation_id")
+            or not isinstance(root_seq, int)
+            or not isinstance(capture_seq, int)
+            or not isinstance(perception_seq, int)
+            or not isinstance(decision_seq, int)
+            or not root_seq < capture_seq < perception_seq < decision_seq
+        ):
+            return False
+        observed_root = frame.get("observed_root_event")
+        if not isinstance(observed_root, Mapping) or any(
+            observed_root.get(field) != root.get(field)
+            for field in (
+                "event_type",
+                "source",
+                "timestamp",
+                "sim_time_s",
+                "priority",
+                "event_generation_mode",
+                "generation_rule_id",
+                "rng_stream",
+            )
+        ):
+            return False
+        captured = frame.get("captured_at_sim_time_s")
+        if (
+            isinstance(captured, bool)
+            or not isinstance(captured, (int, float))
+            or not math.isfinite(float(captured))
+            or float(captured) < 0
+        ):
+            return False
+        for field in ("stale_device_ids", "unavailable_device_ids"):
+            values = frame.get(field)
+            if (
+                not isinstance(values, list)
+                or any(not isinstance(item, str) for item in values)
+                or values != sorted(set(values))
+            ):
+                return False
+        if not AuraCellExecutor._observation_snapshot_matches(condition, frame):
+            return False
+        return True
 
     @staticmethod
     def _runtime_evidence_matches(
@@ -200,6 +382,11 @@ class AuraCellExecutor:
         ]
         if not decisions:
             return False
+        events_by_id = {
+            event_id: event
+            for event in events
+            if isinstance((event_id := event.get("event_id")), str)
+        }
         expected_active_agent_ids = _ACTIVE_AGENT_IDS_BY_TOPOLOGY[cell.topology]
         for event in decisions:
             data = event.get("data")
@@ -213,6 +400,12 @@ class AuraCellExecutor:
                 or data.get("governance") != cell.governance
                 or data.get("observable_snapshot_projection")
                 != "world_state_without_agent_diagnostics.v1"
+            ):
+                return False
+            if not AuraCellExecutor._observation_evidence_matches(
+                cell,
+                event,
+                events_by_id,
             ):
                 return False
             for preimage_field, hash_field, expected_type in _CONTENT_ADDRESSED_EVIDENCE:

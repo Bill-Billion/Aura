@@ -23,13 +23,16 @@ from pydantic import (
 )
 
 from backend.engine.provenance import (
+    SUPPORTED_OBSERVATION_CONDITIONS,
+    ObservationCondition,
     ResearchRuntimeProfile,
     research_runtime_profile_for_axes,
 )
 from backend.engine.rng import MAX_JSON_SAFE_SEED
 
 MATRIX_SCHEMA_VERSION = "1.0"
-RESOLVED_MATRIX_SCHEMA_VERSION = "1.1"
+RESOLVED_MATRIX_SCHEMA_VERSION = "1.2"
+LEGACY_RESOLVED_MATRIX_SCHEMA_VERSION = "1.1"
 CELL_ID_PREFIX = "cell-"
 MAX_MATRIX_AXIS_VALUES = 256
 MAX_MATRIX_CELLS = 10_000
@@ -301,6 +304,25 @@ class MatrixSpec(_StrictModel):
             profiles.add(profile)
         return sorted(profiles, key=lambda profile: profile.value)
 
+    def declared_observation_conditions(self) -> list[ObservationCondition]:
+        """Freeze implemented observation conditions from the raw author axes."""
+
+        supported = set(SUPPORTED_OBSERVATION_CONDITIONS)
+        declared: list[ObservationCondition] = []
+        for raw_condition in self.axes.observation:
+            try:
+                condition = ObservationCondition(raw_condition)
+            except ValueError as exc:
+                raise ValueError(
+                    f"observation={raw_condition!r} is not an implemented condition"
+                ) from exc
+            if condition not in supported:
+                raise ValueError(
+                    f"observation={raw_condition!r} is not an implemented condition"
+                )
+            declared.append(condition)
+        return sorted(set(declared), key=lambda condition: condition.value)
+
     def contract_hash(self) -> str:
         return sha256_json(self.model_dump(mode="json"))
 
@@ -391,13 +413,17 @@ class ExperimentCell(_StrictModel):
 class ResolvedMatrix(_StrictModel):
     """Stable, sorted execution manifest persisted before any cell runs."""
 
-    matrix_schema_version: Literal["1.1"] = RESOLVED_MATRIX_SCHEMA_VERSION
+    matrix_schema_version: Literal["1.1", "1.2"] = RESOLVED_MATRIX_SCHEMA_VERSION
     matrix_id: str = Field(pattern=r"^[a-z][a-z0-9_-]{2,95}$")
     source_revision: str = Field(min_length=1, max_length=MAX_MATRIX_STRING_LENGTH)
     spec_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     expected_runtime_profiles: list[ResearchRuntimeProfile] = Field(
         min_length=1,
         max_length=len(ResearchRuntimeProfile),
+    )
+    expected_observation_conditions: list[ObservationCondition] = Field(
+        min_length=1,
+        max_length=len(ObservationCondition),
     )
     total_estimated_cost_usd: float = Field(ge=0.0)
     cells: list[ExperimentCell] = Field(max_length=MAX_MATRIX_CELLS)
@@ -418,12 +444,34 @@ class ResolvedMatrix(_StrictModel):
             "source_revision": source_revision,
             "spec_hash": spec.contract_hash(),
             "expected_runtime_profiles": spec.declared_runtime_profiles(),
+            "expected_observation_conditions": (
+                spec.declared_observation_conditions()
+            ),
             "total_estimated_cost_usd": sum(
                 cell.estimated_cost_usd for cell in ordered
             ),
             "cells": [cell.model_dump(mode="json") for cell in ordered],
         }
         return cls(**payload, matrix_hash=sha256_json(payload))
+
+    @model_validator(mode="before")
+    @classmethod
+    def _load_legacy_observation_contract(cls, value: Any) -> Any:
+        """Materialize the implicit stale-only contract in historical v1.1 files."""
+
+        if not isinstance(value, dict):
+            return value
+        if value.get("matrix_schema_version") != LEGACY_RESOLVED_MATRIX_SCHEMA_VERSION:
+            return value
+        if "expected_observation_conditions" in value:
+            raise ValueError(
+                "resolved matrix 1.1 must not contain 1.2 observation fields"
+            )
+        migrated = dict(value)
+        migrated["expected_observation_conditions"] = [
+            ObservationCondition.STALE_OFFLINE.value
+        ]
+        return migrated
 
     @model_validator(mode="after")
     def _validate_order_and_hash(self) -> "ResolvedMatrix":
@@ -432,6 +480,13 @@ class ResolvedMatrix(_StrictModel):
             raise ValueError("expected runtime profiles must be sorted")
         if len(profile_values) != len(set(profile_values)):
             raise ValueError("expected runtime profiles must be unique")
+        observation_values = [
+            condition.value for condition in self.expected_observation_conditions
+        ]
+        if observation_values != sorted(observation_values):
+            raise ValueError("expected observation conditions must be sorted")
+        if len(observation_values) != len(set(observation_values)):
+            raise ValueError("expected observation conditions must be unique")
         ids = [cell.cell_id for cell in self.cells]
         if ids != sorted(ids):
             raise ValueError("resolved cells must be sorted by cell_id")
@@ -453,6 +508,14 @@ class ResolvedMatrix(_StrictModel):
         ):
             raise ValueError("matrix total cost does not match its cells")
         payload = self.model_dump(mode="json", exclude={"matrix_hash"})
+        if self.matrix_schema_version == LEGACY_RESOLVED_MATRIX_SCHEMA_VERSION:
+            if self.expected_observation_conditions != [
+                ObservationCondition.STALE_OFFLINE
+            ]:
+                raise ValueError(
+                    "resolved matrix 1.1 only supports stale_offline observation"
+                )
+            payload.pop("expected_observation_conditions")
         expected = sha256_json(payload)
         if self.matrix_hash != expected:
             raise ValueError("resolved matrix hash does not match its contents")
@@ -465,6 +528,7 @@ __all__ = [
     "MAX_MATRIX_CELLS",
     "MAX_MATRIX_STRING_LENGTH",
     "MATRIX_SCHEMA_VERSION",
+    "LEGACY_RESOLVED_MATRIX_SCHEMA_VERSION",
     "RESOLVED_MATRIX_SCHEMA_VERSION",
     "ExactExclusion",
     "ExperimentCell",

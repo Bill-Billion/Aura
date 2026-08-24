@@ -6,6 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from backend.engine.provenance import ResearchRuntimeProfile
+from backend.experiments.artifacts import write_resolved_matrix
 from backend.experiments.resolve import load_and_resolve_matrix, resolve_matrix
 from backend.experiments.spec import (
     MAX_MATRIX_STRING_LENGTH,
@@ -140,8 +141,11 @@ def test_resolution_is_order_independent_and_ids_cover_provenance() -> None:
         source_revision="sha256:revision-a",
     )
     assert first == second
-    assert first.matrix_schema_version == "1.1"
+    assert first.matrix_schema_version == "1.2"
     assert first.expected_runtime_profiles == [ResearchRuntimeProfile.AURA]
+    assert [item.value for item in first.expected_observation_conditions] == [
+        "stale_offline"
+    ]
     assert [cell.cell_id for cell in first.cells] == sorted(
         cell.cell_id for cell in first.cells
     )
@@ -198,7 +202,32 @@ def test_resolved_matrix_rejects_cross_field_provenance_drift() -> None:
         ResolvedMatrix.model_validate(raw)
 
 
-def test_pilot_matrix_resolves_to_exactly_forty_eight_cells() -> None:
+def test_resolved_matrix_reads_v11_with_its_original_hash_contract(tmp_path) -> None:
+    matrix = resolve_matrix(
+        MatrixSpec.model_validate(matrix_mapping()),
+        scenario_resolver=StubScenarioResolver(),
+        source_revision="sha256:revision-a",
+    )
+    legacy = matrix.model_dump(mode="json", exclude={"matrix_hash"})
+    legacy["matrix_schema_version"] = "1.1"
+    legacy.pop("expected_observation_conditions")
+    legacy["matrix_hash"] = sha256_json(legacy)
+
+    loaded = ResolvedMatrix.model_validate(legacy)
+    assert loaded.matrix_schema_version == "1.1"
+    assert [item.value for item in loaded.expected_observation_conditions] == [
+        "stale_offline"
+    ]
+
+    drifted = deepcopy(legacy)
+    drifted["expected_observation_conditions"] = ["stale_offline"]
+    with pytest.raises(ValidationError, match="must not contain"):
+        ResolvedMatrix.model_validate(drifted)
+
+    with pytest.raises(ValueError, match="read-only"):
+        write_resolved_matrix(tmp_path, loaded)
+
+def test_pilot_matrix_resolves_to_exactly_ninety_six_cells() -> None:
     from backend.experiments.resolve import (
         FileOrLibraryScenarioResolver,
         load_matrix_file,
@@ -213,13 +242,19 @@ def test_pilot_matrix_resolves_to_exactly_forty_eight_cells() -> None:
             base_dir="benchmarks/aurabench-dev"
         ),
     )
-    assert len(resolved.cells) == 48
+    assert len(resolved.cells) == 96
     assert {cell.model for cell in resolved.cells} == {"rule_based"}
     assert {cell.seed for cell in resolved.cells} == {21001, 21002, 21003}
     assert {cell.topology for cell in resolved.cells} == {"domain_multi"}
     assert {cell.governance for cell in resolved.cells} == {"aura"}
-    assert {cell.observation for cell in resolved.cells} == {"stale_offline"}
+    assert {cell.observation for cell in resolved.cells} == {
+        "perfect",
+        "stale_offline",
+    }
     assert resolved.expected_runtime_profiles == [ResearchRuntimeProfile.AURA]
+    assert [
+        item.value for item in resolved.expected_observation_conditions
+    ] == ["perfect", "stale_offline"]
 
 
 def test_resolved_scenario_reference_is_portable_across_working_directories(

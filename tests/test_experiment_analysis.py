@@ -267,7 +267,7 @@ def test_cli_manifest_only_mode_rebuilds_without_raw_runs(tmp_path, capsys) -> N
         ]
     ) == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["artifacts"] == 9
+    assert payload["artifacts"] == 10
 
     assert main(["analyze", "--output", str(tmp_path / "missing")]) == 1
     assert "raw analysis mode requires" in capsys.readouterr().err
@@ -377,6 +377,100 @@ def test_counterfactual_analysis_excludes_aura_when_baseline_group_is_invalid(
     assert aura_safe["invalid_reasons"] == {"invalid_fairness_group": 1}
 
 
+def test_analysis_stratifies_counterfactuals_and_pairs_observation_direction(
+    tmp_path,
+) -> None:
+    artifact = _results_artifact()
+    manifest = artifact["manifest"]
+    manifest["results_manifest_schema_version"] = "1.1"
+    perfect_cells = []
+    observation_groups: dict[str, list[str]] = {}
+    for index, stale_cell in enumerate(manifest["cells"], start=3):
+        perfect = json.loads(json.dumps(stale_cell))
+        perfect.update(
+            cell_id=f"cell-{index:032x}",
+            observation="perfect",
+            run_id=f"{stale_cell['run_id']}-perfect",
+        )
+        group_id = "observation-group-" + sha256_json(
+            {
+                "scenario_id": stale_cell["scenario_id"],
+                "scenario_contract_hash": stale_cell["scenario_contract_hash"],
+                "seed": stale_cell["seed"],
+                "model": stale_cell["model"],
+                "runtime_profile": stale_cell["runtime_profile"],
+                "topology": stale_cell["topology"],
+                "governance": stale_cell["governance"],
+                "repetition": stale_cell["repetition"],
+                "source_revision": stale_cell["source_revision"],
+            }
+        )[:32]
+        stale_cell["observation_fairness_group_id"] = group_id
+        perfect["observation_fairness_group_id"] = group_id
+        observation_groups[group_id] = [stale_cell["cell_id"], perfect["cell_id"]]
+        perfect_cells.append(perfect)
+
+    manifest["cells"] = sorted(
+        [*manifest["cells"], *perfect_cells], key=lambda cell: cell["cell_id"]
+    )
+    manifest["matrix"]["planned_cells"] = 4
+    manifest["matrix"]["expected_observation_conditions"] = [
+        "perfect",
+        "stale_offline",
+    ]
+    manifest["validity"].update(
+        completed=4,
+        benchmark_pass=2,
+        benchmark_fail=2,
+        valid_observation_group_ids=sorted(observation_groups),
+        valid_observation_cell_ids=sorted(
+            cell_id for members in observation_groups.values() for cell_id in members
+        ),
+        invalid_observation_groups={},
+    )
+    artifact["seal"]["sha256"] = sha256_json(manifest)
+    source = tmp_path / "observations.json"
+    write_results_manifest(source, artifact)
+    output = tmp_path / "analysis"
+    render_analysis_bundle(source, output_dir=output)
+
+    rows = [
+        json.loads(line)
+        for line in (output / "pair-level-results.jsonl").read_text().splitlines()
+    ]
+    counterfactual = [row for row in rows if row["comparison_type"] == "counterfactual"]
+    observation = [row for row in rows if row["comparison_type"] == "observation"]
+    assert {row["observation"] for row in counterfactual} == {
+        "perfect",
+        "stale_offline",
+    }
+    assert len(counterfactual) == 2
+    assert len(observation) == 2
+    assert all(row["treatment_label"] == "stale_offline" for row in observation)
+    assert all(row["reference_label"] == "perfect" for row in observation)
+
+    aggregates = json.loads((output / "aggregate-results.json").read_text())[
+        "results"
+    ]
+    safe_counterfactual = [
+        item
+        for item in aggregates
+        if item["comparison_type"] == "counterfactual"
+        and item["metric"] == "trajectory_safe_success"
+    ]
+    assert len(safe_counterfactual) == 2
+    assert all(item["n"] == 1 for item in safe_counterfactual)
+    safe_observation = next(
+        item
+        for item in aggregates
+        if item["comparison_type"] == "observation"
+        and item["metric"] == "trajectory_safe_success"
+    )
+    assert safe_observation["observation"] == "stale_offline_minus_perfect"
+    assert safe_observation["effect_direction"] == "stale_offline_minus_perfect"
+    assert safe_observation["n"] == 2
+
+
 def test_raw_results_manifest_uses_shared_validation_and_pilot_contract(tmp_path) -> None:
     spec = load_matrix_file("benchmarks/aurabench-dev/matrix.yaml")
     matrix = resolve_matrix(
@@ -428,6 +522,6 @@ def test_raw_results_manifest_uses_shared_validation_and_pilot_contract(tmp_path
     )
     manifest = artifact["manifest"]
     assert manifest["benchmark"]["human_review_status"] == "pending"
-    assert manifest["validity"]["completed"] == 48
+    assert manifest["validity"]["completed"] == 96
     assert all(cell["admission_status"] == "admitted" for cell in manifest["cells"])
     assert all(cell["result_seal"] for cell in manifest["cells"])

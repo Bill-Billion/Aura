@@ -15,6 +15,7 @@ from backend.engine.provenance import (
     RESEARCH_RUNTIME_PROFILES,
     ExperimentProvenance,
     ExperimentRuntimeSelection,
+    ObservationCondition,
     ResearchRuntimeProfile,
 )
 from backend.experiments.adapters import AuraCellExecutor
@@ -34,7 +35,8 @@ async def test_scenario_runner_activates_the_recorded_runtime_profile(
     profile: ResearchRuntimeProfile,
     tmp_path: Path,
 ) -> None:
-    topology, governance, observation = RESEARCH_RUNTIME_PROFILES[profile]
+    topology, governance = RESEARCH_RUNTIME_PROFILES[profile]
+    observation = ObservationCondition.STALE_OFFLINE
     selection = ExperimentRuntimeSelection.for_profile(
         profile,
         model="rule_based",
@@ -78,6 +80,9 @@ async def test_scenario_runner_activates_the_recorded_runtime_profile(
         assert decisions
         assert {event.data["runtime_profile"] for event in decisions} == {profile.value}
         assert {event.data["governance"] for event in decisions} == {governance}
+        assert {event.data["observation_condition"] for event in decisions} == {
+            observation.value
+        }
         expected_source = {
             "none": "proposal_passthrough",
             "flat_priority": "flat_priority",
@@ -86,7 +91,11 @@ async def test_scenario_runner_activates_the_recorded_runtime_profile(
         assert {event.source for event in decisions} == {expected_source}
         assert all(len(event.data["proposal_set_hash"]) == 64 for event in decisions)
         assert AuraCellExecutor._runtime_evidence_matches(
-            SimpleNamespace(governance=governance, topology=topology),
+            SimpleNamespace(
+                governance=governance,
+                topology=topology,
+                observation=observation.value,
+            ),
             profile,
             [event.model_dump(mode="json") for event in result.events],
         )

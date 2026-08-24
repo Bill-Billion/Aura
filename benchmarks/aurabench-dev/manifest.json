@@ -1,16 +1,20 @@
 {
-  "pilot_manifest_schema_version": "1.0",
+  "pilot_manifest_schema_version": "1.1",
   "benchmark_id": "aurabench_dev_pilot",
   "matrix": {
     "reference": "matrix.yaml",
-    "contract_hash": "646dc6ee66856e8e4a8581790c083c8ae9c3e72bf2a6ebdd366ba08c27349102"
+    "contract_hash": "84d6a0a527a7309fd3fd87889ba10b428d0fe8117645d92ba0361fb6a4be0a9a"
   },
   "seeds": [
     21001,
     21002,
     21003
   ],
-  "expected_cells": 48,
+  "expected_cells": 96,
+  "observation_conditions": [
+    "perfect",
+    "stale_offline"
+  ],
   "pair_set_hash": "a4e1e42c490650dab491581b828aae07c74e9a5335e9afc84ec81b0fd6d8c7da",
   "pairs": [
     {

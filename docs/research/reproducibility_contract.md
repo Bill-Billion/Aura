@@ -18,6 +18,17 @@
 
 proposal 假设只能来自 Agent 当次推理所见的可观测快照，不能读取 ground truth 或执行时 oracle。假设路径、期望值和失效证据必须进入事件日志，保证同一 recorded run 可以复核为何某份计划被丢弃。PR14 先冻结 Lighting resident-state pilot；其他 Agent 与 LLM 完整 prompt slice 的依赖由 observation-model 契约继续冻结。
 
+## 观察模型契约
+
+`current_projector_v1` 是观察模型族，当前只实现两个确定性条件：
+
+- `perfect`：Agent 获得当前世界和根事件的独立深拷贝；
+- `stale_offline`：在线设备报告当前值，离线设备回放最后一次在线值；从未在线过的设备标为 unavailable，不得复制当前物理值。
+
+world snapshot 与 root event 必须由同一次投影产生。每个有效 episode 在任何 planner/controller 消费之前发布 `observation.frame_captured`，封存 condition、model family、contract version、model hash、模拟时间、可观测快照、投影后的根事件及 stale/unavailable 设备集合。`reasoning.perception_snapshot` 和 coordination evidence 只能引用同一 frame hash；resume 会重算并交叉校验这些证据，仅修改 cell/run metadata 不能冒充另一种观察条件。
+
+新 resolved matrix 使用 schema 1.2，并显式冻结 `expected_observation_conditions`。历史 1.1 stale-only 矩阵只允许读取和离线复核，不能继续执行。观察比较固定 scenario、seed、model、repetition、runtime profile、topology、governance 和 source revision，方向统一为 `stale_offline - perfect`；缺少任一条件或固定 provenance 漂移时整组 invalid。
+
 ## 时间与随机性
 
 - 设备调度、居民反应、观测延迟和 verifier 窗口一律基于模拟时间；

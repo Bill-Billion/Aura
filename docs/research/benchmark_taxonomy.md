@@ -65,7 +65,7 @@ ScenarioSpec 2.x 冻结六类单因素干预：
 
 先运行 8–12 组反事实 pair × 3 seeds 的 pilot。只有科学效应和运行健康通过 gate 后，才扩张到 8 个场景族 × 6 个语义模板 × 2 个 variant × 5 seeds，并另加组合扰动，形成约 600 episodes。
 
-首个可执行 pilot 固定为 8 组 pair、3 个 seed，共 48 个 rule-based cells。它覆盖两组 resident-state、三组 device-failure、两组 feedback-loss 和一组 safety-interrupt；其中“无关居民活动变化”和“无关只读摄像头离线”是 negative control。每个 dynamic 场景既要记录注入 marker，也要产生对应的居民、设备或反馈物理事件，不能把“调度成功”当成“干预实现”。
+首个可执行 pilot 固定为 8 组 pair、3 个 seed，并分别运行 `perfect / stale_offline` 两种观察条件，共 96 个 rule-based cells（每种条件 48 个）。它覆盖两组 resident-state、三组 device-failure、两组 feedback-loss 和一组 safety-interrupt；其中“无关居民活动变化”和“无关只读摄像头离线”是 negative control。每个 dynamic 场景既要记录注入 marker，也要产生对应的居民、设备或反馈物理事件，不能把“调度成功”当成“干预实现”。
 
 这个 pilot 只纳入当前 runtime 能真实执行和评价的因子。`observation_delay`、可执行的多居民冲突、偏好变化和跨根联合仲裁在相应运行语义完成前不进入矩阵，也不以 YAML 声明伪装成已有能力。
 

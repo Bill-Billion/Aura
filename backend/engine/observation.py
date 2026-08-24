@@ -5,11 +5,9 @@ observable**、评估侧才对照 ground truth。S2 之前这条界线在代码�
 ``_run_episode`` 把 ``world.snapshot()`` 直接递给 agent，等于宣布"感知是完美的"——
 研究者因此无法评估感知受限下的策略质量，而这正是本平台的卖点之一。
 
-**本期范围（S2 评审裁定的缩减）**：只实现 *身份投影 + 离线设备陈旧快照*，即把分离这
-件事和它的管线做出来。高斯噪声/取整/延迟/丢失全部推迟到 S4-T3 的漂移注入器——那一期
-需要的前提只是"分离已经存在"，不需要 S2 先造一套噪声模型（造了也会在 S4 被重写）。
-因此本模块**不消费任何随机源**：``build_observable_view`` 是纯函数，
-:class:`ObservableProjector` 的唯一状态是"每台设备最后一次在线时的读数"。
+实现范围刻意保持很小：``perfect`` 是身份深拷贝，``stale_offline`` 在设备离线时回放
+最后一次有效报告。高斯噪声、随机丢包和通用延迟 DSL 均不在这里实现。两个条件都不消费
+随机源，因此模型身份和每一帧证据可以确定性地内容寻址。
 
 投影规则（当前两条）：
 
@@ -28,25 +26,139 @@ agent 的 ``serialize_device_for_llm`` / ``build_world_summary`` / ``is_relevant
 
 from __future__ import annotations
 
-from typing import Iterable
+import copy
+import hashlib
+import json
+from dataclasses import dataclass, field
+from typing import Any, Iterable, Mapping
 
+from backend.engine.event_bus import SimEvent
+from backend.engine.provenance import ObservationCondition
 from backend.engine.state import DeviceState, DeviceStateValues, WorldState
 
 __all__ = [
     "OBSERVATION_STALE_KEY",
+    "OBSERVATION_UNAVAILABLE_KEY",
+    "OBSERVATION_CONTRACT_VERSION",
+    "ObservationFrame",
     "ObservableProjector",
     "build_observable_view",
     "device_reports_online",
+    "observation_model_metadata",
 ]
 
 # 观测侧的陈旧标记键。它只出现在 **投影** 的 device.state.extra 里，绝不写回世界——
 # ground truth 没有"我的读数是旧的"这种字段，那是观测者的判断而不是设备的物理状态。
 OBSERVATION_STALE_KEY = "observation_stale"
+OBSERVATION_UNAVAILABLE_KEY = "observation_unavailable"
+OBSERVATION_CONTRACT_VERSION = "1.0"
 
 # online 语义位当前镜像在 state.extra.online（见 backend/execution/validation.py::
 # device_is_online）。这里刻意不 import 那个函数：execution 是命令层，engine 反向依赖
 # 它会让"读世界"绕道"发命令"的包。两处口径必须一致，改动时一起改。
 _ONLINE_KEY = "online"
+
+_MODEL_IDS: Mapping[ObservationCondition, str] = {
+    # One implemented observation-model family with two independently sealed
+    # conditions. ScenarioSpec/current artifacts already name this family.
+    ObservationCondition.PERFECT: "current_projector_v1",
+    ObservationCondition.STALE_OFFLINE: "current_projector_v1",
+}
+
+_MISSING = object()
+_TRANSPORT_ID_KEYS = frozenset(
+    {
+        "event_id",
+        "trigger_event_id",
+        "caused_by_event_id",
+        "correlation_id",
+        "causal_parent",
+        "run_id",
+        "command_id",
+        "operation_id",
+    }
+)
+
+
+def _canonical_json(payload: Any) -> str:
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+def _stable_observed_event_data(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _stable_observed_event_data(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            if key not in _TRANSPORT_ID_KEYS and key != "wall_time"
+        }
+    if isinstance(value, (list, tuple)):
+        return [_stable_observed_event_data(item) for item in value]
+    return value
+
+
+def observation_model_metadata(
+    condition: ObservationCondition | str,
+) -> dict[str, Any]:
+    """Return the canonical semantic identity of one implemented projector."""
+
+    resolved = ObservationCondition(condition)
+    metadata: dict[str, Any] = {
+        "contract_version": OBSERVATION_CONTRACT_VERSION,
+        "condition": resolved.value,
+        "model_id": _MODEL_IDS[resolved],
+        "event_state_projection": "device_report_values_v1",
+    }
+    if resolved is ObservationCondition.PERFECT:
+        metadata.update(
+            device_state_policy="current_ground_truth_copy",
+            liveness_policy="current",
+            cold_start_policy="not_applicable",
+        )
+    else:
+        metadata.update(
+            device_state_policy="last_online_report",
+            liveness_policy="current",
+            cold_start_policy="unavailable",
+        )
+    metadata["model_hash"] = hashlib.sha256(
+        _canonical_json(metadata).encode("utf-8")
+    ).hexdigest()
+    return metadata
+
+
+@dataclass(frozen=True)
+class ObservationFrame:
+    """One immutable, content-addressed perception boundary for an episode.
+
+    Agents receive the copied ``observable_world`` and ``observed_root_event``.
+    Evidence is captured before either object is handed to controller code, so
+    an accidental mutation cannot rewrite what the run claims was perceived.
+    """
+
+    observable_world: WorldState = field(repr=False)
+    observed_root_event: SimEvent = field(repr=False)
+    condition: ObservationCondition
+    model_id: str
+    contract_version: str
+    model_hash: str
+    captured_at_sim_time_s: float
+    stale_device_ids: tuple[str, ...] = ()
+    unavailable_device_ids: tuple[str, ...] = ()
+    _evidence_preimage: dict[str, Any] = field(default_factory=dict, repr=False)
+    frame_hash: str = ""
+
+    def evidence_preimage(self) -> dict[str, Any]:
+        return copy.deepcopy(self._evidence_preimage)
+
+    def observable_snapshot(self) -> dict[str, Any]:
+        snapshot = self._evidence_preimage.get("observable_snapshot", {})
+        return copy.deepcopy(snapshot) if isinstance(snapshot, dict) else {}
 
 
 def device_reports_online(device: DeviceState) -> bool:
@@ -71,10 +183,16 @@ class ObservableProjector:
     reset 污染是同一类缺陷。``AgentRuntime.update_state_manager`` 已经替调用方做了这件事。
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        condition: ObservationCondition | str = ObservationCondition.STALE_OFFLINE,
+    ) -> None:
+        self.condition = ObservationCondition(condition)
+        self._model_metadata = observation_model_metadata(self.condition)
         # device_id → 最后一次在线时的 state 深拷贝。只在设备在线时更新。
         self._last_reported: dict[str, DeviceStateValues] = {}
         self._stale_device_ids: tuple[str, ...] = ()
+        self._unavailable_device_ids: tuple[str, ...] = ()
 
     # ------------------------------------------------------------------ 查询
 
@@ -83,6 +201,14 @@ class ObservableProjector:
         """上一次 :meth:`observe` 中读数被判为陈旧的设备（id 升序）。"""
 
         return self._stale_device_ids
+
+    @property
+    def unavailable_device_ids(self) -> tuple[str, ...]:
+        return self._unavailable_device_ids
+
+    @property
+    def model_metadata(self) -> dict[str, Any]:
+        return copy.deepcopy(self._model_metadata)
 
     def last_reported_state(self, device_id: str) -> DeviceStateValues | None:
         """某设备最后一次在线时的读数副本；从未在线过则为 None。"""
@@ -100,6 +226,7 @@ class ObservableProjector:
 
         self._last_reported.clear()
         self._stale_device_ids = ()
+        self._unavailable_device_ids = ()
 
     def forget(self, device_ids: Iterable[str]) -> None:
         for device_id in device_ids:
@@ -109,7 +236,13 @@ class ObservableProjector:
         """把 ground truth 投影成 agent 可见的世界（返回值是独立深拷贝）。"""
 
         observable = world.snapshot()
+        if self.condition is ObservationCondition.PERFECT:
+            self._stale_device_ids = ()
+            self._unavailable_device_ids = ()
+            return observable
+
         stale: list[str] = []
+        unavailable: list[str] = []
 
         # 按 id 升序遍历：投影本身不依赖顺序，但让 stale_device_ids 与日志稳定可比。
         for device_id in sorted(observable.devices):
@@ -131,13 +264,183 @@ class ObservableProjector:
                 )
                 observed.state = replay
             else:
-                # 从未在线过：没有历史可回放。此时只能标陈旧，绝不编造读数
-                # （编一份"合理的"初值＝把 ground truth 伪装成观测结果）。
-                observed.state = ground_truth_device.state.model_copy(deep=True)
+                # 从未在线过：不能把当前物理值冒充成设备报告。WorldState 还没有
+                # Optional device fields，因此使用显式 unavailable state；消费者必须看
+                # marker，而不是把默认 power=False 当成一次真实读数。
+                unavailable.append(device_id)
+                observed.state = DeviceStateValues(
+                    power=False,
+                    last_changed_by="observation_unavailable",
+                    extra={
+                        _ONLINE_KEY: ground_truth_device.state.extra.get(
+                            _ONLINE_KEY, False
+                        ),
+                        OBSERVATION_UNAVAILABLE_KEY: True,
+                    },
+                )
             observed.state.extra[OBSERVATION_STALE_KEY] = True
 
         self._stale_device_ids = tuple(stale)
+        self._unavailable_device_ids = tuple(unavailable)
         return observable
+
+    def observe_frame(
+        self,
+        world: WorldState,
+        root_event: SimEvent,
+        *,
+        captured_at_sim_time_s: float | None = None,
+    ) -> ObservationFrame:
+        """Project world and root-event channels into one sealed perception."""
+
+        observable = self.observe(world)
+        observed_event = self._project_root_event(root_event, world, observable)
+        captured = (
+            float(captured_at_sim_time_s)
+            if captured_at_sim_time_s is not None
+            else (
+                float(root_event.sim_time_s)
+                if root_event.sim_time_s is not None
+                else float(world.simulation_tick) * float(world.simulated_dt_seconds)
+            )
+        )
+        metadata = self.model_metadata
+        preimage = {
+            "observation_contract_version": metadata["contract_version"],
+            "observation_condition": metadata["condition"],
+            "observation_model_id": metadata["model_id"],
+            "observation_model_hash": metadata["model_hash"],
+            "captured_at_sim_time_s": captured,
+            "observable_snapshot_projection": (
+                "world_state_without_agent_diagnostics.v1"
+            ),
+            "observable_snapshot": observable.model_dump(
+                mode="json", exclude={"agents"}
+            ),
+            # Transport identity/wall-clock fields are deliberately outside the
+            # frame commitment. The perception event already carries the causal
+            # edge; hashing UUIDs would make same-seed traces irreproducible.
+            "observed_root_event": {
+                "event_type": observed_event.event_type,
+                "source": observed_event.source,
+                "timestamp": observed_event.timestamp,
+                "sim_time_s": observed_event.sim_time_s,
+                "priority": observed_event.priority,
+                "event_generation_mode": observed_event.event_generation_mode,
+                "generation_rule_id": observed_event.generation_rule_id,
+                "rng_stream": observed_event.rng_stream,
+                "data": _stable_observed_event_data(observed_event.data),
+            },
+            "stale_device_ids": list(self._stale_device_ids),
+            "unavailable_device_ids": list(self._unavailable_device_ids),
+        }
+        frame_hash = hashlib.sha256(_canonical_json(preimage).encode("utf-8")).hexdigest()
+        return ObservationFrame(
+            observable_world=observable,
+            observed_root_event=observed_event,
+            condition=self.condition,
+            model_id=str(metadata["model_id"]),
+            contract_version=str(metadata["contract_version"]),
+            model_hash=str(metadata["model_hash"]),
+            captured_at_sim_time_s=captured,
+            stale_device_ids=self._stale_device_ids,
+            unavailable_device_ids=self._unavailable_device_ids,
+            _evidence_preimage=copy.deepcopy(preimage),
+            frame_hash=frame_hash,
+        )
+
+    def _project_root_event(
+        self,
+        root_event: SimEvent,
+        ground_truth: WorldState,
+        observable: WorldState,
+    ) -> SimEvent:
+        """Remove device-state values that would bypass the world projection."""
+
+        projected = root_event.model_copy(deep=True)
+        if self.condition is ObservationCondition.PERFECT:
+            return projected
+        # A user command carries a desired value, not a sensor report. Rewriting
+        # it would change the task rather than limit observation.
+        if projected.event_type == "user.command":
+            return projected
+        device_id = projected.data.get("device_id")
+        if not isinstance(device_id, str):
+            return projected
+        observed_device = observable.devices.get(device_id)
+        physical_device = ground_truth.devices.get(device_id)
+        if observed_device is None or physical_device is None:
+            for key in ("state", "device_state", "value", "new_value", "old_value"):
+                projected.data.pop(key, None)
+            return projected
+        if device_reports_online(physical_device):
+            # Online values are current reports in stale_offline as well. Keep
+            # transition fields such as old_value/new_value intact instead of
+            # collapsing both to the post-event snapshot.
+            return projected
+
+        data = projected.data
+        if "state" in data:
+            data["state"] = observed_device.state.model_dump(mode="json")
+        if "device_state" in data:
+            data["device_state"] = observed_device.state.model_dump(mode="json")
+        if "online" in data:
+            data["online"] = observed_device.state.extra.get(_ONLINE_KEY, True)
+        if "power" in data:
+            data["power"] = observed_device.state.power
+
+        for key in physical_device.state.extra:
+            if key not in data:
+                continue
+            if key in observed_device.state.extra:
+                data[key] = copy.deepcopy(observed_device.state.extra[key])
+            else:
+                data.pop(key, None)
+
+        state_path = data.get("path") or data.get("property")
+        observed_value = ObservableProjector._read_observed_device_value(
+            observed_device,
+            device_id=device_id,
+            state_path=state_path,
+        )
+        value_keys = ("value", "new_value", "old_value", "previous_value")
+        if state_path is not None:
+            for key in value_keys:
+                if key not in data:
+                    continue
+                if observed_value is _MISSING:
+                    data.pop(key, None)
+                else:
+                    data[key] = copy.deepcopy(observed_value)
+        elif any(key in data for key in value_keys):
+            # Device-associated raw values with no declared path cannot be
+            # safely mapped to the observable state, so fail closed.
+            for key in value_keys:
+                data.pop(key, None)
+        return projected
+
+    @staticmethod
+    def _read_observed_device_value(
+        device: DeviceState,
+        *,
+        device_id: str,
+        state_path: Any,
+    ) -> Any:
+        if not isinstance(state_path, str) or not state_path:
+            return _MISSING
+        path = state_path
+        prefix = f"devices[{device_id}].state."
+        if path.startswith(prefix):
+            path = path[len(prefix) :]
+        elif path.startswith("state."):
+            path = path[len("state.") :]
+        if path == "power":
+            return device.state.power
+        if path == "last_changed_by":
+            return device.state.last_changed_by
+        if path.startswith("extra."):
+            return device.state.extra.get(path[len("extra.") :], _MISSING)
+        return device.state.extra.get(path, _MISSING)
 
 
 def build_observable_view(
