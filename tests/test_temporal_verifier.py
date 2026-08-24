@@ -5,10 +5,10 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from backend.engine.event_bus import SimEvent
 import backend.evaluation.temporal as temporal_module
-from backend.evaluation.temporal import VerificationStatus, verify_trace
 import backend.evaluation.trace_index as trace_index_module
+from backend.engine.event_bus import SimEvent
+from backend.evaluation.temporal import VerificationStatus, verify_trace
 from backend.evaluation.trace_index import TraceIndex, TraceValidationError
 from backend.scenarios.trace_spec import TraceSpec
 
@@ -629,18 +629,20 @@ def test_trace_index_bounds_untrusted_payload_depth_and_event_count(
 
 
 def test_verifier_rejects_nan_in_typed_comparison_value() -> None:
-    spec = _spec(
-        {
-            "op": "event",
-            "event_type": "sample",
-            "where": [
-                {"path": "data.value", "comparator": "eq", "value": float("nan")}
-            ],
-        }
-    )
-    result = verify_trace(spec, [_event(0, "sample", data={"value": 1.0})])
-    assert result.hard_status == VerificationStatus.UNEVALUABLE
-    assert "TraceSpec" in result.validation_errors[0]
+    with pytest.raises(ValidationError, match="condition values must be finite"):
+        _spec(
+            {
+                "op": "event",
+                "event_type": "sample",
+                "where": [
+                    {
+                        "path": "data.value",
+                        "comparator": "eq",
+                        "value": float("nan"),
+                    }
+                ],
+            }
+        )
 
 
 def test_trace_index_accepts_sim_event_models_but_rejects_nonzero_first_seq() -> None:

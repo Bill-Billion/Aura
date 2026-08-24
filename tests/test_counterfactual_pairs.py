@@ -33,6 +33,9 @@ def test_valid_pair_has_stable_fingerprint() -> None:
     assert len(first) == 1
     assert first[0].group_id == "read_then_leave_001"
     assert first[0].fingerprint == second[0].fingerprint
+    assert first[0].fingerprint == (
+        "13d919217d87c2896e5e2a84427bd4dc661954aa148c185306fd2356086edf4e"
+    )
 
 
 def test_missing_or_duplicate_variant_is_rejected() -> None:

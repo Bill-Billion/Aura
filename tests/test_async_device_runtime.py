@@ -104,7 +104,7 @@ def test_scheduler_has_stable_tie_breaking() -> None:
     assert [item.operation_id for item in scheduler.pop_due(5)] == ["first", "second"]
 
 
-def test_device_perturbation_registry_is_explicit_and_requires_time() -> None:
+def test_device_perturbation_registry_is_explicit_and_requires_timing() -> None:
     assert set(PERTURBATION_HANDLER_REGISTRY) == {
         "device_failure",
         "feedback_loss",
@@ -112,24 +112,24 @@ def test_device_perturbation_registry_is_explicit_and_requires_time() -> None:
         "conflicting_request",
         "safety_interrupt",
     }
-    with pytest.raises(ValidationError, match="requires at_sim_time_s"):
+    with pytest.raises(ValidationError, match="requires exactly one timing contract"):
         DeviceFailurePerturbation(phase="during_execution", device_id="light")
-    with pytest.raises(ValidationError, match="requires at_sim_time_s"):
+    with pytest.raises(ValidationError, match="requires exactly one timing contract"):
         FeedbackLossPerturbation(
             phase="after_execution_before_feedback", device_id="light"
         )
-    with pytest.raises(ValidationError, match="requires at_sim_time_s"):
+    with pytest.raises(ValidationError, match="requires exactly one timing contract"):
         ResidentStateChangePerturbation(
             phase="after_plan_before_execution", user_id="user", activity="away"
         )
-    with pytest.raises(ValidationError, match="requires at_sim_time_s"):
+    with pytest.raises(ValidationError, match="requires exactly one timing contract"):
         ConflictingRequestPerturbation(
             phase="after_plan_before_execution",
             user_id="user",
             room_id="living_room",
             intent="turn it off",
         )
-    with pytest.raises(ValidationError, match="requires at_sim_time_s"):
+    with pytest.raises(ValidationError, match="requires exactly one timing contract"):
         SafetyInterruptPerturbation(
             phase="during_execution", room_id="living_room"
         )

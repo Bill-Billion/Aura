@@ -45,11 +45,11 @@ def test_schema_compatibility_reports_the_requested_field() -> None:
 
 
 def test_scenario_versions_support_legacy_v1_and_aurabench_v2() -> None:
-    assert SUPPORTED_SCENARIO_SCHEMA_VERSION == "2.0"
+    assert SUPPORTED_SCENARIO_SCHEMA_VERSION == "2.1"
     assert LEGACY_SCENARIO_SCHEMA_VERSION == "1.1"
-    assert SUPPORTED_SCENARIO_SCHEMA_BY_MAJOR == {1: "1.1", 2: "2.0"}
+    assert SUPPORTED_SCENARIO_SCHEMA_BY_MAJOR == {1: "1.1", 2: "2.1"}
     assert check_scenario_schema_compatibility("1.0").supported == (1, 1)
-    assert check_scenario_schema_compatibility("2.0").supported == (2, 0)
+    assert check_scenario_schema_compatibility("2.0").supported == (2, 1)
     with pytest.raises(SchemaVersionError, match="unknown major"):
         check_scenario_schema_compatibility("9.0")
 

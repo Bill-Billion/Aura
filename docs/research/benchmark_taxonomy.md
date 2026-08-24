@@ -1,6 +1,21 @@
 # AuraBench 分类学
 
-AuraBench 使用反事实配对组织任务。每个动态 episode 必须有一个共享初态、目标、基础 timeline、TraceSpec 和 seed 的静态孪生任务；两者只允许在声明的 perturbation 上不同。
+AuraBench 使用反事实配对组织任务。每个动态 episode 必须有一个共享初态、基础 timeline、seed 和 `shared_goal` 的静态孪生任务。dynamic 可额外声明 `intervention_response`，但不能修改共享目标；这样“任务语义不变”和“干预后正确动作可改变”可以同时成立。
+
+## ScenarioSpec 2.1 闭环契约
+
+2.0 的绝对模拟时间干预继续用于历史工件与 smoke test。新的科学任务使用 2.1，并且每个 dynamic episode 只允许一个事件相对干预：
+
+- `anchor` 选中首个阶段边界事件，并限定在同一 correlation；
+- `offset_seconds` 声明从 anchor 起算的模拟时间偏移；
+- `must_precede` 声明注入必须早于哪个事件；
+- runtime 必须持久化 `benchmark.perturbation_injected`，不能把声明退化为绝对时间调度；
+- `intervention_response.trigger` 必须选中该持久化事件并绑定相同干预因子；
+- `intervention_response.time_origin` 固定为 `trigger`；`expected_device_effects.within_seconds` 和 `obligations` 的时间窗口都从该事件起算，并只评价从 trigger 开始的 trace 后缀；
+- `intervention_response.expected_device_effects` 与 `obligations` 是干预后的权威评价契约，后者复用 TraceSpec，不再新增第二套规则语言；
+- `shared_goal` 的用户目标、相关房间和安全约束必须与既有 `ground_truth` 对应字段一致，避免同一场景出现两套互相矛盾的目标。
+
+在事件相对运行时完成前，2.1 dynamic 场景会明确拒绝执行，避免静默按 2.0 语义运行。
 
 ## 八个场景族
 
@@ -15,7 +30,7 @@ AuraBench 使用反事实配对组织任务。每个动态 episode 必须有一�
 
 ## 动态干预因子
 
-ScenarioSpec 2.0 首版冻结六类单因素干预：
+ScenarioSpec 2.x 冻结六类单因素干预：
 
 - `resident_state_change`：规划或执行期间居民位置/活动变化；
 - `device_failure`：设备在验证、执行或反馈阶段离线；

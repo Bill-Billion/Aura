@@ -109,10 +109,17 @@ class EventFieldCondition(_StrictModel):
             raise ValueError("exists comparator requires a boolean value")
         if self.comparator in {"in", "not_in"} and not isinstance(self.value, list):
             raise ValueError(f"{self.comparator} comparator requires a list value")
+        if self.comparator == "in" and self.value == []:
+            raise ValueError("in comparator requires a non-empty list value")
         if isinstance(self.value, list) and len(self.value) > MAX_CONDITION_LIST_VALUES:
             raise ValueError(
                 f"condition list cannot exceed {MAX_CONDITION_LIST_VALUES} values"
             )
+        values = self.value if isinstance(self.value, list) else [self.value]
+        if any(
+            isinstance(item, float) and not math.isfinite(item) for item in values
+        ):
+            raise ValueError("condition values must be finite")
         if self.comparator in {"lt", "lte", "gt", "gte"}:
             if isinstance(self.value, bool) or not isinstance(self.value, (int, float)):
                 raise ValueError(

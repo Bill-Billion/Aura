@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
 
+from backend.models.versioning import parse_schema_version
 from backend.scenarios.spec_v2 import ScenarioSpecV2
 
 
@@ -25,14 +26,27 @@ class CounterfactualPair:
 
     @property
     def fingerprint(self) -> str:
+        is_v2_0 = parse_schema_version(self.static.scenario_schema_version) == (2, 0)
         payload = {
             "group_id": self.group_id,
             "base": counterfactual_base_projection(self.static),
             "factor": self.static.counterfactual.factor,
             "dynamic_perturbations": [
-                item.model_dump(mode="json") for item in self.dynamic.perturbations
+                item.model_dump(
+                    mode="json",
+                    exclude={"anchor", "offset_seconds", "must_precede"}
+                    if is_v2_0
+                    else None,
+                )
+                for item in self.dynamic.perturbations
             ],
         }
+        if not is_v2_0:
+            payload["intervention_response"] = (
+                self.dynamic.intervention_response.model_dump(mode="json")
+                if self.dynamic.intervention_response is not None
+                else None
+            )
         encoded = json.dumps(
             payload,
             ensure_ascii=False,
@@ -45,9 +59,19 @@ class CounterfactualPair:
 def counterfactual_base_projection(spec: ScenarioSpecV2) -> dict[str, object]:
     """Fields that must be identical for causal attribution within a pair."""
 
+    excluded = {
+        "id",
+        "name",
+        "description",
+        "counterfactual",
+        "perturbations",
+        "intervention_response",
+    }
+    if parse_schema_version(spec.scenario_schema_version) == (2, 0):
+        excluded.add("shared_goal")
     return spec.model_dump(
         mode="json",
-        exclude={"id", "name", "description", "counterfactual", "perturbations"},
+        exclude=excluded,
     )
 
 
@@ -107,7 +131,7 @@ def validate_counterfactual_pairs(
         ):
             raise CounterfactualPairError(
                 group_id,
-                "variants differ outside id/name/description/variant/perturbations",
+                "variants differ outside identity/perturbation/intervention_response",
             )
 
         pairs.append(CounterfactualPair(group_id, static, dynamic))

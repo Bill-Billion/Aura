@@ -9,6 +9,7 @@ from backend.config.device_registry import (
     build_default_rooms,
     get_default_device_registry,
 )
+from backend.models.versioning import parse_schema_version
 from backend.scenarios.spec import ScenarioSpec
 from backend.scenarios.spec_v2 import ScenarioSpecV2
 from backend.scenarios.trace_spec import trace_spec_fingerprint
@@ -24,9 +25,26 @@ def scenario_contract_fingerprint(spec: ScenarioSpec) -> str:
     silently applying today's expectations to yesterday's events.
     """
 
+    scenario_payload = spec.model_dump(mode="json")
+    if (
+        isinstance(spec, ScenarioSpecV2)
+        and parse_schema_version(spec.scenario_schema_version) == (2, 0)
+    ):
+        # New optional 2.1 fields are not part of a persisted 2.0 contract.
+        scenario_payload = spec.model_dump(
+            mode="json",
+            exclude={
+                "shared_goal": True,
+                "intervention_response": True,
+                "perturbations": {
+                    "__all__": {"anchor", "offset_seconds", "must_precede"}
+                },
+            },
+        )
+
     payload = {
         "fingerprint_version": SCENARIO_CONTRACT_FINGERPRINT_VERSION,
-        "scenario": spec.model_dump(mode="json"),
+        "scenario": scenario_payload,
         "device_registry": [
             entry.model_dump(mode="json")
             for entry in sorted(get_default_device_registry(), key=lambda item: item.id)
