@@ -25,10 +25,11 @@ from __future__ import annotations
 
 import asyncio
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from backend.agents.llm import LLMProvider
 from backend.api.ws import ConnectionManager
@@ -50,6 +51,7 @@ from backend.scenarios.apply import (
 )
 from backend.scenarios.generator import GenerationSources
 from backend.scenarios.loader import ScenarioLoadError, get_scenario
+from backend.scenarios.phase_controller import PerturbationPhaseError
 from backend.scenarios.spec import ScenarioSpec
 
 __all__ = [
@@ -91,6 +93,7 @@ class ScenarioRunErrorCode(str, Enum):
     ENGINE_ERROR = "engine_error"
     EPISODE_SETTLE_TIMEOUT = "episode_settle_timeout"
     TICK_BUDGET_EXCEEDED = "tick_budget_exceeded"
+    PERTURBATION_PHASE_INVALID = "perturbation_phase_invalid"
 
 
 class ScenarioRunError(Exception):
@@ -306,6 +309,18 @@ class ScenarioRunner:
             # through both phases so the in-memory trace cannot lose late evidence.
             await engine.pause()
             await self._wait_for_idle_or_raise(phase="final_drain")
+            try:
+                await engine.finalize_perturbation_phase()
+            except PerturbationPhaseError as exc:
+                raise ScenarioRunError(
+                    ScenarioRunErrorCode.PERTURBATION_PHASE_INVALID,
+                    str(exc),
+                    details={
+                        "scenario_id": exc.scenario_id,
+                        "reason": exc.reason,
+                        **exc.details,
+                    },
+                ) from exc
             await engine.command_executor.cancel_pending(
                 "scenario_horizon_reached",
                 tick=engine.timer.current_tick,
@@ -321,6 +336,22 @@ class ScenarioRunner:
                     details={"scenario_id": self.spec.id, "run_id": run_id},
                 )
 
+            ordered_events = sorted(
+                self._collected,
+                key=lambda event: event.seq if event.seq is not None else -1,
+            )
+            seqs = [event.seq for event in ordered_events]
+            if seqs and (
+                seqs[0] is None
+                or any(seq is None for seq in seqs)
+                or seqs != list(range(seqs[0], seqs[0] + len(seqs)))
+            ):
+                raise ScenarioRunError(
+                    ScenarioRunErrorCode.ENGINE_ERROR,
+                    f"场景 {self.spec.id} 的事件序列不连续",
+                    details={"scenario_id": self.spec.id, "seqs": seqs},
+                )
+
             result = ScenarioRunResult(
                 run_id=run_id,
                 scenario_id=self.spec.id,
@@ -329,7 +360,7 @@ class ScenarioRunner:
                 sim_time_s=engine.sim_time_s,
                 duration_seconds=duration,
                 completed=sources.scripted is not None and sources.scripted.exhausted,
-                events=tuple(self._collected),
+                events=tuple(ordered_events),
                 run_metadata=metadata,
                 initial_state=self.initial_state_application,
                 rng_metadata=rng.metadata(),
@@ -447,6 +478,8 @@ class ScenarioRunner:
                     phase=phase,
                     error=repr(cleanup_error),
                 )
+
+        self.engine.command_executor.device_runtime.reset()
 
         current = self.engine.run_manager.current
         if current is not None and current.run_id == run_id:

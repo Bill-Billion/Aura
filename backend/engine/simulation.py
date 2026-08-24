@@ -69,12 +69,17 @@ from backend.scenarios.generator import (
     GenerationSources,
     build_generation_sources,
 )
+from backend.scenarios.phase_controller import PhasePerturbationController
 from backend.scenarios.spec import ScenarioSpec
 from backend.scenarios.spec_v2 import (
+    ConflictingRequestPerturbation,
+    DeviceFailurePerturbation,
+    FeedbackLossPerturbation,
+    ResidentStateChangePerturbation,
+    SafetyInterruptPerturbation,
     ScenarioSpecV2,
     apply_compiled_perturbations,
     compile_perturbations,
-    unavailable_perturbation_capabilities,
     unsupported_perturbations,
 )
 from backend.simulators.environment import EnvironmentSimulator
@@ -86,32 +91,21 @@ ENGINE_ERROR_WS_TYPE = "ENGINE_ERROR"
 
 
 class PerturbationRuntimeUnavailableError(RuntimeError):
-    """A v2 intervention was declared but no runtime consumer exists yet.
-
-    PR-1 freezes the intervention schema only.  Letting such a scenario continue
-    would silently execute the dynamic member as its static counterfactual, so
-    every engine entry point fails before pausing the active run or opening a
-    new artifact.  PR-2/PR-3 replace this gate with an explicit handler
-    registry; there is deliberately no bypass flag.
-    """
+    """A declared perturbation type has no runtime consumer."""
 
     code = "perturbation_runtime_unavailable"
 
     def __init__(self, spec: ScenarioSpecV2) -> None:
         unsupported = unsupported_perturbations(spec)
-        unavailable = unavailable_perturbation_capabilities(spec)
-        event_relative = [item for item in spec.perturbations if item.anchor is not None]
         self.scenario_id = spec.id
         self.unsupported_perturbation_types = tuple(
             sorted({item.type for item in unsupported})
         )
         self.unsupported_perturbation_phases = tuple(
-            sorted({item.phase for item in event_relative})
+            sorted({item.phase for item in unsupported})
         )
-        self.unavailable_runtime_capabilities = unavailable
         self.message = (
-            f"scenario {spec.id!r} declares perturbation contracts unsupported "
-            "by this runtime"
+            f"scenario {spec.id!r} declares perturbation types unsupported by this runtime"
         )
         super().__init__(self.message)
 
@@ -126,9 +120,6 @@ class PerturbationRuntimeUnavailableError(RuntimeError):
                 ),
                 "unsupported_perturbation_phases": list(
                     self.unsupported_perturbation_phases
-                ),
-                "unavailable_runtime_capabilities": list(
-                    self.unavailable_runtime_capabilities
                 ),
             },
         }
@@ -160,6 +151,7 @@ class SimulationEngine:
         # deterministic resident runtime whose latent profile never enters
         # WorldState (and therefore never enters the agent observation).
         self.resident_engine: ResidentEngine | None = None
+        self.phase_controller: PhasePerturbationController | None = None
         self.timer = SimulatorTimer(
             publish_event=self._publish_sim_event,
             tick_interval=self.TICK_INTERVAL,
@@ -477,10 +469,7 @@ class SimulationEngine:
         # 解析放在最前面：未知场景 id 必须在 pause/取消/换世界**之前**被拒，
         # 否则一次拼错的启动会把正在跑的 run 拆掉再报错。
         spec = resolve_run_scenario(scenario, dirs=scenario_dirs)
-        if isinstance(spec, ScenarioSpecV2) and (
-            unsupported_perturbations(spec)
-            or unavailable_perturbation_capabilities(spec)
-        ):
+        if isinstance(spec, ScenarioSpecV2) and unsupported_perturbations(spec):
             raise PerturbationRuntimeUnavailableError(spec)
         compiled_perturbations = (
             compile_perturbations(spec)
@@ -534,6 +523,7 @@ class SimulationEngine:
             )
 
         await self.pause()
+        self._bind_phase_controller(None)
         # Defensive reset for legacy/manual headless failures which may have
         # interrupted a tick before its handler wrapper was installed.
         self._is_processing_timer_tick = False
@@ -640,6 +630,7 @@ class SimulationEngine:
         # 留着上一个场景的产线，等于用旧场景的 timeline 驱动一个匿名的新实验。
         try:
             if isinstance(spec, ScenarioSpecV2):
+                self._bind_phase_controller(self._build_phase_controller(spec))
                 apply_compiled_perturbations(
                     compiled_perturbations, self
                 )
@@ -664,6 +655,7 @@ class SimulationEngine:
             # which blocks every subsequent launch/mutation.  The partial
             # artifact remains explicit and non-evaluable via end_reason.
             self.bind_generation_sources(None)
+            self._bind_phase_controller(None)
             current = self.run_manager.current
             if current is not None and current.run_id == started_run.run_id:
                 self.run_manager.end_run("launch_failed")
@@ -680,6 +672,7 @@ class SimulationEngine:
 
     async def close(self) -> None:
         await self.stop()
+        self._bind_phase_controller(None)
         self._unsubscribe_handlers()
         await self.agent_runtime.close()
         # run 必须显式收尾：此后 run_id 为 None，任何还在飞的产物一律判 stale
@@ -770,32 +763,52 @@ class SimulationEngine:
 
         The simulator advances in coarse steps while devices retain exact
         deadlines.  Draining after the closing tick would make persisted
-        ``sim_time_s`` move backwards.  Resident deadlines split the drain
-        into ordered intervals; ties remain resident-first so a safety event
-        can preempt a device completion at the same simulated instant.
+        ``sim_time_s`` move backwards.  Every runtime deadline splits the
+        drain into ordered intervals; ties remain phase/resident-first so an
+        intervention can preempt a device completion at the same instant.
         """
 
+        phase_runtime = self.phase_controller
         resident_runtime = self.resident_engine
         device_runtime = self.command_executor.device_runtime
         world = self.state_manager.world
-        while resident_runtime is not None:
-            resident_due = resident_runtime.next_due_at_s
-            if resident_due is None or resident_due > sim_time_s:
-                break
-            await device_runtime.advance(
-                math.nextafter(resident_due, -math.inf),
-                tick=timer_tick,
-                active_run_id=self.run_id,
+        while True:
+            phase_due = (
+                phase_runtime.next_due_at_s if phase_runtime is not None else None
             )
-            for resident_event in resident_runtime.advance(
-                world, sim_time_s=resident_due, tick=timer_tick
-            ):
-                await self._publish_sim_event(resident_event)
-        await device_runtime.advance(
-            sim_time_s,
-            tick=timer_tick,
-            active_run_id=self.run_id,
-        )
+            resident_due = (
+                resident_runtime.next_due_at_s
+                if resident_runtime is not None
+                else None
+            )
+            device_due = device_runtime.next_due_at_s
+            due_times = [
+                due
+                for due in (phase_due, resident_due, device_due)
+                if due is not None and due <= sim_time_s
+            ]
+            if not due_times:
+                break
+            due_at_s = min(due_times)
+            if phase_due == due_at_s or resident_due == due_at_s:
+                await device_runtime.advance(
+                    math.nextafter(due_at_s, -math.inf),
+                    tick=timer_tick,
+                    active_run_id=self.run_id,
+                )
+            if phase_due == due_at_s and phase_runtime is not None:
+                await phase_runtime.advance(due_at_s)
+            if resident_due == due_at_s and resident_runtime is not None:
+                for resident_event in resident_runtime.advance(
+                    world, sim_time_s=due_at_s, tick=timer_tick
+                ):
+                    await self._publish_sim_event(resident_event)
+            if device_due == due_at_s:
+                await device_runtime.advance(
+                    due_at_s,
+                    tick=timer_tick,
+                    active_run_id=self.run_id,
+                )
 
     async def _handle_timer_tick_body(self, event: SimEvent) -> None:
         world = self.state_manager.world
@@ -989,27 +1002,50 @@ class SimulationEngine:
         )
 
     async def _activate_runtime_device_failure(
-        self, device_id: str, sim_time_s: float, tick: int | None
-    ) -> None:
+        self,
+        device_id: str,
+        sim_time_s: float,
+        tick: int | None,
+        *,
+        causal_parent: str | None = None,
+        correlation_id: str | None = None,
+        arm_failure: bool = False,
+    ) -> SimEvent:
         """Materialize a due v2 device failure as world truth plus a root event."""
 
-        event = await self._publish_sim_event(
-            SimEvent(
-                event_type="device.offline",
-                source=FAILURE_INJECTION_CAUSED_BY,
-                timestamp=float(tick if tick is not None else self.timer.current_tick),
-                priority=2,
-                event_generation_mode="scripted",
-                generation_rule_id="perturbation.device_failure",
-                sim_time_s=sim_time_s,
-                data={
-                    "device_id": device_id,
-                    "online": False,
-                    "at_sim_time_s": sim_time_s,
-                    "reason": "v2 device_failure perturbation",
-                },
-            )
+        causal_fields: dict[str, str] = {}
+        if causal_parent is not None:
+            causal_fields["causal_parent"] = causal_parent
+        if correlation_id is not None:
+            causal_fields["correlation_id"] = correlation_id
+        event = SimEvent(
+            event_type="device.offline",
+            source=FAILURE_INJECTION_CAUSED_BY,
+            timestamp=float(tick if tick is not None else self.timer.current_tick),
+            priority=2,
+            event_generation_mode="scripted",
+            generation_rule_id="perturbation.device_failure",
+            sim_time_s=sim_time_s,
+            data={
+                "device_id": device_id,
+                "online": False,
+                "at_sim_time_s": sim_time_s,
+                "reason": "v2 device_failure perturbation",
+                "perturbation_type": "device_failure",
+            },
+            **causal_fields,
         )
+        self.event_bus.stamp(event)
+        if event.seq is None:
+            visible = await self._publish_sim_event(event)
+            raise RuntimeError(
+                "device failure evidence was suppressed: "
+                f"visible_event_type={visible.event_type}"
+            )
+        if arm_failure:
+            self.command_executor.device_runtime.failures.inject_offline(
+                device_id, at_sim_time_s=sim_time_s
+            )
         self._apply_availability_write(
             DeviceAvailabilityWrite(
                 device_id=device_id,
@@ -1018,6 +1054,123 @@ class SimulationEngine:
             ),
             event,
         )
+        visible = await self._publish_sim_event(event)
+        if visible.event_id != event.event_id or visible.event_type != event.event_type:
+            raise RuntimeError(
+                "device failure evidence was not admitted: "
+                f"visible_event_type={visible.event_type}"
+            )
+        return visible
+
+    def _bind_phase_controller(
+        self, controller: PhasePerturbationController | None
+    ) -> None:
+        if self.phase_controller is not None:
+            self.event_bus.unsubscribe("*", self.phase_controller.handle_event)
+        self.phase_controller = controller
+        phase = controller.perturbation.phase if controller is not None else None
+        self.agent_runtime.before_observation_hook = (
+            controller.handle_event if phase == "before_perception" else None
+        )
+        self.agent_runtime.emit_perception_before_plan = (
+            phase == "after_perception_before_plan"
+        )
+        if controller is not None:
+            self.event_bus.subscribe("*", controller.handle_event)
+
+    def _build_phase_controller(
+        self, spec: ScenarioSpecV2
+    ) -> PhasePerturbationController | None:
+        if not spec.perturbations or spec.perturbations[0].anchor is None:
+            return None
+        run_id = self.run_id
+        if run_id is None:
+            raise RuntimeError("phase controller requires an active run")
+        return PhasePerturbationController(
+            spec,
+            run_id=run_id,
+            publish=self._publish_sim_event,
+            stamp=self.event_bus.stamp,
+            inject=self._inject_event_relative_perturbation,
+            tick_source=lambda: self.timer.current_tick,
+        )
+
+    async def finalize_perturbation_phase(self) -> None:
+        if self.phase_controller is not None:
+            await self.phase_controller.finalize()
+
+    async def _inject_event_relative_perturbation(
+        self,
+        perturbation: (
+            ResidentStateChangePerturbation
+            | DeviceFailurePerturbation
+            | ConflictingRequestPerturbation
+            | SafetyInterruptPerturbation
+            | FeedbackLossPerturbation
+        ),
+        evidence: SimEvent,
+        sim_time_s: float,
+    ) -> None:
+        device_runtime = self.command_executor.device_runtime
+        if isinstance(perturbation, DeviceFailurePerturbation):
+            await self._activate_runtime_device_failure(
+                perturbation.device_id,
+                sim_time_s,
+                self.timer.current_tick,
+                causal_parent=evidence.event_id,
+                correlation_id=evidence.correlation_id,
+                arm_failure=True,
+            )
+            return
+        if isinstance(perturbation, FeedbackLossPerturbation):
+            device_runtime.failures.inject_feedback_loss(
+                perturbation.device_id,
+                drop_count=perturbation.drop_count,
+                at_sim_time_s=sim_time_s,
+            )
+            return
+
+        resident_runtime = self.resident_engine
+        if resident_runtime is None:
+            raise RuntimeError("resident perturbation requires a v2 resident runtime")
+        if isinstance(perturbation, ResidentStateChangePerturbation):
+            kind = "resident_state_change"
+            data = {
+                "user_id": perturbation.user_id,
+                "room_id": perturbation.room_id,
+                "activity": perturbation.activity,
+            }
+        elif isinstance(perturbation, ConflictingRequestPerturbation):
+            kind = "conflicting_request"
+            data = {
+                "user_id": perturbation.user_id,
+                "room_id": perturbation.room_id,
+                "intent": perturbation.intent,
+            }
+        elif isinstance(perturbation, SafetyInterruptPerturbation):
+            kind = "safety_interrupt"
+            data = {
+                "room_id": perturbation.room_id,
+                "event_type": perturbation.event_type,
+                "severity": perturbation.severity,
+            }
+        else:  # pragma: no cover - closed by ScenarioSpec's discriminator
+            raise TypeError(f"unsupported event-relative perturbation: {perturbation!r}")
+        event = resident_runtime.intervention_event(
+            kind,
+            data,
+            self.state_manager.world,
+            sim_time_s=sim_time_s,
+            tick=self.timer.current_tick,
+            causal_parent=evidence.event_id,
+            correlation_id=evidence.correlation_id,
+        )
+        visible = await self._publish_sim_event(event)
+        if visible.event_id != event.event_id or visible.event_type != event.event_type:
+            raise RuntimeError(
+                "physical perturbation evidence was not admitted: "
+                f"visible_event_type={visible.event_type}"
+            )
 
     # ScenarioSpecV2 perturbation-runtime protocol.  Device interventions are
     # delegated to PR-2's runtime; resident and safety interventions share the
@@ -1096,10 +1249,17 @@ class SimulationEngine:
     async def _handle_safety_interrupt(self, event: SimEvent) -> None:
         """A safety root event preempts every currently executing device operation."""
 
+        reason = f"safety interrupt: {event.event_type}"
         await self.command_executor.interrupt_device_operations(
-            reason=f"safety interrupt: {event.event_type}",
+            reason=reason,
             tick=self.state_manager.world.simulation_tick,
             sim_time_s=event.sim_time_s,
+        )
+        # The executing lifecycle event is published before DeviceRuntime owns
+        # an operation. A re-entrant safety event must close that narrow gap too.
+        await self.command_executor.cancel_pending(
+            reason,
+            tick=self.state_manager.world.simulation_tick,
         )
 
     _RESIDENT_STATE_EVENT_TYPES: tuple[str, ...] = (

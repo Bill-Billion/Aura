@@ -652,7 +652,6 @@ PerturbationHandler: TypeAlias = Callable[
     [PerturbationRuntime, PerturbationSpec], None
 ]
 CompiledPerturbation: TypeAlias = tuple[PerturbationHandler, PerturbationSpec]
-EVENT_RELATIVE_PHASE_RUNTIME = "event_relative_phase_runtime"
 
 
 def unsupported_perturbations(spec: ScenarioSpecV2) -> list[PerturbationSpec]:
@@ -661,12 +660,6 @@ def unsupported_perturbations(spec: ScenarioSpecV2) -> list[PerturbationSpec]:
         for item in spec.perturbations
         if item.type not in PERTURBATION_HANDLER_REGISTRY
     ]
-
-
-def unavailable_perturbation_capabilities(spec: ScenarioSpecV2) -> tuple[str, ...]:
-    if any(item.anchor is not None for item in spec.perturbations):
-        return (EVENT_RELATIVE_PHASE_RUNTIME,)
-    return ()
 
 
 def configure_perturbations(
@@ -678,20 +671,16 @@ def configure_perturbations(
 def compile_perturbations(
     spec: ScenarioSpecV2,
 ) -> tuple[CompiledPerturbation, ...]:
-    """Resolve every handler before a run is committed."""
+    """Resolve absolute-time handlers; PR13 owns event-relative injection."""
 
     unsupported = unsupported_perturbations(spec)
     if unsupported:
         names = ", ".join(sorted({item.type for item in unsupported}))
         raise ValueError(f"unsupported perturbation types: {names}")
-    unavailable = unavailable_perturbation_capabilities(spec)
-    if unavailable:
-        raise ValueError(
-            "unavailable perturbation runtime capabilities: " + ", ".join(unavailable)
-        )
     return tuple(
         (PERTURBATION_HANDLER_REGISTRY[item.type], item)
         for item in spec.perturbations
+        if item.anchor is None
     )
 
 
@@ -711,7 +700,6 @@ apply_compiled_device_perturbations = apply_compiled_perturbations
 
 
 __all__ = [
-    "EVENT_RELATIVE_PHASE_RUNTIME",
     "PERTURBATION_HANDLER_REGISTRY",
     "BenchmarkMetadata",
     "ConflictingRequestPerturbation",
@@ -737,6 +725,5 @@ __all__ = [
     "compile_perturbations",
     "configure_device_perturbations",
     "configure_perturbations",
-    "unavailable_perturbation_capabilities",
     "unsupported_perturbations",
 ]

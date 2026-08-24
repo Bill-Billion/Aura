@@ -428,6 +428,13 @@ class AgentRuntime:
         self._episode_meta: dict[asyncio.Task[None], dict[str, Any]] = {}
         self.environment_debounce_ms = int(os.getenv("AGENT_ENV_DEBOUNCE_MS", "5000"))
         self._last_environment_episode_started_at: dict[str, float] = {}
+        # ScenarioSpec 2.1 owns the matcher/injector.  The agent runtime only
+        # exposes the two computation boundaries that cannot be represented by
+        # observing an event after the fact.
+        self.before_observation_hook: (
+            Callable[[SimEvent], Awaitable[None]] | None
+        ) = None
+        self.emit_perception_before_plan = False
 
     @property
     def is_provider_configured(self) -> bool:
@@ -946,6 +953,17 @@ class AgentRuntime:
         if self.state_manager is None or self.publish_event is None or self.conn is None:
             return
 
+        # A before-perception intervention may publish another root event.  Take
+        # this root's ticket first so that nested work cannot overtake it.
+        emission_ticket: int | None = None
+        if self.before_observation_hook is not None:
+            emission_ticket = self.emission_gate.take_ticket()
+            try:
+                await self.before_observation_hook(event)
+            except BaseException:
+                self.emission_gate.release(emission_ticket)
+                raise
+
         # §2.3：从这里往下，agent 侧看到的一律是 observable 投影。相关性判定也算 agent
         # 的感知（它读 devices/rooms），因此与 episode 共用**同一次**投影——分两次取会
         # 让"决定要不要跑"和"跑的时候看到的"来自两个不同时刻的观测。
@@ -956,6 +974,8 @@ class AgentRuntime:
         observed_version = self._current_world_version()
         relevant_agents = [agent for agent in self.agents if agent.is_relevant(observable, event)]
         if not relevant_agents:
+            if emission_ticket is not None:
+                self.emission_gate.release(emission_ticket)
             return
 
         now = time.monotonic()
@@ -974,6 +994,8 @@ class AgentRuntime:
             agents_to_run.append(agent)
 
         if not agents_to_run:
+            if emission_ticket is not None:
+                self.emission_gate.release(emission_ticket)
             return
 
         # 顺序契约第 4 条：后到的根事件**不抢占**前一条在飞 episode。
@@ -984,7 +1006,8 @@ class AgentRuntime:
 
         # 取号必须在这里：本方法由 EventBus 顺序派发，取号顺序 == 根事件发布顺序，
         # 与 agent 算得快慢无关——这是整条确定性链的起点。
-        emission_ticket = self.emission_gate.take_ticket()
+        if emission_ticket is None:
+            emission_ticket = self.emission_gate.take_ticket()
         # episode 在起点抓一次 run_id：它跑完时活跃 run 可能已经换了（reset / 场景连跑），
         # 落地前拿这份快照与当时的活跃 run 对账（§2.2）。
         episode_run_id = self.current_run_id()
@@ -1105,8 +1128,59 @@ class AgentRuntime:
             observed_version = self._current_world_version()
         candidates = self._ordered_agents(agents)
 
+        if self.emit_perception_before_plan:
+            # This phase is intentionally serialized from the persisted
+            # perception boundary onward. Releasing and reacquiring the ticket
+            # would let another episode splice events into this causal chain.
+            async with self.emission_gate.turn(ticket):
+                if self._is_stale_run(run_id):
+                    return
+                perception = await self._emit_preplan_perception(root_event, snapshot)
+                decision, agents, evaluated = await self._compute_episode(
+                    root_event, snapshot, candidates
+                )
+                await self._emit_episode(
+                    root_event=root_event,
+                    agents=agents,
+                    evaluated=evaluated,
+                    run_id=run_id,
+                    decision=decision,
+                    candidates=candidates,
+                    snapshot=snapshot,
+                    observed_version=observed_version,
+                    perception_event=perception,
+                )
+            return
+
         # —— 编排（§8.1）：也是"算"的一部分，因此在闸门之外做完。——
         # 它不写世界、不发事件，只决定"这一轮派给谁、每人干什么"。
+        decision, agents, evaluated = await self._compute_episode(
+            root_event, snapshot, candidates
+        )
+
+        # 从这里往下是"发"：整段持号，按取号序（=根事件发布序）串行。
+        async with self.emission_gate.turn(ticket):
+            await self._emit_episode(
+                root_event=root_event,
+                agents=agents,
+                evaluated=evaluated,
+                run_id=run_id,
+                decision=decision,
+                candidates=candidates,
+                snapshot=snapshot,
+                observed_version=observed_version,
+            )
+
+    async def _compute_episode(
+        self,
+        root_event: SimEvent,
+        snapshot: WorldState,
+        candidates: list[BaseAgent],
+    ) -> tuple[
+        OrchestrationDecision,
+        list[BaseAgent],
+        list[AgentDecisionEnvelope | None],
+    ]:
         decision = await self._plan_episode(root_event, snapshot, candidates)
         selected = set(decision.selected_agent_ids)
         # 顺序仍取自 candidates（= 注册序）：TaskPlan.domain_tasks 本身就是按注册序
@@ -1132,19 +1206,7 @@ class AgentRuntime:
             for agent in agents
         ]
         evaluated = await asyncio.gather(*evaluation_tasks)
-
-        # 从这里往下是"发"：整段持号，按取号序（=根事件发布序）串行。
-        async with self.emission_gate.turn(ticket):
-            await self._emit_episode(
-                root_event=root_event,
-                agents=agents,
-                evaluated=list(evaluated),
-                run_id=run_id,
-                decision=decision,
-                candidates=candidates,
-                snapshot=snapshot,
-                observed_version=observed_version,
-            )
+        return decision, agents, list(evaluated)
 
     # --- §8.1 编排 ----------------------------------------------------------
 
@@ -1193,6 +1255,7 @@ class AgentRuntime:
         candidates: list[BaseAgent],
         snapshot: WorldState,
         observed_version: int,
+        perception_event: SimEvent | None = None,
     ) -> None:
         """episode 的**发射**阶段：本方法内发出的每一条事件都在持号期间。
 
@@ -1220,7 +1283,9 @@ class AgentRuntime:
         # 编排层的三环（感知 → 意图 → 任务拆分）先发，域 agent 的推理链挂在它下面：
         # §4.4「causal_parent 必须指向直接父事件」，而这一轮里域 agent 的直接父就是
         # 编排器的任务拆分，不是根事件本身。
-        episode_parent = await self._emit_orchestrator_prefix(root_event, decision)
+        episode_parent = await self._emit_orchestrator_prefix(
+            root_event, decision, perception_event=perception_event
+        )
 
         # S3-T6：编排器在场时，**前三环归编排器**，域 agent 不再各起一棵平行小树。
         # 审计 §六「episode 被稀释」说的就是旧形状：一条 correlation 下挂着 N 套同名的
@@ -1515,6 +1580,8 @@ class AgentRuntime:
         self,
         root_event: SimEvent,
         decision: OrchestrationDecision,
+        *,
+        perception_event: SimEvent | None = None,
     ) -> str:
         """编排层的三环事件，返回域 agent 推理链应当挂靠的父事件 id。
 
@@ -1530,26 +1597,28 @@ class AgentRuntime:
         scope_rooms = sorted(
             {room_id for task in context_view.domain_tasks for room_id in task.relevant_room_ids}
         )
-        perception = await self._emit_agent_event(
-            root_event=root_event,
-            agent_id=self.orchestrator.orchestrator_id,
-            event_type="reasoning.perception_snapshot",
-            causal_parent=root_event.event_id,
-            data={
-                "orchestrator_id": context_view.orchestrator_id,
-                "trigger_event_type": root_event.event_type,
-                "search_space_device_types": list(decision.rule_intent.device_types),
-                "search_space_resolved_from": decision.rule_intent.resolved_from,
-                "default_policy": decision.rule_intent.default_policy,
-                # event_schema_version=1.0 compatibility; remove only with a v2 migrator.
-                "world_summary": (
-                    f"{root_event.event_type} → 搜索空间 {len(scope_devices)} 台设备 / "
-                    f"{len(scope_rooms)} 个房间（{decision.rule_intent.resolved_from}）"
-                ),
-                "relevant_devices": scope_devices,
-                "relevant_rooms": scope_rooms,
-            },
-        )
+        perception = perception_event
+        if perception is None:
+            perception = await self._emit_agent_event(
+                root_event=root_event,
+                agent_id=self.orchestrator.orchestrator_id,
+                event_type="reasoning.perception_snapshot",
+                causal_parent=root_event.event_id,
+                data={
+                    "orchestrator_id": context_view.orchestrator_id,
+                    "trigger_event_type": root_event.event_type,
+                    "search_space_device_types": list(decision.rule_intent.device_types),
+                    "search_space_resolved_from": decision.rule_intent.resolved_from,
+                    "default_policy": decision.rule_intent.default_policy,
+                    # event_schema_version=1.0 compatibility; remove only with a v2 migrator.
+                    "world_summary": (
+                        f"{root_event.event_type} → 搜索空间 {len(scope_devices)} 台设备 / "
+                        f"{len(scope_rooms)} 个房间（{decision.rule_intent.resolved_from}）"
+                    ),
+                    "relevant_devices": scope_devices,
+                    "relevant_rooms": scope_rooms,
+                },
+            )
         intent_event = await self._emit_agent_event(
             root_event=root_event,
             agent_id=self.orchestrator.orchestrator_id,
@@ -1586,6 +1655,33 @@ class AgentRuntime:
             parent_id = fallback.event_id
 
         return parent_id
+
+    async def _emit_preplan_perception(
+        self, root_event: SimEvent, snapshot: WorldState
+    ) -> SimEvent:
+        device_ids = sorted(snapshot.devices)
+        room_ids = sorted(snapshot.rooms)
+        return await self._emit_agent_event(
+            root_event=root_event,
+            agent_id=self.orchestrator.orchestrator_id,
+            event_type="reasoning.perception_snapshot",
+            causal_parent=root_event.event_id,
+            data={
+                "orchestrator_id": self.orchestrator.orchestrator_id,
+                "trigger_event_type": root_event.event_type,
+                "search_space_device_types": sorted(
+                    {device.type for device in snapshot.devices.values()}
+                ),
+                "search_space_resolved_from": "observable_snapshot",
+                "default_policy": "pending_plan",
+                "world_summary": (
+                    f"{root_event.event_type} → 感知 {len(device_ids)} 台设备 / "
+                    f"{len(room_ids)} 个房间"
+                ),
+                "relevant_devices": device_ids,
+                "relevant_rooms": room_ids,
+            },
+        )
 
     async def _broadcast_pending_deltas(self, pending_deltas: list[DeltaChange]) -> None:
         """把本 episode 已落地的 delta 一次性广播（保持"一 episode 一条 STATE_DELTA"口径）。"""

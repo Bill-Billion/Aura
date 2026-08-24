@@ -1,4 +1,4 @@
-scenario_schema_version: "2.0"
+scenario_schema_version: "2.1"
 id: read_then_leave_001_dynamic
 name: 阅读照明动态反事实
 description: Agent 规划阅读照明后用户离开客厅，旧计划必须被重新验证。
@@ -26,13 +26,55 @@ counterfactual:
   variant: dynamic
   factor: resident_state_change
 
+shared_goal:
+  user_goal: 用户阅读期间客厅照明充足，且不控制无关房间。
+  relevant_room_ids: [living_room]
+  forbidden_room_ids: [bedroom]
+  safety_constraints: []
+
 perturbations:
   - type: resident_state_change
     phase: after_plan_before_execution
-    at_sim_time_s: 10
+    anchor:
+      event_type: reasoning.execution_plan
+      relation: same_correlation
+      occurrence: first
+    offset_seconds: 0
+    must_precede:
+      event_type: action.device_control
     user_id: user_01
     room_id: outside
     activity: away
+
+intervention_response:
+  trigger:
+    event_type: benchmark.perturbation_injected
+    where:
+      - path: data.perturbation_type
+        comparator: eq
+        value: resident_state_change
+  time_origin: trigger
+  expected_device_effects:
+    - device_id: light_living_01
+      within_seconds: 5
+      expected:
+        power: false
+  obligations:
+    language_version: "1.0"
+    properties:
+      - id: no_stale_reading_action
+        category: relevance
+        level: hard
+        description: 用户离开后不得继续执行原阅读照明计划。
+        expression:
+          op: never
+          operand:
+            op: event
+            event_type: action.device_control
+            where:
+              - path: data.device_id
+                comparator: eq
+                value: light_living_01
 
 initial_state:
   time_of_day: "20:00"

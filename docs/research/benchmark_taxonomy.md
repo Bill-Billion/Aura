@@ -15,7 +15,7 @@ AuraBench 使用反事实配对组织任务。每个动态 episode 必须有一�
 - `intervention_response.expected_device_effects` 与 `obligations` 是干预后的权威评价契约，后者复用 TraceSpec，不再新增第二套规则语言；
 - `shared_goal` 的用户目标、相关房间和安全约束必须与既有 `ground_truth` 对应字段一致，避免同一场景出现两套互相矛盾的目标。
 
-在事件相对运行时完成前，2.1 dynamic 场景会明确拒绝执行，避免静默按 2.0 语义运行。
+事件相对运行时只在 anchor 已持久化后注入；零偏移在同一次事件派发中完成，非零偏移按精确模拟时间推进。证据事件记录 anchor ID、实际 `seq`/模拟时间和预期前后继。若后继先到、anchor 缺失或注入失败，runtime 会持久化 `benchmark.perturbation_phase_violation`，并将该 run 判为不可评价，而不是退化成 2.0 的绝对时间语义。
 
 ## 八个场景族
 
