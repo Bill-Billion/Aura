@@ -15,6 +15,8 @@ AuraBench 使用反事实配对组织任务。每个动态 episode 必须有一�
 - `intervention_response.expected_device_effects` 与 `obligations` 是干预后的权威评价契约，后者复用 TraceSpec，不再新增第二套规则语言；
 - `shared_goal` 的用户目标、相关房间和安全约束必须与既有 `ground_truth` 对应字段一致，避免同一场景出现两套互相矛盾的目标。
 
+动态 run 的 episode 完整性、延迟、命令失败、fallback 和冲突仍按整段轨迹报告；用户意图、设备结果与轨迹性质则先折叠 trigger 时刻的设备状态，再只按 trigger-relative 后缀评价。报告中的 `metadata.intervention_response.metric_scopes` 明确记录这两种证据范围。
+
 事件相对运行时只在 anchor 已持久化后注入；零偏移在同一次事件派发中完成，非零偏移按精确模拟时间推进。证据事件记录 anchor ID、实际 `seq`/模拟时间和预期前后继。若后继先到、anchor 缺失或注入失败，runtime 会持久化 `benchmark.perturbation_phase_violation`，并将该 run 判为不可评价，而不是退化成 2.0 的绝对时间语义。
 
 首个 resident-state pilot 为 Lighting proposal 冻结有限的居民上下文 guard，并记录当前规则读取的 `time_of_day`；这不是完整 LLM prompt dependency set。runtime 在持久化 `reasoning.execution_plan` 后，以及每条命令进入执行器的最后同步边界，用最新可观测视图复核这些假设；任一共享假设失效，就持久化 `reasoning.decision_discarded` 并淘汰尚未执行的旧命令。安全根事件不受普通居民上下文假设约束。其他 Agent 的完整观测依赖随 observation-model 实验契约冻结，不在此处伪装成已覆盖。

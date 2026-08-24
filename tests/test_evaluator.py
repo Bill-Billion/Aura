@@ -544,6 +544,138 @@ def test_v2_report_exposes_final_state_blind_spot() -> None:
     assert report.trace_verification["hard_status"] == "fail"
 
 
+def test_dynamic_response_uses_trigger_relative_trace_suffix() -> None:
+    scenario = load_library([AURABENCH_PILOT_DIR])["read_then_leave_001_dynamic"]
+    events = [
+        event(
+            "user.starts_activity",
+            seq=0,
+            event_id="root",
+            parent=None,
+            sim_time_s=0,
+            data={"activity": "reading", "room_id": "living_room"},
+        ),
+        event(
+            "action.device_control",
+            seq=1,
+            event_id="pre-trigger-action",
+            parent="root",
+            sim_time_s=1,
+            data={
+                "device_id": "light_living_01",
+                "capability": "power",
+                "value": True,
+            },
+        ),
+        event(
+            "device.effect_applied",
+            seq=2,
+            event_id="turned-on",
+            parent="pre-trigger-action",
+            sim_time_s=1,
+            data={
+                "deltas": [
+                    {
+                        "path": "devices[light_living_01].state.power",
+                        "new_value": True,
+                    }
+                ]
+            },
+        ),
+        event(
+            "benchmark.perturbation_injected",
+            seq=3,
+            event_id="resident-left",
+            parent="root",
+            sim_time_s=10,
+            data={"perturbation_type": "resident_state_change"},
+        ),
+        event(
+            "device.effect_applied",
+            seq=4,
+            event_id="turned-off",
+            parent="resident-left",
+            sim_time_s=14,
+            data={
+                "deltas": [
+                    {
+                        "path": "devices[light_living_01].state.power",
+                        "new_value": False,
+                    }
+                ]
+            },
+        ),
+    ]
+
+    report = ScenarioEvaluator(scenario).evaluate(events)
+
+    unrecovered = ScenarioEvaluator(scenario).evaluate(events[:-1])
+    assert unrecovered.metrics.device_state_match_rate.value == 0.0
+    assert report.metrics.device_state_match_rate.value == 1.0
+    assert report.metrics.user_intent_satisfied.value is True
+    assert report.metrics.device_state_match_rate.details["fields"][0][
+        "last_change_sim_time_s"
+    ] == 4.0
+    assert report.trajectory_properties_satisfied is True
+    assert report.metadata["intervention_response"] == {
+        "trigger_event_id": "resident-left",
+        "trigger_seq": 3,
+        "trigger_sim_time_s": 10.0,
+        "evaluated_event_count": 2,
+        "time_origin": "trigger",
+        "metric_scopes": {
+            "whole_run": [
+                "episode_complete",
+                "first_action_latency_ms",
+                "command_failure_count",
+                "fallback_count",
+                "conflict_count",
+            ],
+            "trigger_relative": [
+                "user_intent_satisfied",
+                "device_state_match_rate",
+                "final_state_success",
+                "trajectory_properties_satisfied",
+                "trajectory_safe_success",
+            ],
+        },
+    }
+    assert len(report.provenance["evaluation_trace_spec_hash"]) == 64
+
+    stale = ScenarioEvaluator(scenario).evaluate(
+        events
+        + [
+            event(
+                "action.device_control",
+                seq=5,
+                event_id="post-trigger-stale-action",
+                parent="resident-left",
+                sim_time_s=15,
+                data={
+                    "device_id": "light_living_01",
+                    "capability": "power",
+                    "value": True,
+                },
+            )
+        ]
+    )
+    assert stale.trajectory_properties_satisfied is False
+
+
+def test_dynamic_response_without_unique_trigger_is_unevaluable() -> None:
+    scenario = load_library([AURABENCH_PILOT_DIR])["read_then_leave_001_dynamic"]
+
+    report = ScenarioEvaluator(scenario).evaluate(
+        [event("user.starts_activity", seq=0, event_id="root", parent=None)]
+    )
+
+    assert report.outcome is EvalOutcome.ERROR
+    assert report.failure_reasons == [
+        "intervention_response is unevaluable: intervention response trigger "
+        "must match exactly one event; matched 0"
+    ]
+
+
 def test_empty_effects_and_unknown_safety_constraint_do_not_default_pass() -> None:
     empty = MetricsCollector(
         events=[],
