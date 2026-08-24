@@ -26,6 +26,10 @@ class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class _FrozenStrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
 class ArtifactReference(_StrictModel):
     reference: str = Field(min_length=1)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -84,6 +88,28 @@ class PilotManifest(_StrictModel):
         return sorted(values, key=lambda item: item.group_id)
 
 
+class ValidatedPilotPair(_FrozenStrictModel):
+    group_id: str = Field(min_length=1)
+    pair_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    static_scenario_id: str = Field(min_length=1)
+    dynamic_scenario_id: str = Field(min_length=1)
+
+
+class ValidatedPilotBundle(_FrozenStrictModel):
+    """Typed, ordered projection of one fully validated pilot manifest."""
+
+    benchmark_id: str = Field(min_length=1)
+    matrix_contract_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    pair_set_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    gate_status: Literal["pending"]
+    manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    seeds: tuple[int, ...] = Field(min_length=1, max_length=256)
+    expected_cells: int = Field(gt=0)
+    pairs: tuple[ValidatedPilotPair, ...] = Field(
+        min_length=1, max_length=MAX_PILOT_PAIRS
+    )
+
+
 class ReviewerSlot(_StrictModel):
     slot: int = Field(ge=1, le=2)
     reviewer_id: None = None
@@ -102,12 +128,18 @@ class ReviewStatus(_StrictModel):
     reviewer_slots: list[ReviewerSlot] = Field(min_length=2, max_length=2)
 
 
-def _load_json(path: Path, model_type):
+def _load_json_with_bytes(path: Path, model_type):
+    encoded = _read_artifact_bytes(path)
     try:
-        raw = json.loads(_read_artifact_bytes(path))
+        raw = json.loads(encoded)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         raise ValueError(f"invalid JSON artifact {path}: {exc}") from exc
-    return model_type.model_validate(raw)
+    return model_type.model_validate(raw), encoded
+
+
+def _load_json(path: Path, model_type):
+    value, _ = _load_json_with_bytes(path, model_type)
+    return value
 
 
 def _read_artifact_bytes(path: Path) -> bytes:
@@ -204,11 +236,13 @@ def _validate_review_status(
     return status
 
 
-def validate_pilot_bundle(manifest_path: Path | str) -> dict[str, object]:
-    """Fail closed if scenarios, matrix, hashes, or review evidence drift."""
+def load_validated_pilot_bundle(
+    manifest_path: Path | str,
+) -> ValidatedPilotBundle:
+    """Validate a pilot bundle and return its immutable analysis projection."""
 
     manifest_path = Path(manifest_path).resolve()
-    manifest = _load_json(manifest_path, PilotManifest)
+    manifest, manifest_bytes = _load_json_with_bytes(manifest_path, PilotManifest)
     root = manifest_path.parent
 
     matrix_path = _resolve_artifact(root, manifest.matrix.reference)
@@ -278,14 +312,45 @@ def validate_pilot_bundle(manifest_path: Path | str) -> dict[str, object]:
         manifest=manifest, status_path=status_path
     )
 
+    return ValidatedPilotBundle(
+        benchmark_id=manifest.benchmark_id,
+        matrix_contract_hash=manifest.matrix.contract_hash,
+        pair_set_hash=manifest.pair_set_hash,
+        gate_status=review_status.gate_status,
+        manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+        seeds=tuple(manifest.seeds),
+        expected_cells=manifest.expected_cells,
+        pairs=tuple(
+            ValidatedPilotPair(
+                group_id=pair.group_id,
+                pair_fingerprint=pair.pair_fingerprint,
+                static_scenario_id=pair.static.scenario_id,
+                dynamic_scenario_id=pair.dynamic.scenario_id,
+            )
+            for pair in manifest.pairs
+        ),
+    )
+
+
+def validate_pilot_bundle(manifest_path: Path | str) -> dict[str, object]:
+    """Fail closed if scenarios, matrix, hashes, or review evidence drift."""
+
+    bundle = load_validated_pilot_bundle(manifest_path)
     return {
-        "benchmark_id": manifest.benchmark_id,
-        "pairs": len(pairs),
-        "seeds": len(manifest.seeds),
-        "cells": manifest.expected_cells,
-        "pair_set_hash": manifest.pair_set_hash,
-        "gate_status": review_status.gate_status,
+        "benchmark_id": bundle.benchmark_id,
+        "pairs": len(bundle.pairs),
+        "seeds": len(bundle.seeds),
+        "cells": bundle.expected_cells,
+        "pair_set_hash": bundle.pair_set_hash,
+        "gate_status": bundle.gate_status,
     }
 
 
-__all__ = ["PilotManifest", "ReviewStatus", "validate_pilot_bundle"]
+__all__ = [
+    "PilotManifest",
+    "ReviewStatus",
+    "ValidatedPilotBundle",
+    "ValidatedPilotPair",
+    "load_validated_pilot_bundle",
+    "validate_pilot_bundle",
+]

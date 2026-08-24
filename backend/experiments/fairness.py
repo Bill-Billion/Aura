@@ -218,6 +218,7 @@ class FairnessAudit:
     valid_groups: int
     invalid_groups: int
     invalid_reasons: dict[str, list[str]]
+    valid_group_ids: tuple[str, ...] = ()
     valid_cell_ids: tuple[str, ...] = ()
 
 
@@ -261,6 +262,7 @@ def audit_comparison_outputs(
         grouped[comparison_group_id(cell)].append(cell)
 
     valid = 0
+    valid_group_ids: list[str] = []
     valid_cell_ids: list[str] = []
     invalid_reasons: dict[str, list[str]] = {}
     for group_id, members in sorted(grouped.items()):
@@ -321,12 +323,14 @@ def audit_comparison_outputs(
             invalid_reasons[group_id] = reasons
         else:
             valid += 1
+            valid_group_ids.append(group_id)
             valid_cell_ids.extend(cell.cell_id for cell in members)
 
     return FairnessAudit(
         valid_groups=valid,
         invalid_groups=len(invalid_reasons),
         invalid_reasons=invalid_reasons,
+        valid_group_ids=tuple(sorted(valid_group_ids)),
         valid_cell_ids=tuple(sorted(valid_cell_ids)),
     )
 

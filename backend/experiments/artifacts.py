@@ -210,6 +210,43 @@ def _atomic_create_bytes(path: Path, encoded: bytes) -> Path:
     return path
 
 
+def atomic_create_bytes(
+    path: Path | str,
+    encoded: bytes,
+    *,
+    max_bytes: int,
+) -> Path:
+    """Create immutable evidence, accepting an existing byte-identical file."""
+
+    path = Path(path)
+    if len(encoded) > max_bytes:
+        raise ValueError(f"artifact exceeds {max_bytes} bytes: {path}")
+    absolute_parent = Path(os.path.abspath(path.parent))
+    directory_fd = os.open(os.path.sep, _DIRECTORY_FLAGS)
+    try:
+        for component in absolute_parent.parts[1:]:
+            try:
+                os.mkdir(component, mode=0o700, dir_fd=directory_fd)
+            except FileExistsError:
+                pass
+            child_fd = os.open(component, _DIRECTORY_FLAGS, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = child_fd
+        try:
+            _atomic_create_bytes_at(directory_fd, path.name, encoded)
+        except FileExistsError:
+            existing, _ = _read_regular_file_at(
+                directory_fd, path.name, max_bytes=max_bytes
+            )
+            if existing != encoded:
+                raise ValueError(
+                    f"artifact already exists with different contents: {path}"
+                )
+    finally:
+        os.close(directory_fd)
+    return path
+
+
 def _atomic_create_bytes_at(directory_fd: int, name: str, encoded: bytes) -> None:
     temp_name = f".{name}.{secrets.token_hex(8)}.tmp"
     descriptor = os.open(
@@ -466,6 +503,7 @@ __all__ = [
     "MAX_CELL_RESULT_BYTES",
     "MAX_RESOLVED_MATRIX_BYTES",
     "archive_cell_result",
+    "atomic_create_bytes",
     "atomic_create_json",
     "atomic_write_json",
     "cell_result_exists",

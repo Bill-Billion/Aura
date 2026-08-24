@@ -35,6 +35,24 @@ pilot 根目录还必须提交 `manifest.json`。manifest 冻结 matrix contract
 
 旧 ScenarioSpec 1.x 与历史工件必须继续可加载和重评；2.x 采用新增字段和新 major，不原地迁移或改写 v1 文件。未知 major 必须 fail closed。
 
+统计分析是独立阶段，不在 `run` 或 `summarize` 中隐式触发。原始模式先使用与全局汇总相同的 seal、run provenance 和 fairness gate，把有效 cell 投影为自包含的 `results-manifest.json`；离线模式只能读取这份密封清单，不能重新访问 run 目录。两个模式分别为：
+
+```bash
+python -m backend.experiments analyze \
+  --resolved-matrix <resolved-matrix.json> \
+  --result-root <experiment-root> \
+  --benchmark-manifest benchmarks/aurabench-dev/manifest.json \
+  --output <analysis-dir>
+
+python -m backend.experiments analyze \
+  --results-manifest <analysis-dir>/results-manifest.json \
+  --output <rebuild-dir>
+```
+
+同一 results manifest 必须字节级重建 `pair-level-results.jsonl`、`aggregate-results.json`、`bootstrap-samples.json`、`error-taxonomy.json`、主表、消融表和 figure data。`artifact-manifest.json` 最后创建并记录每个文件的 hash 和字节数；已有文件只接受 byte-identical 内容，禁止覆盖。human review 为 `pending` 时必须原样写入结果清单，不得伪造 approval。
+
+二元配对使用 exact McNemar 和 paired bootstrap 风险差，连续非正态配对使用 Wilcoxon signed-rank 和 bootstrap 配对差中位数，比例使用 Wilson 区间，多 baseline family 使用完整预注册的 Holm–Bonferroni。所有结果同时报告 effect、95% CI、`n` 和 invalid；缺失任一 arm 时整对不进入配对检验。Final-State Blind Spot 的两个 Wilson 分母分别是各 arm 中 `final_state_success=true` 的运行，不能因另一 arm 不满足终态而删除。
+
 ## 恢复与重试
 
 唯一运行键为：

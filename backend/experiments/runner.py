@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
@@ -106,6 +107,23 @@ class ConditionSummary(BaseModel):
 
 
 ConditionKey = tuple[str, str, str, str]
+
+
+@dataclass(frozen=True)
+class ValidatedMatrixResults:
+    """Full-matrix evidence admitted through the same gate as summarization."""
+
+    completed_outputs: dict[str, Mapping[str, Any]]
+    completed_artifacts: dict[str, CellResultArtifact]
+    fairness: FairnessAudit
+    completed: int
+    benchmark_pass: int
+    benchmark_fail: int
+    evaluation_error: int
+    execution_failed: int
+    invalid_artifacts: int
+    failed_cell_ids: tuple[str, ...]
+    by_condition: tuple[ConditionSummary, ...]
 
 
 def _condition_key(cell: ExperimentCell) -> ConditionKey:
@@ -516,13 +534,13 @@ class MatrixRunner:
         return summary
 
 
-def summarize_results(
+def collect_validated_results(
     matrix: ResolvedMatrix,
     *,
     output_dir: Path | str,
     validator: CompletedResultValidator,
-) -> MatrixSummary:
-    """Validate all result seals and write the cross-shard summary."""
+) -> ValidatedMatrixResults:
+    """Validate every cell artifact and retain the admitted scientific inputs."""
 
     root = Path(output_dir)
     if not callable(getattr(validator, "validate_completed", None)):
@@ -539,6 +557,7 @@ def summarize_results(
     invalid = 0
     failed_ids: list[str] = []
     completed_outputs: dict[str, Mapping[str, Any]] = {}
+    completed_artifacts: dict[str, CellResultArtifact] = {}
     by_condition = _condition_summaries(matrix.cells, matrix.cells)
     for cell in matrix.cells:
         if not cell_result_exists(root, cell.cell_id):
@@ -563,6 +582,7 @@ def summarize_results(
         ):
             completed += 1
             completed_outputs[cell.cell_id] = result.output or {}
+            completed_artifacts[cell.cell_id] = artifact
             outcome = _record_completed(
                 by_condition[_condition_key(cell)],
                 result.output or {},
@@ -597,36 +617,71 @@ def summarize_results(
         completed_outputs,
         expected_profiles=matrix.expected_runtime_profiles,
     )
+    return ValidatedMatrixResults(
+        completed_outputs=completed_outputs,
+        completed_artifacts=completed_artifacts,
+        fairness=fairness,
+        completed=completed,
+        benchmark_pass=benchmark_pass,
+        benchmark_fail=benchmark_fail,
+        evaluation_error=evaluation_error,
+        execution_failed=execution_failed,
+        invalid_artifacts=invalid,
+        failed_cell_ids=tuple(failed_ids),
+        by_condition=tuple(by_condition[key] for key in sorted(by_condition)),
+    )
+
+
+def summarize_results(
+    matrix: ResolvedMatrix,
+    *,
+    output_dir: Path | str,
+    validator: CompletedResultValidator,
+) -> MatrixSummary:
+    """Validate all result seals and write the cross-shard summary."""
+
+    root = Path(output_dir)
+    collected = collect_validated_results(
+        matrix,
+        output_dir=root,
+        validator=validator,
+    )
     (
         scientific_valid_cells,
         scientific_benchmark_pass,
         scientific_benchmark_fail,
-    ) = _scientific_counts(fairness, completed_outputs)
+    ) = _scientific_counts(
+        collected.fairness,
+        collected.completed_outputs,
+    )
 
     summary = MatrixSummary(
         matrix_id=matrix.matrix_id,
         matrix_hash=matrix.matrix_hash,
         planned=len(matrix.cells),
         selected=len(matrix.cells),
-        completed=completed,
+        completed=collected.completed,
         skipped=0,
-        benchmark_pass=benchmark_pass,
-        benchmark_fail=benchmark_fail,
-        evaluation_error=evaluation_error,
-        execution_failed=execution_failed,
+        benchmark_pass=collected.benchmark_pass,
+        benchmark_fail=collected.benchmark_fail,
+        evaluation_error=collected.evaluation_error,
+        execution_failed=collected.execution_failed,
         pending=(
-            len(matrix.cells) - completed - evaluation_error - execution_failed
+            len(matrix.cells)
+            - collected.completed
+            - collected.evaluation_error
+            - collected.execution_failed
         ),
-        invalid_artifacts=invalid,
+        invalid_artifacts=collected.invalid_artifacts,
         fairness_audited=True,
-        valid_baseline_groups=fairness.valid_groups,
-        invalid_baseline_groups=fairness.invalid_groups,
-        invalid_baseline_group_reasons=fairness.invalid_reasons,
+        valid_baseline_groups=collected.fairness.valid_groups,
+        invalid_baseline_groups=collected.fairness.invalid_groups,
+        invalid_baseline_group_reasons=collected.fairness.invalid_reasons,
         scientific_valid_cells=scientific_valid_cells,
         scientific_benchmark_pass=scientific_benchmark_pass,
         scientific_benchmark_fail=scientific_benchmark_fail,
-        failed_cell_ids=failed_ids,
-        by_condition=[by_condition[key] for key in sorted(by_condition)],
+        failed_cell_ids=list(collected.failed_cell_ids),
+        by_condition=list(collected.by_condition),
     )
     atomic_write_json(root / "summary.json", summary.model_dump(mode="json"))
     return summary
@@ -640,7 +695,9 @@ __all__ = [
     "MatrixRunError",
     "MatrixRunner",
     "MatrixSummary",
+    "ValidatedMatrixResults",
     "cell_shard_index",
+    "collect_validated_results",
     "select_shard",
     "shard_summary_path",
     "summarize_results",

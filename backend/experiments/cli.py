@@ -1,4 +1,4 @@
-"""Command-line interface for resolving, running, and summarizing matrices."""
+"""Command-line interface for matrix execution and reproducible analysis."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Sequence
 
 from .adapters import AuraCellExecutor
+from .analysis import AnalysisPlan, analyze_matrix_results, render_analysis_bundle
 from .artifacts import read_resolved_matrix, write_resolved_matrix
 from .pilot_bundle import validate_pilot_bundle
 from .resolve import load_and_resolve_matrix
@@ -42,6 +43,17 @@ def _parser() -> argparse.ArgumentParser:
     )
     summarize.add_argument("resolved_matrix", type=Path)
     summarize.add_argument("--output", type=Path, required=True)
+
+    analyze = commands.add_parser(
+        "analyze", help="seal validated results or rebuild paper artifacts"
+    )
+    analyze.add_argument("--resolved-matrix", type=Path)
+    analyze.add_argument("--result-root", type=Path)
+    analyze.add_argument("--benchmark-manifest", type=Path)
+    analyze.add_argument("--results-manifest", type=Path)
+    analyze.add_argument("--output", type=Path, required=True)
+    analyze.add_argument("--bootstrap-seed", type=int, default=0)
+    analyze.add_argument("--bootstrap-resamples", type=int, default=10_000)
 
     validate_pilot = commands.add_parser(
         "validate-pilot", help="validate a scientific pilot manifest"
@@ -87,6 +99,53 @@ def main(argv: Sequence[str] | None = None) -> int:
                 validator=AuraCellExecutor(data_root=args.output / "runs"),
             )
             payload = summary.model_dump(mode="json")
+        elif args.command == "analyze":
+            if args.results_manifest is not None:
+                if any(
+                    value is not None
+                    for value in (
+                        args.resolved_matrix,
+                        args.result_root,
+                        args.benchmark_manifest,
+                    )
+                ):
+                    raise ValueError(
+                        "--results-manifest rebuild mode forbids raw-result inputs"
+                    )
+                if args.bootstrap_seed != 0 or args.bootstrap_resamples != 10_000:
+                    raise ValueError(
+                        "manifest-only rebuild cannot override the sealed analysis plan"
+                    )
+                payload = render_analysis_bundle(
+                    args.results_manifest,
+                    output_dir=args.output,
+                )
+            else:
+                missing = [
+                    option
+                    for option, value in (
+                        ("--resolved-matrix", args.resolved_matrix),
+                        ("--result-root", args.result_root),
+                        ("--benchmark-manifest", args.benchmark_manifest),
+                    )
+                    if value is None
+                ]
+                if missing:
+                    raise ValueError(
+                        "raw analysis mode requires " + ", ".join(missing)
+                    )
+                matrix = read_resolved_matrix(args.resolved_matrix)
+                payload = analyze_matrix_results(
+                    matrix,
+                    result_root=args.result_root,
+                    validator=AuraCellExecutor(data_root=args.result_root / "runs"),
+                    benchmark_manifest=args.benchmark_manifest,
+                    output_dir=args.output,
+                    analysis_plan=AnalysisPlan(
+                        bootstrap_root_seed=args.bootstrap_seed,
+                        bootstrap_resamples=args.bootstrap_resamples,
+                    ),
+                )
         else:
             payload = validate_pilot_bundle(args.manifest)
             if args.require_approved and payload["gate_status"] != "approved":

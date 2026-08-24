@@ -304,6 +304,11 @@ class AuraCellExecutor:
         if not isinstance(metadata, dict):
             raise AdapterUnavailableError("completed run metadata is unavailable")
         evaluation = report.to_dict()
+        analysis_context = {
+            "counterfactual_group_id": metadata.get("counterfactual_group_id"),
+            "counterfactual_variant": metadata.get("counterfactual_variant"),
+            "scenario_category": getattr(spec, "category", None),
+        }
         qualification = (
             "mocked_pipeline_no_fixture"
             if cell.model == "mocked"
@@ -320,6 +325,7 @@ class AuraCellExecutor:
                 "experiment": experiment.model_dump(mode="json"),
                 "model_qualification": qualification,
                 "quality_baseline": False if cell.model == "mocked" else None,
+                "analysis_context": analysis_context,
                 "fairness": build_fairness_payload(
                     cell,
                     run_metadata=metadata,
@@ -345,7 +351,7 @@ class AuraCellExecutor:
             return False
         try:
             runtime_profile = self._validate_adapters(cell)
-            _, evaluation_dirs = self._load_scenario(cell)
+            spec, evaluation_dirs = self._load_scenario(cell)
             metadata = read_run_metadata(run_id, root=self.data_root)
             if not isinstance(metadata, dict):
                 return False
@@ -388,10 +394,16 @@ class AuraCellExecutor:
             scenario_dirs=evaluation_dirs or None,
         )
         evaluation = report.to_dict()
+        expected_analysis_context = {
+            "counterfactual_group_id": metadata.get("counterfactual_group_id"),
+            "counterfactual_variant": metadata.get("counterfactual_variant"),
+            "scenario_category": getattr(spec, "category", None),
+        }
         return (
             report.outcome is not EvalOutcome.ERROR
             and output.get("experiment") == expected_experiment
             and output.get("evaluation") == evaluation
+            and output.get("analysis_context") == expected_analysis_context
             and output.get("fairness")
             == build_fairness_payload(
                 cell,
