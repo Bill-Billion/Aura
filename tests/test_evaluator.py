@@ -487,7 +487,7 @@ def test_v2_state_evidence_uses_physical_effect_when_feedback_is_lost() -> None:
 
 
 def test_v2_report_exposes_final_state_blind_spot() -> None:
-    scenario = load_library([AURABENCH_PILOT_DIR])["read_then_leave_001_static"]
+    scenario = load_library([AURABENCH_PILOT_DIR])["single_feedback_loss_006_static"]
     events = [
         event(
             "user.starts_activity",
@@ -503,7 +503,11 @@ def test_v2_report_exposes_final_state_blind_spot() -> None:
             event_id="living-action",
             parent="root",
             sim_time_s=1,
-            data={"device_id": "light_living_01", "capability": "power", "value": True},
+            data={
+                "device_id": "light_living_01",
+                "capability": "brightness",
+                "value": 70,
+            },
         ),
         event(
             "device.effect_applied",
@@ -512,11 +516,9 @@ def test_v2_report_exposes_final_state_blind_spot() -> None:
             parent="living-action",
             sim_time_s=2,
             data={
+                "device_id": "light_living_01",
+                "capability": "brightness",
                 "deltas": [
-                    {
-                        "path": "devices[light_living_01].state.power",
-                        "new_value": True,
-                    },
                     {
                         "path": "devices[light_living_01].state.extra.brightness",
                         "new_value": 70,
@@ -545,15 +547,17 @@ def test_v2_report_exposes_final_state_blind_spot() -> None:
 
 
 def test_dynamic_response_uses_trigger_relative_trace_suffix() -> None:
-    scenario = load_library([AURABENCH_PILOT_DIR])["read_then_leave_001_dynamic"]
+    scenario = load_library([AURABENCH_PILOT_DIR])[
+        "unrelated_resident_activity_002_dynamic"
+    ]
     events = [
         event(
-            "user.starts_activity",
+            "user.enters_room",
             seq=0,
             event_id="root",
             parent=None,
             sim_time_s=0,
-            data={"activity": "reading", "room_id": "living_room"},
+            data={"user_id": "user_01", "to_room": "living_room"},
         ),
         event(
             "action.device_control",
@@ -563,39 +567,16 @@ def test_dynamic_response_uses_trigger_relative_trace_suffix() -> None:
             sim_time_s=1,
             data={
                 "device_id": "light_living_01",
-                "capability": "power",
-                "value": True,
+                "capability": "brightness",
+                "value": 55,
             },
         ),
         event(
             "device.effect_applied",
             seq=2,
-            event_id="turned-on",
+            event_id="pre-trigger-state",
             parent="pre-trigger-action",
             sim_time_s=1,
-            data={
-                "deltas": [
-                    {
-                        "path": "devices[light_living_01].state.power",
-                        "new_value": True,
-                    }
-                ]
-            },
-        ),
-        event(
-            "benchmark.perturbation_injected",
-            seq=3,
-            event_id="resident-left",
-            parent="root",
-            sim_time_s=10,
-            data={"perturbation_type": "resident_state_change"},
-        ),
-        event(
-            "device.effect_applied",
-            seq=4,
-            event_id="turned-off",
-            parent="resident-left",
-            sim_time_s=14,
             data={
                 "deltas": [
                     {
@@ -605,12 +586,67 @@ def test_dynamic_response_uses_trigger_relative_trace_suffix() -> None:
                 ]
             },
         ),
+        event(
+            "benchmark.perturbation_injected",
+            seq=3,
+            event_id="unrelated-change",
+            parent="root",
+            sim_time_s=10,
+            data={"perturbation_type": "resident_state_change"},
+        ),
+        event(
+            "user.activity_change",
+            seq=4,
+            event_id="activity-change",
+            parent="unrelated-change",
+            sim_time_s=10,
+            data={
+                "perturbation_type": "resident_state_change",
+                "user_id": "user_02",
+                "activity": "idle",
+            },
+        ),
+        event(
+            "action.device_control",
+            seq=5,
+            event_id="post-trigger-action",
+            parent="activity-change",
+            sim_time_s=11,
+            data={
+                "device_id": "light_living_01",
+                "capability": "brightness",
+                "value": 70,
+            },
+        ),
+        event(
+            "device.effect_applied",
+            seq=6,
+            event_id="comfort-restored",
+            parent="post-trigger-action",
+            sim_time_s=14,
+            data={
+                "deltas": [
+                    {
+                        "path": "devices[light_living_01].state.power",
+                        "new_value": True,
+                    },
+                    {
+                        "path": "devices[light_living_01].state.extra.brightness",
+                        "new_value": 70,
+                    },
+                    {
+                        "path": "devices[light_living_01].state.extra.color_temp",
+                        "new_value": 3000,
+                    },
+                ]
+            },
+        ),
     ]
 
     report = ScenarioEvaluator(scenario).evaluate(events)
 
     unrecovered = ScenarioEvaluator(scenario).evaluate(events[:-1])
-    assert unrecovered.metrics.device_state_match_rate.value == 0.0
+    assert unrecovered.metrics.device_state_match_rate.value < 1.0
     assert report.metrics.device_state_match_rate.value == 1.0
     assert report.metrics.user_intent_satisfied.value is True
     assert report.metrics.device_state_match_rate.details["fields"][0][
@@ -618,10 +654,10 @@ def test_dynamic_response_uses_trigger_relative_trace_suffix() -> None:
     ] == 4.0
     assert report.trajectory_properties_satisfied is True
     assert report.metadata["intervention_response"] == {
-        "trigger_event_id": "resident-left",
+        "trigger_event_id": "unrelated-change",
         "trigger_seq": 3,
         "trigger_sim_time_s": 10.0,
-        "evaluated_event_count": 2,
+        "evaluated_event_count": 4,
         "time_origin": "trigger",
         "metric_scopes": {
             "whole_run": [
@@ -642,24 +678,25 @@ def test_dynamic_response_uses_trigger_relative_trace_suffix() -> None:
     }
     assert len(report.provenance["evaluation_trace_spec_hash"]) == 64
 
-    stale = ScenarioEvaluator(scenario).evaluate(
-        events
+    wrong_physical_evidence = ScenarioEvaluator(scenario).evaluate(
+        events[:4]
         + [
             event(
-                "action.device_control",
-                seq=5,
-                event_id="post-trigger-stale-action",
-                parent="resident-left",
-                sim_time_s=15,
+                "user.activity_change",
+                seq=4,
+                event_id="activity-change",
+                parent="unrelated-change",
+                sim_time_s=10,
                 data={
-                    "device_id": "light_living_01",
-                    "capability": "power",
-                    "value": True,
+                    "perturbation_type": "resident_state_change",
+                    "user_id": "user_01",
+                    "activity": "idle",
                 },
             )
         ]
+        + events[5:]
     )
-    assert stale.trajectory_properties_satisfied is False
+    assert wrong_physical_evidence.trajectory_properties_satisfied is False
 
 
 def test_dynamic_response_without_unique_trigger_is_unevaluable() -> None:

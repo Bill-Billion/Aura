@@ -48,14 +48,15 @@ def test_explicit_v1_contract_fingerprint_is_unchanged() -> None:
 
 def test_pilot_library_dispatches_v2_and_validates_complete_pair() -> None:
     library = load_library([PILOT_DIR], validate_pairs=True)
-    assert set(library) == {
+    assert len(library) == 16
+    assert {
         "read_then_leave_001_static",
         "read_then_leave_001_dynamic",
-    }
+    } <= set(library)
     assert all(isinstance(spec, ScenarioSpecV2) for spec in library.values())
     static = library["read_then_leave_001_static"]
     assert static.summary()["counterfactual_group_id"] == "read_then_leave_001"
-    assert static.summary()["trace_property_count"] == 2
+    assert static.summary()["trace_property_count"] == 1
 
 
 def test_unknown_scenario_major_is_rejected() -> None:

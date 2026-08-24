@@ -1,11 +1,11 @@
 scenario_schema_version: "2.1"
-id: read_then_leave_001_static
-name: 客厅舒适照明静态对照
-description: 用户停留在客厅时，已规划的舒适照明正常执行。
-seed: 21001
-duration_seconds: 60
+id: unrelated_camera_failure_001_static
+name: 无关只读摄像头故障静态对照
+description: 用户进入客厅后的照明计划在无关摄像头保持在线时正常完成。
+seed: 21004
+duration_seconds: 10
 mode: observe
-family: user_nonstationarity
+family: device_failure_recovery
 split: dev
 difficulty: medium
 
@@ -13,23 +13,25 @@ home:
   topology_id: apartment_v1
   device_configuration_id: default_registry_v1
 
-residents:
-  - user_id: user_01
-    profile_id: resident_reader_v1
-    authority_level: adult
+residents: []
 
 observation_model:
   id: current_projector_v1
 
+noise_model:
+  device_offline:
+    probability: 0
+    recovery_probability: 0
+
 counterfactual:
-  group_id: read_then_leave_001
+  group_id: unrelated_camera_failure_001
   variant: static
-  factor: resident_state_change
+  factor: device_failure
 
 shared_goal:
-  user_goal: 用户停留在客厅时提供舒适照明；用户离开后不得继续执行旧计划。
+  user_goal: user_01 进入客厅时维持舒适照明，且无关只读摄像头故障不得污染照明决策。
   relevant_room_ids: [living_room]
-  forbidden_room_ids: []
+  forbidden_room_ids: [bedroom]
   safety_constraints: []
 
 perturbations: []
@@ -62,7 +64,7 @@ timeline:
 
 expected_device_effects:
   - device_id: light_living_01
-    within_seconds: 20
+    within_seconds: 5
     expected:
       power: true
       extra.brightness: 70
@@ -70,20 +72,19 @@ expected_device_effects:
 
 involved_agents:
   - lighting_agent
+  - security_agent
 
 success_criteria:
   require_complete_episode: false
-  max_command_failures: 0
   allow_fallback: true
 
 metrics:
-  - command_failure_count
   - device_state_match_rate
 
 ground_truth:
-  user_goal: 用户停留在客厅时提供舒适照明；用户离开后不得继续执行旧计划。
+  user_goal: user_01 进入客厅时维持舒适照明，且无关只读摄像头故障不得污染照明决策。
   primary_room_ids: [living_room]
-  relevant_device_ids: [light_living_01]
+  relevant_device_ids: [light_living_01, camera_entry_01]
   forbidden_device_ids: []
   required_agent_roles: [lighting]
   acceptable_noop: false
@@ -93,10 +94,10 @@ ground_truth:
 trace_spec:
   language_version: "1.0"
   properties:
-    - id: target_comfort_action_in_time
+    - id: entry_light_action_same_episode
       category: liveness
       level: hard
-      description: 用户进入客厅后 20 秒内应执行目标舒适亮度。
+      description: user_01 进入客厅后，同一 episode 应及时调整目标灯亮度。
       expression:
         op: after
         trigger:
@@ -106,15 +107,12 @@ trace_spec:
             - path: data.user_id
               comparator: eq
               value: user_01
-            - path: data.to_room
-              comparator: eq
-              value: living_room
         relation: same_correlation
         consequent:
           op: eventually
           window:
             start_seconds: 0
-            end_seconds: 20
+            end_seconds: 5
           operand:
             op: event
             event_type: action.device_control
@@ -128,8 +126,50 @@ trace_spec:
               - path: data.value
                 comparator: eq
                 value: 70
+    - id: entry_light_effect_same_episode
+      category: causality
+      level: hard
+      description: 目标灯亮度调整必须在同一 episode 产生物理效果。
+      expression:
+        op: after
+        trigger:
+          op: event
+          event_type: user.enters_room
+          where:
+            - path: data.user_id
+              comparator: eq
+              value: user_01
+        relation: same_correlation
+        consequent:
+          op: eventually
+          window:
+            start_seconds: 0
+            end_seconds: 5
+          operand:
+            op: event
+            event_type: device.effect_applied
+            where:
+              - path: data.device_id
+                comparator: eq
+                value: light_living_01
+              - path: data.capability
+                comparator: eq
+                value: brightness
+    - id: no_camera_control
+      category: safety
+      level: hard
+      description: 只读摄像头不得收到控制动作。
+      expression:
+        op: never
+        operand:
+          op: event
+          event_type: action.device_control
+          where:
+            - path: data.device_id
+              comparator: eq
+              value: camera_entry_01
 
 benchmark:
-  template_id: read_then_leave
+  template_id: unrelated_camera_failure
   generator_version: "1.0"
   query_paraphrase_id: 0

@@ -1,0 +1,25 @@
+{
+  "review_status_schema_version": "1.0",
+  "benchmark_id": "aurabench_dev_pilot",
+  "pair_set_hash": "a4e1e42c490650dab491581b828aae07c74e9a5335e9afc84ec81b0fd6d8c7da",
+  "source_revision": null,
+  "gate_status": "pending",
+  "reviewer_slots": [
+    {
+      "slot": 1,
+      "reviewer_id": null,
+      "status": "unassigned",
+      "submitted_at": null,
+      "artifact_reference": null,
+      "artifact_sha256": null
+    },
+    {
+      "slot": 2,
+      "reviewer_id": null,
+      "status": "unassigned",
+      "submitted_at": null,
+      "artifact_reference": null,
+      "artifact_sha256": null
+    }
+  ]
+}

@@ -6,6 +6,24 @@ from backend.experiments.cli import main
 
 
 def test_cli_resolve_and_summarize(tmp_path, capsys) -> None:
+    exit_code = main(
+        ["validate-pilot", "benchmarks/aurabench-dev/manifest.json"]
+    )
+    assert exit_code == 0
+    validation = json.loads(capsys.readouterr().out)
+    assert validation["pairs"] == 8
+    assert validation["gate_status"] == "pending"
+
+    exit_code = main(
+        [
+            "validate-pilot",
+            "benchmarks/aurabench-dev/manifest.json",
+            "--require-approved",
+        ]
+    )
+    assert exit_code == 1
+    assert "not approved" in capsys.readouterr().err
+
     output = tmp_path / "experiment"
     exit_code = main(
         [
@@ -19,13 +37,13 @@ def test_cli_resolve_and_summarize(tmp_path, capsys) -> None:
     resolved = output / "resolved-matrix.json"
     assert resolved.is_file()
     payload = json.loads(capsys.readouterr().out)
-    assert payload["cells"] == 8
+    assert payload["cells"] == 48
 
     exit_code = main(["summarize", str(resolved), "--output", str(output)])
     assert exit_code == 0
     summary = json.loads(capsys.readouterr().out)
     assert summary["completed"] == 0
-    assert summary["pending"] == 8
+    assert summary["pending"] == 48
 
 
 def test_cli_reports_invalid_input_without_traceback(tmp_path, capsys) -> None:

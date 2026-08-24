@@ -1,23 +1,35 @@
 matrix_schema_version: "1.0"
 matrix_id: aurabench_dev_pilot
 
-# A deliberately small, real-runtime pilot: the static/dynamic pair is crossed
-# with the two zero-cost deterministic model modes and two repetitions.  The
-# remaining axes are fixed to the only adapters implemented by this PR.
+# Eight counterfactual pairs crossed with three frozen seeds. The remaining
+# axes stay fixed so this pilot measures scenario dynamics, not system variants.
 axes:
   scenario:
+    - episodes/comfort_smoke_preemption_static.yaml
+    - episodes/comfort_smoke_preemption_dynamic.yaml
+    - episodes/partial_feedback_loss_static.yaml
+    - episodes/partial_feedback_loss_dynamic.yaml
     - episodes/read_then_leave_static.yaml
     - episodes/read_then_leave_dynamic.yaml
-  seed: [21001]
-  model: [rule_based, mocked]
+    - episodes/single_feedback_loss_static.yaml
+    - episodes/single_feedback_loss_dynamic.yaml
+    - episodes/target_failure_before_execution_static.yaml
+    - episodes/target_failure_before_execution_dynamic.yaml
+    - episodes/target_failure_during_execution_static.yaml
+    - episodes/target_failure_during_execution_dynamic.yaml
+    - episodes/unrelated_camera_failure_static.yaml
+    - episodes/unrelated_camera_failure_dynamic.yaml
+    - episodes/unrelated_resident_activity_static.yaml
+    - episodes/unrelated_resident_activity_dynamic.yaml
+  seed: [21001, 21002, 21003]
+  model: [rule_based]
   topology: [domain_multi]
   governance: [aura]
   observation: [stale_offline]
-  repetition: [0, 1]
+  repetition: [0]
 
 exclude: []
-max_cells: 8
+max_cells: 48
 max_total_cost_usd: 0.0
 cost_per_model_usd:
   rule_based: 0.0
-  mocked: 0.0

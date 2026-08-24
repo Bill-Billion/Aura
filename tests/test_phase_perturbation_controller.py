@@ -335,7 +335,7 @@ async def test_dynamic_pilot_persists_anchor_evidence_and_physical_change() -> N
         for item in discarded.data["invalidated_assumptions"]
     } == {
         "rooms[living_room].occupancy": (True, False, False),
-        "users[user_01].activity": ("reading", "away", False),
+        "users[user_01].activity": ("relaxing", "away", False),
         "users[user_01].location.room": ("living_room", None, False),
     }
     assert discarded.data["discarded_commands"] == plan.data["commands"]
@@ -354,7 +354,7 @@ async def test_dynamic_pilot_persists_anchor_evidence_and_physical_change() -> N
     )
     assert runner.state_manager.world.users["user_01"].location is None
     assert runner.state_manager.world.users["user_01"].activity == "away"
-    assert runner.state_manager.world.devices["light_living_01"].state.power is False
+    assert runner.state_manager.world.devices["light_living_01"].state.power is True
 
 
 @pytest.mark.anyio
@@ -504,7 +504,7 @@ async def test_before_perception_injects_before_observable_snapshot() -> None:
     spec = _phase_spec(
         "resident_state_change",
         "before_perception",
-        "user.starts_activity",
+        "user.enters_room",
         "reasoning.perception_snapshot",
     )
     from backend.main import _init_default_state
@@ -515,7 +515,7 @@ async def test_before_perception_injects_before_observable_snapshot() -> None:
     planned_activities: list[str | None] = []
 
     async def plan_from_post_intervention_snapshot(root_event, snapshot, candidates):
-        if root_event.event_type == "user.starts_activity":
+        if root_event.event_type == "user.enters_room":
             planned_activities.append(snapshot.users["user_01"].activity)
         return await original_plan(root_event, snapshot, candidates)
 
@@ -529,7 +529,7 @@ async def test_before_perception_injects_before_observable_snapshot() -> None:
 
         history = engine.event_bus.get_history()
         root = next(
-            event for event in history if event.event_type == "user.starts_activity"
+            event for event in history if event.event_type == "user.enters_room"
         )
         evidence = next(
             event
@@ -731,7 +731,7 @@ async def test_device_deadline_can_create_an_earlier_nonzero_phase_deadline() ->
                 source=CommandSource.SCENARIO,
                 device_id="light_living_01",
                 capability="power",
-                value=True,
+                value=False,
             ),
             publish=engine._publish_sim_event,
         )
