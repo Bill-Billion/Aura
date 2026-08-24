@@ -9,6 +9,7 @@ import pytest
 
 from backend.experiments.pilot_bundle import (
     MAX_PILOT_ARTIFACT_BYTES,
+    load_validated_pilot_bundle,
     validate_pilot_bundle,
 )
 from backend.experiments.resolve import load_matrix_file
@@ -33,6 +34,36 @@ def test_committed_scientific_pilot_bundle_is_complete_and_pending_review() -> N
         "pair_set_hash": "a4e1e42c490650dab491581b828aae07c74e9a5335e9afc84ec81b0fd6d8c7da",
         "gate_status": "pending",
     }
+
+
+def test_load_validated_pilot_bundle_returns_sealed_ordered_pair_projection() -> None:
+    manifest_path = PILOT_ROOT / "manifest.json"
+    bundle = load_validated_pilot_bundle(manifest_path)
+
+    assert bundle.benchmark_id == "aurabench_dev_pilot"
+    assert bundle.matrix_contract_hash == load_matrix_file(
+        PILOT_ROOT / "matrix.yaml"
+    ).contract_hash()
+    assert bundle.pair_set_hash == (
+        "a4e1e42c490650dab491581b828aae07c74e9a5335e9afc84ec81b0fd6d8c7da"
+    )
+    assert bundle.gate_status == "pending"
+    assert bundle.manifest_sha256 == hashlib.sha256(
+        manifest_path.read_bytes()
+    ).hexdigest()
+    assert bundle.seeds == (21001, 21002, 21003)
+    assert bundle.expected_cells == 48
+    assert [pair.group_id for pair in bundle.pairs] == sorted(
+        pair.group_id for pair in bundle.pairs
+    )
+    read_then_leave = next(
+        pair for pair in bundle.pairs if pair.group_id == "read_then_leave_001"
+    )
+    assert read_then_leave.pair_fingerprint == (
+        "33a9363862a3bf9f7f31817775678b7d86697c6844eadf5a700a110b81bdcd0e"
+    )
+    assert read_then_leave.static_scenario_id == "read_then_leave_001_static"
+    assert read_then_leave.dynamic_scenario_id == "read_then_leave_001_dynamic"
 
 
 def test_pilot_bundle_rejects_oversized_manifest(tmp_path: Path) -> None:
