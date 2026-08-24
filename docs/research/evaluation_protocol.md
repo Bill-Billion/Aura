@@ -23,6 +23,16 @@ TraceSpec 1.0 是结构化有限轨迹语言，只允许 `always`、`never`、`e
 
 需要触发条件的规则默认不允许空轨迹自动通过。证据不足、缺少模拟时间或事件图损坏时返回 error/unevaluable，不得静默 PASS。
 
+所有窗口均为闭区间，只读取 `sim_time_s`；同一模拟时刻按 `seq` 决定先后。`after` 的后继必须严格位于触发事件之后，`start_seconds=0` 只允许匹配同一模拟时刻但 `seq` 更大的事件。`after` 对每一个触发事件都执行检查；没有触发事件时为 unevaluable。`always` 的空检查域同样为 unevaluable，`eventually` 空域为 fail，`never` 空域为 pass，`count` 空域按计数 0 正常比较。
+
+`always` 与 `until` 采用 event-sampled 语义：它们检查有限轨迹中的事件采样点，不对两个事件之间的连续物理状态作额外推断。设备和居民队列会在关闭时间区间的 `system.timer_tick` 发布前按 deadline 排空，因此同一 tick 的到期事件可以位于该 tick 事件之前；消费者不得假设 timer tick 是这个时间点的第一条事件。
+
+验证器使用 `PASS / FAIL / UNEVALUABLE` 三态。任一 hard property 为 FAIL 时，`trajectory_properties_satisfied=false`；没有 FAIL 但存在 UNEVALUABLE 时，该字段为 null 且整个评价为 error。soft property 只进入明细，不改变 hard success。
+
+每条属性都输出稳定的最小 witness 或 counterexample：`eventually` 选择最早匹配，`never`/`always` 选择最早反例，`after` 记录最早失败触发及关系证据，`until` 记录最早 terminal 或首个条件断点，`count` 只保留足以决定比较结果的最早事件集合。因果关系验证使用 persisted `causal_parent` 图，不读取运行时对象或故障 oracle。
+
+v2 终态由 `device.effect_applied.data.deltas` 重建，反馈丢失不改变物理真值；历史 v1 工件继续从 `feedback.state_delta` 重建，保证旧报告语义不漂移。
+
 ## 主要指标
 
 - RQ1：static 与 dynamic 的配对 `trajectory_safe_success` 差值；

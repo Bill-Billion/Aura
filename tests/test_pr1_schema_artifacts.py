@@ -53,6 +53,13 @@ async def test_v2_artifact_persists_pair_and_trace_provenance_and_is_evaluable()
     report = evaluate_run(result.run_id, scenario_dirs=[PILOT_DIR])
     assert report.outcome is not EvalOutcome.ERROR
     assert report.provenance["scenario_schema_version"] == "2.0"
+    assert report.final_state_success is not None
+    assert report.trajectory_properties_satisfied is not None
+    assert report.trajectory_safe_success == (
+        report.final_state_success and report.trajectory_properties_satisfied
+    )
+    assert report.trace_verification is not None
+    assert report.trace_verification["hard_status"] in {"pass", "fail"}
 
 
 @pytest.mark.anyio
@@ -130,3 +137,17 @@ async def test_unknown_scenario_major_in_artifact_is_an_evaluation_error() -> No
     report = evaluate_run(result.run_id)
     assert report.outcome is EvalOutcome.ERROR
     assert "unknown major" in report.failure_reasons[0]
+
+
+@pytest.mark.anyio
+async def test_v2_trace_spec_hash_drift_is_an_evaluation_error() -> None:
+    static = load_library([PILOT_DIR])["read_then_leave_001_static"]
+    result = await run_scenario(static)
+    metadata_path = run_dir(result.run_id) / RUN_METADATA_FILENAME
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["trace_spec_hash"] = "0" * 64
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    report = evaluate_run(result.run_id, scenario_dirs=[PILOT_DIR])
+    assert report.outcome is EvalOutcome.ERROR
+    assert "TraceSpec evaluation contract drift" in report.failure_reasons[0]

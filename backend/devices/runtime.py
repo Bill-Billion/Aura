@@ -49,6 +49,10 @@ class DeviceRuntime:
     def bind_driver(self, driver: DeviceRuntimeDriver) -> None:
         self.driver = driver
 
+    @property
+    def next_due_at_s(self) -> float | None:
+        return self.scheduler.next_due_at_s
+
     def schedule(
         self,
         record: CommandRecord,

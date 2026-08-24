@@ -22,6 +22,12 @@ from backend.evaluation.metrics import (
     compute_user_intent_satisfied,
     compute_device_state_match_rate,
 )
+from backend.evaluation.temporal import (
+    PropertyVerification,
+    TraceVerification,
+    VerificationStatus,
+    verify_trace,
+)
 from backend.evaluation.suite import (
     SeedSet,
     SuiteReport,
@@ -39,6 +45,9 @@ __all__ = [
     "SeedSet",
     "SuiteReport",
     "SuiteRunner",
+    "PropertyVerification",
+    "TraceVerification",
+    "VerificationStatus",
     "compute_episode_complete",
     "compute_first_action_latency_ms",
     "compute_command_failure_count",
@@ -48,4 +57,5 @@ __all__ = [
     "compute_device_state_match_rate",
     "evaluate_run",
     "run_suite",
+    "verify_trace",
 ]
