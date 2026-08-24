@@ -123,6 +123,25 @@ def test_trace_spec_rejects_untyped_formula_unknown_operator_and_bad_conditions(
                 "where": [{"path": "data.device_id", "comparator": "in", "value": "x"}],
             }
         )
+    with pytest.raises(ValidationError, match="non-empty"):
+        EventSelector.model_validate(
+            {
+                "event_type": "x",
+                "where": [
+                    {"path": "data.device_id", "comparator": "in", "value": []}
+                ],
+            }
+        )
+    for value in (float("nan"), float("inf"), [float("-inf")]):
+        with pytest.raises(ValidationError, match="finite"):
+            EventSelector.model_validate(
+                {
+                    "event_type": "x",
+                    "where": [
+                        {"path": "data.value", "comparator": "eq", "value": value}
+                    ],
+                }
+            )
 
 
 def test_trace_spec_rejects_duplicate_ids_and_invalid_windows() -> None:

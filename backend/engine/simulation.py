@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import math
 import time
+from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import Any, Iterable, Literal, Mapping
+from typing import Any, Literal
 
 from backend.agents.llm import LLMProvider
 from backend.agents.llm_modes import resolve_mode_for_provider
@@ -22,7 +23,6 @@ from backend.devices.latency import (
 )
 from backend.engine.event_bus import EventBus, SimEvent, WorldEvent
 from backend.engine.event_log import RunArtifactRecorder, attach_run_artifacts
-from backend.engine.provenance import ExperimentProvenance, ExperimentRuntimeSelection
 from backend.engine.event_types import (
     ENGINE_ERROR_EVENT_TYPE,
     ENVIRONMENT_STATE_REFRESH,
@@ -31,6 +31,7 @@ from backend.engine.event_types import (
     USER_ACTIVITY_CHANGE,
     USER_MOVEMENT_EVENT_TYPES,
 )
+from backend.engine.provenance import ExperimentProvenance, ExperimentRuntimeSelection
 from backend.engine.rng import SimRandom, validate_seed
 from backend.engine.run_manager import (
     RunManager,
@@ -53,6 +54,8 @@ from backend.execution.executor import (
     InvariantReportDebounce,
 )
 from backend.models.schemas import BaselinePolicy, WSMessage
+from backend.residents import ResidentEngine
+from backend.residents.policy import RESPONSIVE_EVENT_TYPES
 from backend.scenarios.apply import apply_scenario_initial_state
 from backend.scenarios.fingerprint import (
     scenario_contract_fingerprint,
@@ -71,10 +74,9 @@ from backend.scenarios.spec_v2 import (
     ScenarioSpecV2,
     apply_compiled_perturbations,
     compile_perturbations,
+    unavailable_perturbation_capabilities,
     unsupported_perturbations,
 )
-from backend.residents import ResidentEngine
-from backend.residents.policy import RESPONSIVE_EVENT_TYPES
 from backend.simulators.environment import EnvironmentSimulator
 from backend.simulators.user_behavior import UserBehaviorSimulator
 
@@ -97,16 +99,19 @@ class PerturbationRuntimeUnavailableError(RuntimeError):
 
     def __init__(self, spec: ScenarioSpecV2) -> None:
         unsupported = unsupported_perturbations(spec)
+        unavailable = unavailable_perturbation_capabilities(spec)
+        event_relative = [item for item in spec.perturbations if item.anchor is not None]
         self.scenario_id = spec.id
         self.unsupported_perturbation_types = tuple(
             sorted({item.type for item in unsupported})
         )
         self.unsupported_perturbation_phases = tuple(
-            sorted({item.phase for item in unsupported})
+            sorted({item.phase for item in event_relative})
         )
+        self.unavailable_runtime_capabilities = unavailable
         self.message = (
-            f"scenario {spec.id!r} declares perturbations, but this runtime "
-            "does not have perturbation consumers"
+            f"scenario {spec.id!r} declares perturbation contracts unsupported "
+            "by this runtime"
         )
         super().__init__(self.message)
 
@@ -121,6 +126,9 @@ class PerturbationRuntimeUnavailableError(RuntimeError):
                 ),
                 "unsupported_perturbation_phases": list(
                     self.unsupported_perturbation_phases
+                ),
+                "unavailable_runtime_capabilities": list(
+                    self.unavailable_runtime_capabilities
                 ),
             },
         }
@@ -469,7 +477,10 @@ class SimulationEngine:
         # 解析放在最前面：未知场景 id 必须在 pause/取消/换世界**之前**被拒，
         # 否则一次拼错的启动会把正在跑的 run 拆掉再报错。
         spec = resolve_run_scenario(scenario, dirs=scenario_dirs)
-        if isinstance(spec, ScenarioSpecV2) and unsupported_perturbations(spec):
+        if isinstance(spec, ScenarioSpecV2) and (
+            unsupported_perturbations(spec)
+            or unavailable_perturbation_capabilities(spec)
+        ):
             raise PerturbationRuntimeUnavailableError(spec)
         compiled_perturbations = (
             compile_perturbations(spec)
