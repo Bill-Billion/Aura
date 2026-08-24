@@ -52,6 +52,7 @@ runner 每拍之后 ``wait_for_idle``，因此跨拍不会交错；但同一拍�
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import time
 from collections.abc import Awaitable, Callable
@@ -59,7 +60,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from backend.agents.arbiter import (
-    ARBITER_ID,
     COORDINATION_DECISION_EVENT_TYPE,
     Arbiter,
     ArbiterResult,
@@ -68,8 +68,17 @@ from backend.agents.arbiter import (
     RejectedCommand,
 )
 from backend.agents.base import BaseAgent
-from backend.agents.contracts import AgentProposal, DomainTask, RootEventContext
+from backend.agents.contracts import (
+    AgentProposal,
+    ConfidenceSource,
+    DomainTask,
+    ProposalOutcome,
+    RootEventContext,
+    TaskPlan,
+)
 from backend.agents.energy import EnergyAgent
+from backend.agents.generalist import SINGLE_DIRECT_AGENT_ID, SingleDirectAgent
+from backend.agents.governance import ProposalResolver, build_governance_resolver
 from backend.agents.hvac import HVACAgent
 from backend.agents.lighting import LightingAgent
 from backend.agents.scene import SceneAgent
@@ -78,6 +87,7 @@ from backend.agents.orchestrator import (
     DomainAgentBinding,
     HomeOrchestratorAgent,
     OrchestrationDecision,
+    RuleIntent,
 )
 from backend.agents.llm import (
     AnthropicCompatibleProvider,
@@ -119,6 +129,11 @@ from backend.engine.event_log import (
     read_run_metadata,
     run_dir,
 )
+from backend.engine.provenance import (
+    ExperimentRuntimeSelection,
+    ResearchRuntimeProfile,
+    research_runtime_profile_for_axes,
+)
 from backend.engine.event_types import (
     ENVIRONMENT_STATE_REFRESH,
     starts_agent_episode,
@@ -128,6 +143,7 @@ from backend.engine.run_manager import (
     STALE_RUN_DISCARD_EVENT_TYPE,
     STALE_RUN_DISCARD_REASON,
     baseline_policy_for_llm_mode,
+    canonical_json,
     effective_llm_mode_for_policy,
 )
 from backend.engine.state import AgentRuntimeState, WorldState
@@ -343,6 +359,23 @@ class _OpenedProposal:
     records: list[tuple[ArbitratedCommand, CommandRecord]]
 
 
+@dataclass(frozen=True)
+class _SequentialProposal:
+    envelope: AgentDecisionEnvelope
+    proposal: AgentProposal
+    execution_event_id: str
+    commands: tuple[ArbitratedCommand, ...]
+    device_versions: dict[str, int]
+
+
+@dataclass(frozen=True)
+class _SingleControllerAuditActor:
+    """Identity-only trace scaffold; it never plans or calls a provider."""
+
+    orchestrator_id: str = SINGLE_DIRECT_AGENT_ID
+    name: str = "Single Direct Controller"
+
+
 class TriggerClassifier:
     """Decide whether a root event should start a new agent episode.
 
@@ -410,6 +443,10 @@ class AgentRuntime:
         log.info("llm_mode_resolved", **llm_mode_health(self.llm_provider))
         self.memory_store = memory_store or AgentMemoryStore()
         self.arbiter = arbiter or Arbiter()
+        self.active_experiment_runtime: ExperimentRuntimeSelection | None = None
+        self.governance_resolver: ProposalResolver = build_governance_resolver(
+            "aura", arbiter=self.arbiter
+        )
         # 仲裁门（S3-T5）：命令的 proposed→approved|rejected 都经它，且它就是装在
         # S1 预留的 ``submit(..., pre_submit=…)`` 接缝上的那个实现。UI 腿（main.py）与
         # agent 腿共用**同一台**，否则用户占用登记在一台、agent 仲裁读另一台，
@@ -701,6 +738,60 @@ class AgentRuntime:
             self._subscribe_handlers()
         elif self.event_bus is not None:
             self._refresh_subscriptions()
+
+    def activate_experiment_runtime(
+        self,
+        selection: ExperimentRuntimeSelection | None,
+    ) -> None:
+        """Install one sealed research profile after old episode work is drained."""
+
+        if any(not task.done() for task in self._background_tasks):
+            raise RuntimeError("cannot change research profile while episodes are active")
+
+        self._unsubscribe_handlers()
+        previous_agent_ids = {agent.agent_id for agent in self.agents}
+        self.agents.clear()
+        if selection is not None and selection.runtime_profile is ResearchRuntimeProfile.SINGLE_DIRECT:
+            self.agents.append(SingleDirectAgent())
+            self.orchestrator = _SingleControllerAuditActor()
+            governance = selection.governance
+        else:
+            self.agents.extend(build_default_agents())
+            self.orchestrator = HomeOrchestratorAgent()
+            governance = selection.governance if selection is not None else "aura"
+
+        self.governance_resolver = build_governance_resolver(
+            governance,
+            arbiter=self.arbiter,
+        )
+        self.active_experiment_runtime = selection
+        if self.state_manager is not None:
+            active_agent_ids = {agent.agent_id for agent in self.agents}
+            for agent_id in previous_agent_ids - active_agent_ids:
+                self.state_manager.world.agents.pop(agent_id, None)
+        self._subscribe_handlers()
+
+    def _effective_runtime_profile(self) -> ResearchRuntimeProfile:
+        """Derive the active treatment from installed objects, never metadata."""
+
+        selection = self.active_experiment_runtime
+        if selection is None:
+            return ResearchRuntimeProfile.AURA
+        active_ids = tuple(agent.agent_id for agent in self.agents)
+        if active_ids == (SINGLE_DIRECT_AGENT_ID,):
+            topology = "single"
+        else:
+            default_ids = tuple(factory().agent_id for factory in DEFAULT_AGENT_FACTORIES)
+            if active_ids != default_ids:
+                raise RuntimeError(
+                    "active agent topology does not match a sealed research profile"
+                )
+            topology = "domain_multi"
+        return research_runtime_profile_for_axes(
+            topology=topology,
+            governance=self.governance_resolver.strategy_id,
+            observation=selection.observation,
+        )
 
     def bind(
         self,
@@ -1242,6 +1333,13 @@ class AgentRuntime:
         "orchestrator 不写世界"不是靠约定：它手上根本没有真世界的引用。
         """
 
+        if (
+            self.active_experiment_runtime is not None
+            and self.active_experiment_runtime.runtime_profile
+            is ResearchRuntimeProfile.SINGLE_DIRECT
+        ):
+            return self._single_controller_audit_plan(root_event, snapshot, agents)
+
         context = RootEventContext.from_observable_world(
             root_event=root_event,
             observable_world=snapshot,
@@ -1258,6 +1356,57 @@ class AgentRuntime:
                 f"recorded orchestrator integrity failure: {decision.plan.fallback_reason}"
             )
         return decision
+
+    @staticmethod
+    def _single_controller_audit_plan(
+        root_event: SimEvent,
+        snapshot: WorldState,
+        agents: list[BaseAgent],
+    ) -> OrchestrationDecision:
+        """Describe a direct episode without adding a second decision-maker."""
+
+        if len(agents) != 1 or agents[0].agent_id != SINGLE_DIRECT_AGENT_ID:
+            raise RuntimeError(
+                "single_direct requires exactly one registered direct controller"
+            )
+        agent = agents[0]
+        priority = agent.proposal_priority(snapshot, root_event)
+        task = DomainTask(
+            agent_role="generalist",
+            task="evaluate the root event directly without delegation",
+            # Empty means audit-only: BaseAgent must not narrow the controller's
+            # own observation or command surface through this trace scaffold.
+            relevant_device_ids=[],
+            relevant_room_ids=[],
+            priority=priority,
+        )
+        intent = agent.proposal_intent(snapshot, root_event)
+        rule_intent = RuleIntent(
+            intent=intent,
+            domain="generalist",
+            priority=priority,
+            confidence=1.0,
+            resolved_from="single_controller_audit",
+            default_policy="controller decides directly",
+            device_types=tuple(agent.get_controlled_device_types()),
+        )
+        return OrchestrationDecision(
+            plan=TaskPlan(
+                orchestrator_id=SINGLE_DIRECT_AGENT_ID,
+                intent=intent,
+                confidence=1.0,
+                confidence_source=ConfidenceSource.RULE_BASED,
+                domain_tasks=[task],
+            ),
+            outcome=ProposalOutcome.ACTED,
+            min_confidence=0.0,
+            rule_intent=rule_intent,
+            llm_mode=LLMMode.RULE_BASED.value,
+            provider="audit_scaffold",
+            model="none",
+            explanation="identity-only trace scaffold; controller owns the decision",
+            tasks_by_agent_id={SINGLE_DIRECT_AGENT_ID: task},
+        )
 
     async def _emit_episode(
         self,
@@ -1342,24 +1491,54 @@ class AgentRuntime:
                 )
             )
         proposal_by_agent = {proposal.agent_id: proposal for proposal in proposals}
+        # Agent diagnostics differ by topology and are not part of the
+        # controller's scientific observation.  Excluding them keeps this
+        # content-addressed projection treatment-neutral.
+        observable_snapshot = snapshot.model_dump(
+            mode="json", exclude={"agents"}
+        )
+        proposal_set = [proposal.model_dump(mode="json") for proposal in proposals]
+        proposal_set_hash = hashlib.sha256(
+            canonical_json(proposal_set).encode("utf-8")
+        ).hexdigest()
+        observable_snapshot_hash = hashlib.sha256(
+            canonical_json(observable_snapshot).encode("utf-8")
+        ).hexdigest()
 
         # §8.2 能耗否决权：占用门在 EnergyAgent 内部，这里只负责把评审结果喂给仲裁器。
         energy_review = None
-        energy_agent = next(
-            (agent for agent in self.agents if isinstance(agent, EnergyAgent)), None
-        )
-        if energy_agent is not None:
-            energy_review = energy_agent.review_peer_proposals(proposals, snapshot)
+        user_claims = None
+        if self.governance_resolver.strategy_id == "aura":
+            energy_agent = next(
+                (agent for agent in self.agents if isinstance(agent, EnergyAgent)), None
+            )
+            if energy_agent is not None:
+                energy_review = energy_agent.review_peer_proposals(proposals, snapshot)
+            user_claims = self.arbitration_gate.claims_since(
+                float(root_event.wall_time or 0.0)
+            )
 
-        result = self.arbiter.resolve(
+        result = self.governance_resolver.resolve(
             proposals,
             root_event,
             snapshot,
             energy_review=energy_review,
             # 用户在本 episode 开始**之后**下的直控 → agent 提案在同一控制点上让位。
             # 这是"用户覆盖 agent"从名义变机制的读取端（写入端见 ArbitrationGate.pre_submit）。
-            user_claims=self.arbitration_gate.claims_since(float(root_event.wall_time or 0.0)),
+            user_claims=user_claims,
         )
+        approved_command_set = [
+            command.model_dump(mode="json") for command in result.approved_commands
+        ]
+        rejected_command_set = [
+            command.model_dump(mode="json") for command in result.rejected_commands
+        ]
+        requested_profile = (
+            self.active_experiment_runtime.runtime_profile
+            if self.active_experiment_runtime is not None
+            else ResearchRuntimeProfile.AURA
+        )
+        effective_profile = self._effective_runtime_profile()
 
         # run 门（§2.2）：推理事件外发也是 await 点，写世界之前再问一次身份。
         if self._is_stale_run(run_id):
@@ -1379,10 +1558,35 @@ class AgentRuntime:
         # 本事件 data 里的 per_agent 分解。
         coordination_event = await self._emit_agent_event(
             root_event=root_event,
-            agent_id=ARBITER_ID,
+            agent_id=self.governance_resolver.event_source,
             event_type=COORDINATION_DECISION_EVENT_TYPE,
             causal_parent=episode_parent,
-            data=result.event_data(),
+            data={
+                **result.event_data(),
+                "agent_id": self.governance_resolver.event_source,
+                "runtime_profile": requested_profile.value,
+                "requested_runtime_profile": requested_profile.value,
+                "effective_runtime_profile": effective_profile.value,
+                "governance": self.governance_resolver.strategy_id,
+                "governance_strategy_version": self.governance_resolver.strategy_version,
+                "selection_basis": self.governance_resolver.strategy_id,
+                "active_agent_ids": [agent.agent_id for agent in self.agents],
+                "observable_snapshot_projection": (
+                    "world_state_without_agent_diagnostics.v1"
+                ),
+                "observable_snapshot": observable_snapshot,
+                "proposal_set": proposal_set,
+                "approved_command_set": approved_command_set,
+                "rejected_command_set": rejected_command_set,
+                "observable_snapshot_hash": observable_snapshot_hash,
+                "proposal_set_hash": proposal_set_hash,
+                "approved_command_set_hash": hashlib.sha256(
+                    canonical_json(approved_command_set).encode("utf-8")
+                ).hexdigest(),
+                "rejected_command_set_hash": hashlib.sha256(
+                    canonical_json(rejected_command_set).encode("utf-8")
+                ).hexdigest(),
+            },
         )
         for envelope in envelopes:
             self._update_reasoning_step(envelope.agent_id, coordination_event.event_type)
@@ -1405,6 +1609,10 @@ class AgentRuntime:
         # 出生与执行之间隔着若干次事件外发（await），一条用户直控可以在这段窗口里
         # 把它取代掉（S1 把取代范围写成"同批内"，这里扩宽到仲裁窗口）。
         opened: list[_OpenedProposal] = []
+        sequential: list[_SequentialProposal] = []
+        last_actions = {
+            envelope.agent_id: envelope.explanation for envelope in envelopes
+        }
         for envelope in envelopes:
             agent_id = envelope.agent_id
             proposal = proposal_by_agent[agent_id]
@@ -1466,6 +1674,25 @@ class AgentRuntime:
                     tick=tick,
                 )
 
+            # No-arbiter profiles submit every admitted command immediately in
+            # deterministic registration order.  Opening all commands first
+            # would let the executor's pending registry turn this baseline into
+            # an accidental last-open-wins policy.
+            if self.governance_resolver.strategy_id == "none":
+                sequential.append(
+                    _SequentialProposal(
+                        envelope=envelope,
+                        proposal=proposal,
+                        execution_event_id=execution_event.event_id,
+                        commands=tuple(approved),
+                        device_versions={
+                            command.device_id: proposal.observed_world_version or 0
+                            for command in approved
+                        },
+                    )
+                )
+                continue
+
             group = _OpenedProposal(
                 envelope=envelope,
                 proposal=proposal,
@@ -1493,9 +1720,113 @@ class AgentRuntime:
             if group.records:
                 opened.append(group)
 
+        # No-arbiter plans are all completed against the shared observation.
+        # Commands are then opened one at a time so same-target proposals do
+        # not become an accidental last-open-wins policy.  Each command still
+        # crosses the exact same final-use stale/assumption guard as the
+        # resolver-selected profiles below.
+        for group in sequential:
+            for index, command in enumerate(group.commands):
+                if self._is_stale_run(run_id):
+                    await self._broadcast_pending_deltas(pending_deltas)
+                    await self._discard_stale_episode(
+                        root_event=root_event,
+                        agents=agents,
+                        episode_run_id=run_id,
+                        stage="before_command_execution",
+                        envelopes=envelopes,
+                    )
+                    return
+                record = await self.arbitration_gate.open(
+                    self._build_device_command(
+                        proposal=command.as_proposal(),
+                        source=self._command_source(group.envelope),
+                        root_event=root_event,
+                        causal_parent=group.execution_event_id,
+                        actor=group.envelope.agent_id,
+                        actor_name=group.envelope.agent_name,
+                    ),
+                    publish=publishers[group.envelope.agent_id],
+                    tick=tick,
+                )
+                boundary: tuple[VersionedDecision, StaleDecisionCheck] | None = None
+                guard_error: Exception | None = None
+
+                def revalidate(_record: CommandRecord) -> str | None:
+                    nonlocal boundary, guard_error
+                    try:
+                        boundary = self._check_proposal_boundary(
+                            group.proposal,
+                            list(group.commands[index:]),
+                            device_versions=group.device_versions,
+                            causal_parent=group.execution_event_id,
+                            correlation_id=root_event.correlation_id,
+                        )
+                    except Exception as exc:
+                        guard_error = exc
+                        return "pre-execution guard failed"
+                    if boundary is not None:
+                        check = boundary[1]
+                        if check.invalidated_assumptions:
+                            return "proposal assumption invalidated before execution"
+                        if _record.command.device_id in check.stale_device_ids:
+                            return "target device changed after planning"
+                    return None
+
+                executed = await self.arbitration_gate.execute(
+                    record,
+                    publish=publishers[group.envelope.agent_id],
+                    pre_execute=revalidate,
+                    tick=tick,
+                )
+                if guard_error is not None:
+                    await self._emit_agent_event(
+                        root_event=root_event,
+                        agent_id=group.envelope.agent_id,
+                        event_type="system.pre_execution_guard_failed",
+                        causal_parent=group.execution_event_id,
+                        data={
+                            "reason": "pre_execution_guard_error",
+                            "agent_id": group.envelope.agent_id,
+                            "error_type": type(guard_error).__name__,
+                            "discarded_commands": [
+                                item.as_proposal().model_dump(mode="json")
+                                for item in group.commands[index:]
+                            ],
+                        },
+                    )
+                    break
+                if boundary is not None and boundary[1].invalidated_assumptions:
+                    await self._publish_decision_discarded(
+                        root_event=root_event,
+                        envelope=group.envelope,
+                        decision=boundary[0],
+                        check=boundary[1],
+                    )
+                    break
+                if (
+                    boundary is not None
+                    and record.command.device_id in boundary[1].stale_device_ids
+                ):
+                    await self._publish_decision_discarded(
+                        root_event=root_event,
+                        envelope=group.envelope,
+                        decision=boundary[0],
+                        check=boundary[1],
+                    )
+                    continue
+                if executed.status is CommandStatus.SUCCEEDED and command.reason:
+                    last_actions[group.envelope.agent_id] = command.reason
+                if (
+                    executed.status is CommandStatus.SUCCEEDED
+                    and executed.applied_device_version is not None
+                ):
+                    group.device_versions[command.device_id] = (
+                        executed.applied_device_version
+                    )
+
         # —— 执行：审计必修①，落地全部交给 CommandExecutor（六级校验 / 十态生命周期 /
         # 失败事件 / effect 钩子都在那一条流水线里）。
-        last_actions = {envelope.agent_id: envelope.explanation for envelope in envelopes}
         for group in opened:
             if self._is_stale_run(run_id):
                 await self._cancel_opened_commands(

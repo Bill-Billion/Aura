@@ -86,6 +86,29 @@ class AgentMemoryStore:
                 f" property={event.data.get('property') or '-'}"
             )
 
+        if event.event_type == "reasoning.coordination_decision":
+            per_agent = event.data.get("per_agent")
+            outcomes = []
+            if isinstance(per_agent, list):
+                outcomes = [
+                    (
+                        f"{str(item.get('agent_id') or '-')[:64]}:"
+                        f"{str(item.get('outcome') or '-')[:64]}"
+                    )
+                    for item in per_agent[:16]
+                    if isinstance(item, Mapping)
+                ]
+            return (
+                "reasoning.coordination_decision:"
+                f" profile={str(event.data.get('runtime_profile') or '-')[:64]}"
+                f" governance={str(event.data.get('governance') or '-')[:64]}"
+                f" outcomes={','.join(outcomes) or '-'}"
+                f" observable_hash={str(event.data.get('observable_snapshot_hash') or '-')[:64]}"
+                f" proposal_hash={str(event.data.get('proposal_set_hash') or '-')[:64]}"
+                f" approved_hash={str(event.data.get('approved_command_set_hash') or '-')[:64]}"
+                f" rejected_hash={str(event.data.get('rejected_command_set_hash') or '-')[:64]}"
+            )
+
         return f"{event.event_type}: {AgentMemoryStore._stable_event_data(event.data)}"
 
     @staticmethod

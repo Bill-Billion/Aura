@@ -1,25 +1,30 @@
-"""The one real Aura runtime adapter supported by the pilot matrix.
+"""Fail-closed adapters for the implemented research runtime profiles.
 
 Unsupported scientific conditions are rejected rather than approximated.  In
-particular, this module does not claim to implement the planned single-agent,
-no-governance, flat-priority, or perfect-observation baselines.
+particular, every accepted topology/governance combination names one concrete
+profile; independently mixing otherwise known axis values is not accepted.
 """
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 from backend.engine.event_log import (
     read_run_metadata,
+    read_run_events,
     verify_finalized_event_log,
 )
 from backend.engine.provenance import (
+    RESEARCH_RUNTIME_PROFILES,
     ExperimentProvenance,
     ExperimentRuntimeSelection,
+    ResearchRuntimeProfile,
+    research_runtime_profile_for_axes,
 )
-from backend.engine.run_manager import read_source_revision
+from backend.engine.run_manager import canonical_json, read_source_revision
 from backend.evaluation.evaluator import EvalOutcome, evaluate_run
 from backend.models.schemas import BaselinePolicy
 from backend.scenarios.fingerprint import scenario_contract_fingerprint
@@ -27,20 +32,50 @@ from backend.scenarios.loader import get_scenario, load_scenario_file
 from backend.scenarios.runner import ScenarioRunner
 from backend.scenarios.spec import ScenarioSpec
 
+from .fairness import build_fairness_payload
 from .spec import ExperimentCell
 from .runner import CellExecutionResult
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 SUPPORTED_MODELS = frozenset({"rule_based", "mocked"})
-SUPPORTED_TOPOLOGIES = frozenset({"domain_multi"})
-SUPPORTED_GOVERNANCE = frozenset({"aura"})
-SUPPORTED_OBSERVATIONS = frozenset({"stale_offline"})
+SUPPORTED_RUNTIME_PROFILES = frozenset(RESEARCH_RUNTIME_PROFILES)
+SUPPORTED_TOPOLOGIES = frozenset(
+    axes[0] for axes in RESEARCH_RUNTIME_PROFILES.values()
+)
+SUPPORTED_GOVERNANCE = frozenset(
+    axes[1] for axes in RESEARCH_RUNTIME_PROFILES.values()
+)
+SUPPORTED_OBSERVATIONS = frozenset(
+    axes[2] for axes in RESEARCH_RUNTIME_PROFILES.values()
+)
 
 _BASELINE_BY_MODEL = {
     "rule_based": BaselinePolicy.RULE_BASED,
     "mocked": BaselinePolicy.LLM_MOCKED,
 }
+
+# Mirrors ``backend.agents.runtime.DEFAULT_AGENT_FACTORIES`` registration order.
+# ``active_agent_ids`` is persisted by the runtime precisely so completed
+# evidence can prove the active topology without inferring it from whichever
+# agents happened to propose in one episode.
+_ACTIVE_AGENT_IDS_BY_TOPOLOGY: dict[str, tuple[str, ...]] = {
+    "single": ("single_direct_agent",),
+    "domain_multi": (
+        "lighting_agent",
+        "hvac_agent",
+        "security_agent",
+        "energy_agent",
+        "scene_agent",
+    ),
+}
+
+_CONTENT_ADDRESSED_EVIDENCE: tuple[tuple[str, str, type], ...] = (
+    ("observable_snapshot", "observable_snapshot_hash", Mapping),
+    ("proposal_set", "proposal_set_hash", list),
+    ("approved_command_set", "approved_command_set_hash", list),
+    ("rejected_command_set", "rejected_command_set_hash", list),
+)
 
 
 class AdapterUnavailableError(RuntimeError):
@@ -48,7 +83,7 @@ class AdapterUnavailableError(RuntimeError):
 
 
 class AuraCellExecutor:
-    """Execute the implemented domain-multi/Aura/stale-offline condition."""
+    """Execute one implemented research profile through the shared Aura runtime."""
 
     def __init__(
         self,
@@ -68,19 +103,22 @@ class AuraCellExecutor:
         self.enforce_source_revision = enforce_source_revision
 
     @staticmethod
-    def _validate_adapters(cell: ExperimentCell) -> None:
-        selections = (
-            ("model", cell.model, SUPPORTED_MODELS),
-            ("topology", cell.topology, SUPPORTED_TOPOLOGIES),
-            ("governance", cell.governance, SUPPORTED_GOVERNANCE),
-            ("observation", cell.observation, SUPPORTED_OBSERVATIONS),
-        )
-        for axis, value, implemented in selections:
-            if value not in implemented:
-                raise AdapterUnavailableError(
-                    f"{axis} adapter {value!r} is not implemented; "
-                    f"implemented values: {', '.join(sorted(implemented))}"
-                )
+    def _validate_adapters(cell: ExperimentCell) -> ResearchRuntimeProfile:
+        if cell.model not in SUPPORTED_MODELS:
+            raise AdapterUnavailableError(
+                f"model adapter {cell.model!r} is not implemented; "
+                f"implemented values: {', '.join(sorted(SUPPORTED_MODELS))}"
+            )
+        try:
+            return research_runtime_profile_for_axes(
+                topology=cell.topology,
+                governance=cell.governance,
+                observation=cell.observation,
+            )
+        except ValueError as exc:
+            raise AdapterUnavailableError(
+                f"runtime profile is not implemented: {exc}"
+            ) from exc
 
     def _load_scenario(self, cell: ExperimentCell) -> tuple[ScenarioSpec, tuple[Path, ...]]:
         reference_path = Path(cell.scenario_reference)
@@ -118,12 +156,14 @@ class AuraCellExecutor:
         cell: ExperimentCell,
         *,
         matrix_hash: str,
+        runtime_profile: ResearchRuntimeProfile,
     ) -> ExperimentProvenance:
         return ExperimentProvenance(
             experiment_id=cell.experiment_id,
             matrix_spec_hash=cell.matrix_spec_hash,
             matrix_hash=matrix_hash,
             cell_id=cell.cell_id,
+            runtime_profile=runtime_profile,
             model=cell.model,
             topology=cell.topology,
             governance=cell.governance,
@@ -131,13 +171,103 @@ class AuraCellExecutor:
             repetition=cell.repetition,
         )
 
+    @staticmethod
+    def _runtime_selection(
+        cell: ExperimentCell,
+        runtime_profile: ResearchRuntimeProfile,
+    ) -> ExperimentRuntimeSelection:
+        return ExperimentRuntimeSelection.for_profile(
+            runtime_profile,
+            model=cast(Literal["rule_based", "mocked"], cell.model),
+            baseline_policy=_BASELINE_BY_MODEL[cell.model],
+        )
+
+    @staticmethod
+    def _runtime_evidence_matches(
+        cell: ExperimentCell,
+        runtime_profile: ResearchRuntimeProfile,
+        events: Sequence[Mapping[str, Any]],
+    ) -> bool:
+        expected_source = {
+            "none": "proposal_passthrough",
+            "flat_priority": "flat_priority",
+            "aura": "arbiter",
+        }[cell.governance]
+        decisions = [
+            event
+            for event in events
+            if event.get("event_type") == "reasoning.coordination_decision"
+        ]
+        if not decisions:
+            return False
+        expected_active_agent_ids = _ACTIVE_AGENT_IDS_BY_TOPOLOGY[cell.topology]
+        for event in decisions:
+            data = event.get("data")
+            if not isinstance(data, Mapping):
+                return False
+            if (
+                event.get("source") != expected_source
+                or data.get("runtime_profile") != runtime_profile.value
+                or data.get("requested_runtime_profile") != runtime_profile.value
+                or data.get("effective_runtime_profile") != runtime_profile.value
+                or data.get("governance") != cell.governance
+                or data.get("observable_snapshot_projection")
+                != "world_state_without_agent_diagnostics.v1"
+            ):
+                return False
+            for preimage_field, hash_field, expected_type in _CONTENT_ADDRESSED_EVIDENCE:
+                preimage = data.get(preimage_field)
+                recorded_hash = data.get(hash_field)
+                if not isinstance(preimage, expected_type) or not isinstance(
+                    recorded_hash, str
+                ):
+                    return False
+                recomputed = hashlib.sha256(
+                    canonical_json(preimage).encode("utf-8")
+                ).hexdigest()
+                if recorded_hash != recomputed:
+                    return False
+
+            active_agent_ids = data.get("active_agent_ids")
+            if (
+                not isinstance(active_agent_ids, list)
+                or any(not isinstance(agent_id, str) for agent_id in active_agent_ids)
+                or tuple(active_agent_ids) != expected_active_agent_ids
+            ):
+                return False
+            for field in (
+                "proposal_set",
+                "approved_command_set",
+                "rejected_command_set",
+            ):
+                entries = data[field]
+                if any(
+                    not isinstance(item, Mapping)
+                    or item.get("agent_id") not in expected_active_agent_ids
+                    for item in entries
+                ):
+                    return False
+            per_agent = data.get("per_agent")
+            if not isinstance(per_agent, list) or any(
+                not isinstance(item, Mapping)
+                or not isinstance(item.get("agent_id"), str)
+                for item in per_agent
+            ):
+                return False
+            agent_ids = [item["agent_id"] for item in per_agent]
+            if len(agent_ids) != len(set(agent_ids)) or not set(agent_ids).issubset(
+                expected_active_agent_ids
+            ):
+                return False
+        return True
+
     async def execute(
         self,
         cell: ExperimentCell,
         *,
         matrix_hash: str,
     ) -> CellExecutionResult:
-        self._validate_adapters(cell)
+        runtime_profile = self._validate_adapters(cell)
         if self.enforce_source_revision:
             current_revision = read_source_revision()
             if current_revision != cell.source_revision:
@@ -146,11 +276,12 @@ class AuraCellExecutor:
                     f"runtime is {current_revision!r}"
                 )
         spec, evaluation_dirs = self._load_scenario(cell)
-        experiment = self._experiment(cell, matrix_hash=matrix_hash)
-        runtime_selection = ExperimentRuntimeSelection(
-            model=cell.model,
-            baseline_policy=_BASELINE_BY_MODEL[cell.model],
+        experiment = self._experiment(
+            cell,
+            matrix_hash=matrix_hash,
+            runtime_profile=runtime_profile,
         )
+        runtime_selection = self._runtime_selection(cell, runtime_profile)
         runner = ScenarioRunner(
             spec,
             seed=cell.seed,
@@ -169,6 +300,10 @@ class AuraCellExecutor:
             data_root=self.data_root,
             scenario_dirs=evaluation_dirs or None,
         )
+        metadata = read_run_metadata(result.run_id, root=self.data_root)
+        if not isinstance(metadata, dict):
+            raise AdapterUnavailableError("completed run metadata is unavailable")
+        evaluation = report.to_dict()
         qualification = (
             "mocked_pipeline_no_fixture"
             if cell.model == "mocked"
@@ -185,7 +320,12 @@ class AuraCellExecutor:
                 "experiment": experiment.model_dump(mode="json"),
                 "model_qualification": qualification,
                 "quality_baseline": False if cell.model == "mocked" else None,
-                "evaluation": report.to_dict(),
+                "fairness": build_fairness_payload(
+                    cell,
+                    run_metadata=metadata,
+                    evaluation=evaluation,
+                ),
+                "evaluation": evaluation,
             }
         )
 
@@ -204,17 +344,23 @@ class AuraCellExecutor:
         if not isinstance(run_id, str) or not run_id:
             return False
         try:
-            self._validate_adapters(cell)
+            runtime_profile = self._validate_adapters(cell)
             _, evaluation_dirs = self._load_scenario(cell)
             metadata = read_run_metadata(run_id, root=self.data_root)
             if not isinstance(metadata, dict):
                 return False
             verify_finalized_event_log(run_id, metadata=metadata, root=self.data_root)
+            events, _ = read_run_events(
+                run_id,
+                root=self.data_root,
+                verify_integrity=True,
+            )
         except Exception:
             return False
         expected_experiment = self._experiment(
             cell,
             matrix_hash=matrix_hash,
+            runtime_profile=runtime_profile,
         ).model_dump(mode="json")
         expected_policy = _BASELINE_BY_MODEL[cell.model].value
         expected_llm_mode = "rule_based" if cell.model == "rule_based" else "mocked"
@@ -234,14 +380,24 @@ class AuraCellExecutor:
         )
         if not metadata_matches:
             return False
+        if not self._runtime_evidence_matches(cell, runtime_profile, events):
+            return False
         report = evaluate_run(
             run_id,
             data_root=self.data_root,
             scenario_dirs=evaluation_dirs or None,
         )
+        evaluation = report.to_dict()
         return (
             report.outcome is not EvalOutcome.ERROR
-            and output.get("evaluation") == report.to_dict()
+            and output.get("experiment") == expected_experiment
+            and output.get("evaluation") == evaluation
+            and output.get("fairness")
+            == build_fairness_payload(
+                cell,
+                run_metadata=metadata,
+                evaluation=evaluation,
+            )
         )
 
 
@@ -249,6 +405,7 @@ __all__ = [
     "SUPPORTED_GOVERNANCE",
     "SUPPORTED_MODELS",
     "SUPPORTED_OBSERVATIONS",
+    "SUPPORTED_RUNTIME_PROFILES",
     "SUPPORTED_TOPOLOGIES",
     "AdapterUnavailableError",
     "AuraCellExecutor",

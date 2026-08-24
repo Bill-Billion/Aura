@@ -18,6 +18,7 @@ from .artifacts import (
     write_cell_result,
     write_resolved_matrix,
 )
+from .fairness import FairnessAudit, audit_comparison_outputs, validate_comparison_plan
 from .spec import ExperimentCell, ResolvedMatrix
 
 
@@ -61,7 +62,7 @@ class MatrixRunError(RuntimeError):
 class MatrixSummary(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    summary_schema_version: str = "1.0"
+    summary_schema_version: str = "1.1"
     matrix_id: str
     matrix_hash: str
     shard_index: int | None = Field(default=None, ge=0)
@@ -76,6 +77,13 @@ class MatrixSummary(BaseModel):
     execution_failed: int = Field(ge=0)
     pending: int = Field(ge=0)
     invalid_artifacts: int = Field(default=0, ge=0)
+    fairness_audited: bool = False
+    valid_baseline_groups: int = Field(default=0, ge=0)
+    invalid_baseline_groups: int = Field(default=0, ge=0)
+    invalid_baseline_group_reasons: dict[str, list[str]] = Field(default_factory=dict)
+    scientific_valid_cells: int = Field(default=0, ge=0)
+    scientific_benchmark_pass: int = Field(default=0, ge=0)
+    scientific_benchmark_fail: int = Field(default=0, ge=0)
     failed_cell_ids: list[str] = Field(default_factory=list)
     by_condition: list["ConditionSummary"] = Field(default_factory=list)
 
@@ -154,6 +162,21 @@ def _evaluation_outcome(output: Mapping[str, Any]) -> str | None:
     evaluation = output.get("evaluation")
     outcome = evaluation.get("outcome") if isinstance(evaluation, Mapping) else None
     return outcome if isinstance(outcome, str) else None
+
+
+def _scientific_counts(
+    audit: FairnessAudit,
+    completed_outputs: Mapping[str, Mapping[str, Any]],
+) -> tuple[int, int, int]:
+    """Count benchmark outcomes only inside fairness-valid comparison groups."""
+
+    passed = 0
+    failed = 0
+    for cell_id in audit.valid_cell_ids:
+        outcome = _evaluation_outcome(completed_outputs[cell_id])
+        passed += int(outcome == "pass")
+        failed += int(outcome == "fail")
+    return len(audit.valid_cell_ids), passed, failed
 
 
 def _validate_completed_output(
@@ -238,6 +261,10 @@ class MatrixRunner:
             executor = AuraCellExecutor(data_root=root / "runs")
         if not callable(getattr(executor, "validate_completed", None)):
             raise TypeError("cell executor must implement validate_completed")
+        validate_comparison_plan(
+            matrix.cells,
+            expected_profiles=matrix.expected_runtime_profiles,
+        )
         write_resolved_matrix(root, matrix)
         selected = select_shard(
             matrix.cells,
@@ -255,6 +282,7 @@ class MatrixRunner:
         terminal_error: MatrixRunError | None = None
         write_summary = True
         by_condition = _condition_summaries(matrix.cells, selected)
+        completed_outputs: dict[str, Mapping[str, Any]] = {}
 
         for cell in selected:
             if cell_result_exists(root, cell.cell_id):
@@ -302,6 +330,7 @@ class MatrixRunner:
                         )
                         benchmark_pass += int(outcome == "pass")
                         benchmark_fail += int(outcome == "fail")
+                        completed_outputs[cell.cell_id] = output
                         continue
                     if resume and existing.result.status == "evaluation_error":
                         if not retry_results:
@@ -419,6 +448,7 @@ class MatrixRunner:
                     )
                     benchmark_pass += int(recorded == "pass")
                     benchmark_fail += int(recorded == "fail")
+                    completed_outputs[cell.cell_id] = output
 
         for condition in by_condition.values():
             condition.pending = (
@@ -427,6 +457,22 @@ class MatrixRunner:
                 - condition.evaluation_error
                 - condition.execution_failed
             )
+        fairness: FairnessAudit | None = None
+        scientific_valid_cells = 0
+        scientific_benchmark_pass = 0
+        scientific_benchmark_fail = 0
+        if shard_count == 1:
+            fairness = audit_comparison_outputs(
+                matrix.cells,
+                completed_outputs,
+                expected_profiles=matrix.expected_runtime_profiles,
+            )
+            (
+                scientific_valid_cells,
+                scientific_benchmark_pass,
+                scientific_benchmark_fail,
+            ) = _scientific_counts(fairness, completed_outputs)
+
         summary = MatrixSummary(
             matrix_id=matrix.matrix_id,
             matrix_hash=matrix.matrix_hash,
@@ -444,6 +490,15 @@ class MatrixRunner:
                 len(selected) - completed - evaluation_error - execution_failed
             ),
             invalid_artifacts=invalid_artifacts,
+            fairness_audited=fairness is not None,
+            valid_baseline_groups=(fairness.valid_groups if fairness else 0),
+            invalid_baseline_groups=(fairness.invalid_groups if fairness else 0),
+            invalid_baseline_group_reasons=(
+                fairness.invalid_reasons if fairness else {}
+            ),
+            scientific_valid_cells=scientific_valid_cells,
+            scientific_benchmark_pass=scientific_benchmark_pass,
+            scientific_benchmark_fail=scientific_benchmark_fail,
             failed_cell_ids=failed_ids,
             by_condition=[by_condition[key] for key in sorted(by_condition)],
         )
@@ -472,6 +527,10 @@ def summarize_results(
     root = Path(output_dir)
     if not callable(getattr(validator, "validate_completed", None)):
         raise TypeError("summarization requires a completed-result validator")
+    validate_comparison_plan(
+        matrix.cells,
+        expected_profiles=matrix.expected_runtime_profiles,
+    )
     completed = 0
     benchmark_pass = 0
     benchmark_fail = 0
@@ -479,6 +538,7 @@ def summarize_results(
     execution_failed = 0
     invalid = 0
     failed_ids: list[str] = []
+    completed_outputs: dict[str, Mapping[str, Any]] = {}
     by_condition = _condition_summaries(matrix.cells, matrix.cells)
     for cell in matrix.cells:
         if not cell_result_exists(root, cell.cell_id):
@@ -502,6 +562,7 @@ def summarize_results(
             matrix_hash=matrix.matrix_hash,
         ):
             completed += 1
+            completed_outputs[cell.cell_id] = result.output or {}
             outcome = _record_completed(
                 by_condition[_condition_key(cell)],
                 result.output or {},
@@ -531,6 +592,17 @@ def summarize_results(
             - condition.execution_failed
         )
 
+    fairness = audit_comparison_outputs(
+        matrix.cells,
+        completed_outputs,
+        expected_profiles=matrix.expected_runtime_profiles,
+    )
+    (
+        scientific_valid_cells,
+        scientific_benchmark_pass,
+        scientific_benchmark_fail,
+    ) = _scientific_counts(fairness, completed_outputs)
+
     summary = MatrixSummary(
         matrix_id=matrix.matrix_id,
         matrix_hash=matrix.matrix_hash,
@@ -546,6 +618,13 @@ def summarize_results(
             len(matrix.cells) - completed - evaluation_error - execution_failed
         ),
         invalid_artifacts=invalid,
+        fairness_audited=True,
+        valid_baseline_groups=fairness.valid_groups,
+        invalid_baseline_groups=fairness.invalid_groups,
+        invalid_baseline_group_reasons=fairness.invalid_reasons,
+        scientific_valid_cells=scientific_valid_cells,
+        scientific_benchmark_pass=scientific_benchmark_pass,
+        scientific_benchmark_fail=scientific_benchmark_fail,
         failed_cell_ids=failed_ids,
         by_condition=[by_condition[key] for key in sorted(by_condition)],
     )
