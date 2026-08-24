@@ -60,6 +60,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from backend.agents.contracts import ProposalAssumption
 from backend.agents.llm import (
     LLMProvider,
     LLMProviderError,
@@ -88,6 +89,7 @@ from backend.engine.event_log import (
     run_dir,
 )
 from backend.engine.run_manager import LLMMode, canonical_json, resolve_llm_mode
+from backend.engine.state import WorldState
 from backend.engine.state_manager import DeltaChange, StateManager
 
 __all__ = [
@@ -106,6 +108,7 @@ __all__ = [
     "MOCK_FIXTURE_MISS_REASON",
     "STALE_DECISION_EVENT_TYPE",
     "STALE_DECISION_REASON",
+    "INVALIDATED_ASSUMPTION_REASON",
     "BUDGET_EXCEEDED_REASON",
     "EPISODE_BUDGET_ENV",
     "DEFAULT_EPISODE_BUDGET_USD",
@@ -177,6 +180,7 @@ MOCK_FIXTURE_MISS_REASON = "mock_fixture_miss"
 
 STALE_DECISION_EVENT_TYPE = "reasoning.decision_discarded"
 STALE_DECISION_REASON = "stale"
+INVALIDATED_ASSUMPTION_REASON = "invalidated_assumption"
 
 # canonical 化时浮点保留的位数。这一位数是"回放命中率 / 语义保真"的取舍点：
 # 3 位刚好抹掉 0.30000000000000004 这类二进制尾巴（真正的不确定性来源），
@@ -1066,7 +1070,8 @@ def _device_id_from_path(path: str) -> str | None:
 class VersionedDecision(BaseModel):
     """一份"带着它据以推理的世界版本"的决策（S3-T7 的对外形状）。
 
-    ``device_versions`` 只记这条决策要碰的设备：粒度就是丢弃判定的粒度。
+    ``device_versions`` 只记这条决策要碰的设备；``assumptions`` 记录整份提案共享的
+    可观测事实。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -1075,6 +1080,7 @@ class VersionedDecision(BaseModel):
     decided_at_version: int
     device_versions: dict[str, int] = Field(default_factory=dict)
     commands: list[AgentCommandProposal] = Field(default_factory=list)
+    assumptions: list[ProposalAssumption] = Field(default_factory=list)
     correlation_id: str | None = None
     root_event_id: str | None = None
 
@@ -1087,6 +1093,7 @@ class VersionedDecision(BaseModel):
         agent_id: str = "",
         correlation_id: str | None = None,
         root_event_id: str | None = None,
+        assumptions: Sequence[ProposalAssumption] = (),
     ) -> "VersionedDecision":
         """在**发起 LLM 调用之前**拍一张版本快照，落地前再比。"""
 
@@ -1097,6 +1104,7 @@ class VersionedDecision(BaseModel):
                 command.device_id for command in commands
             ),
             commands=[command.model_copy(deep=True) for command in commands],
+            assumptions=[item.model_copy(deep=True) for item in assumptions],
             correlation_id=correlation_id,
             root_event_id=root_event_id,
         )
@@ -1110,6 +1118,7 @@ class VersionedDecision(BaseModel):
         agent_id: str = "",
         correlation_id: str | None = None,
         root_event_id: str | None = None,
+        assumptions: Sequence[ProposalAssumption] = (),
     ) -> "VersionedDecision":
         """用一个**过去的**全局版本建快照——真实链路里的顺序就是反的。
 
@@ -1127,6 +1136,7 @@ class VersionedDecision(BaseModel):
             decided_at_version=version,
             device_versions={command.device_id: version for command in commands},
             commands=[command.model_copy(deep=True) for command in commands],
+            assumptions=[item.model_copy(deep=True) for item in assumptions],
             correlation_id=correlation_id,
             root_event_id=root_event_id,
         )
@@ -1143,17 +1153,49 @@ class StaleDecisionCheck(BaseModel):
     fresh_commands: list[AgentCommandProposal] = Field(default_factory=list)
     discarded_commands: list[AgentCommandProposal] = Field(default_factory=list)
     stale_device_ids: list[str] = Field(default_factory=list)
+    invalidated_assumptions: list[dict[str, Any]] = Field(default_factory=list)
 
 
 def check_stale_decision(
     decision: VersionedDecision,
     tracker: WorldVersionTracker,
+    observable_world: WorldState | None = None,
 ) -> StaleDecisionCheck:
-    """决策落地前的最后一问：它碰的那几台设备，还是它当时看到的那几台吗？
+    """决策落地前复核设备版本和提案依赖的可观测事实。
 
-    **只比 per-device 版本**。全局计数器每个环境 tick 都在涨，用它判等于把所有决策
-    都判死（plan_raw 明写的粒度要求）。命令顺序原样保留——顺序是仲裁与执行的语义。
+    设备版本冲突只淘汰对应设备上的命令。共享假设失效则淘汰整个提案，因为运行时
+    无法证明剩余命令仍符合原始意图。命令顺序原样保留——顺序是仲裁与执行的语义。
     """
+
+    invalidated: list[dict[str, Any]] = []
+    if decision.assumptions:
+        if observable_world is None:
+            invalidated = [
+                {
+                    "path": item.path,
+                    "expected": item.equals,
+                    "actual": None,
+                    "missing": True,
+                }
+                for item in decision.assumptions
+            ]
+        else:
+            for item in decision.assumptions:
+                try:
+                    actual = StateManager.read_path(observable_world, item.path)
+                    missing = False
+                except (AttributeError, KeyError, TypeError):
+                    actual = None
+                    missing = True
+                if missing or type(actual) is not type(item.equals) or actual != item.equals:
+                    invalidated.append(
+                        {
+                            "path": item.path,
+                            "expected": item.equals,
+                            "actual": actual,
+                            "missing": missing,
+                        }
+                    )
 
     stale_devices: set[str] = set()
     fresh: list[AgentCommandProposal] = []
@@ -1167,6 +1209,10 @@ def check_stale_decision(
         else:
             fresh.append(command)
 
+    if invalidated:
+        discarded = list(decision.commands)
+        fresh = []
+
     return StaleDecisionCheck(
         is_stale=bool(discarded),
         decided_at_version=decision.decided_at_version,
@@ -1174,6 +1220,9 @@ def check_stale_decision(
         fresh_commands=fresh,
         discarded_commands=discarded,
         stale_device_ids=sorted(stale_devices),
+        invalidated_assumptions=sorted(
+            invalidated, key=lambda item: str(item["path"])
+        ),
     )
 
 
@@ -1185,7 +1234,7 @@ def build_stale_decision_event(
     source: str = "agent_runtime",
     sim_time_s: float | None = None,
 ) -> SimEvent:
-    """丢弃留痕事件（``reasoning.decision_discarded``，reason=stale）。
+    """构造执行前复核失败的 ``reasoning.decision_discarded`` 事件。
 
     没有丢弃就没有事件——传一个 ``is_stale=False`` 的判定进来是调用方的逻辑错误，
     直接抛，而不是发一条"丢了 0 条命令"的空事件去污染推理链。
@@ -1213,11 +1262,16 @@ def build_stale_decision_event(
         ),
         event_generation_mode="system",
         data={
-            "reason": STALE_DECISION_REASON,
+            "reason": (
+                INVALIDATED_ASSUMPTION_REASON
+                if check.invalidated_assumptions
+                else STALE_DECISION_REASON
+            ),
             "agent_id": decision.agent_id,
             "decided_at_version": check.decided_at_version,
             "current_version": check.current_version,
             "stale_device_ids": check.stale_device_ids,
+            "invalidated_assumptions": check.invalidated_assumptions,
             "discarded_commands": [
                 command.model_dump(mode="json") for command in check.discarded_commands
             ],

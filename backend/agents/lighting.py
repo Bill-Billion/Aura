@@ -5,7 +5,9 @@ from __future__ import annotations
 from typing import Any
 
 from backend.agents.base import BaseAgent
+from backend.agents.contracts import DomainTask, ProposalAssumption
 from backend.engine.event_bus import SimEvent
+from backend.engine.event_types import SAFETY_SMOKE_DETECTED
 from backend.engine.state import DeviceState, WorldState
 
 
@@ -55,6 +57,54 @@ class LightingAgent(BaseAgent):
             return "user_comfort"
 
         return "convenience"
+
+    def proposal_assumptions(
+        self,
+        world_state: WorldState,
+        root_event: SimEvent,
+        domain_task: DomainTask | None,
+    ) -> list[ProposalAssumption]:
+        """Preserve the resident context that justified activity lighting."""
+
+        if root_event.event_type == SAFETY_SMOKE_DETECTED:
+            return []
+        room_ids = {
+            room_id
+            for room_id in self.get_relevant_rooms(world_state, root_event)
+            if room_id in world_state.rooms
+        }
+        root_user_id = str(root_event.data.get("user_id") or "")
+
+        assumptions: list[ProposalAssumption] = [
+            ProposalAssumption(
+                path="environment.time_of_day",
+                equals=world_state.environment.time_of_day,
+            )
+        ]
+        if root_user_id in world_state.users:
+            user = world_state.users[root_user_id]
+            assumptions.extend(
+                [
+                    ProposalAssumption(
+                        path=f"users[{root_user_id}].activity",
+                        equals=user.activity,
+                    ),
+                    ProposalAssumption(
+                        path=f"users[{root_user_id}].location.room",
+                        equals=(
+                            user.location.room if user.location is not None else None
+                        ),
+                    ),
+                ]
+            )
+        assumptions.extend(
+            ProposalAssumption(
+                path=f"rooms[{room_id}].occupancy",
+                equals=world_state.rooms[room_id].occupancy,
+            )
+            for room_id in room_ids
+        )
+        return sorted(assumptions, key=lambda item: item.path)
 
     def get_relevant_devices(self, world_state: WorldState, root_event: SimEvent) -> list[DeviceState]:
         if root_event.event_type == "user.command":

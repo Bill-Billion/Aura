@@ -15,6 +15,7 @@ from backend.agents.contracts import (  # noqa: TC001 - 运行期需要（默认
     DomainTask,
     OrchestrationPolicy,
     PriorityLevel,
+    ProposalAssumption,
     ProposalOutcome,
     migrate_legacy_priority,
 )
@@ -327,6 +328,7 @@ class BaseAgent(ABC):
         root_event: SimEvent,
         domain_task: DomainTask | None = None,
         policy: OrchestrationPolicy | None = None,
+        observed_world_version: int | None = None,
     ) -> AgentProposal:
         """把一次 LLM 决策（envelope）投影成 §8.4 提案。
 
@@ -348,7 +350,18 @@ class BaseAgent(ABC):
             requires_coordination=envelope.needs_coordination,
             domain_task=domain_task,
             policy=policy,
+            observed_world_version=observed_world_version,
         )
+
+    def proposal_assumptions(
+        self,
+        world_state: WorldState,
+        root_event: SimEvent,
+        domain_task: DomainTask | None,
+    ) -> list[ProposalAssumption]:
+        """Return observable facts shared by every command in this proposal."""
+
+        return []
 
     def _finalize_proposal(
         self,
@@ -362,6 +375,7 @@ class BaseAgent(ABC):
         requires_coordination: bool,
         domain_task: DomainTask | None,
         policy: OrchestrationPolicy | None,
+        observed_world_version: int | None = None,
     ) -> AgentProposal:
         """五种非动作表达的**唯一**判定点（§8.4）。
 
@@ -388,6 +402,10 @@ class BaseAgent(ABC):
             "confidence": confidence,
             "confidence_source": confidence_source,
             "requires_coordination": requires_coordination,
+            "assumptions": self.proposal_assumptions(
+                world_state, root_event, domain_task
+            ),
+            "observed_world_version": observed_world_version,
         }
 
         if review is not None and review.outcome in NON_ACTION_OUTCOMES:

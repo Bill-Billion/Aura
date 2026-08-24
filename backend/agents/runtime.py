@@ -63,6 +63,7 @@ from backend.agents.arbiter import (
     COORDINATION_DECISION_EVENT_TYPE,
     Arbiter,
     ArbiterResult,
+    ArbitratedCommand,
     ArbitrationGate,
     RejectedCommand,
 )
@@ -94,6 +95,7 @@ from backend.agents.llm_modes import (
     RECORDING_WRITE_REASON,
     ReplayLLMProvider,
     RunScopedRecordedProvider,
+    StaleDecisionCheck,
     VersionedDecision,
     WorldVersionTracker,
     build_provider_for_mode,
@@ -330,6 +332,15 @@ class RuntimePolicySelection:
     llm_mode: LLMMode
     provider: LLMProvider
     recording_source_run_id: str | None = None
+
+
+@dataclass
+class _OpenedProposal:
+    envelope: AgentDecisionEnvelope
+    proposal: AgentProposal
+    execution_event_id: str
+    device_versions: dict[str, int]
+    records: list[tuple[ArbitratedCommand, CommandRecord]]
 
 
 class TriggerClassifier:
@@ -794,6 +805,10 @@ class AgentRuntime:
             await self.command_executor.bind_state_manager(
                 self.state_manager, reason="state_manager_rebound"
             )
+        tracker = WorldVersionTracker.of(self.state_manager)
+        self.command_executor.device_version_source = (
+            tracker.device_version if tracker is not None else None
+        )
         # 仲裁门必须跟着同一台 executor 走（换世界时它的仲裁窗口记录也一并作废）。
         self.arbitration_gate.bind(self.command_executor)
         return self.command_executor
@@ -1323,8 +1338,10 @@ class AgentRuntime:
                     world_state=snapshot,
                     root_event=root_event,
                     domain_task=decision.task_for_agent(agent.agent_id),
+                    observed_world_version=observed_version,
                 )
             )
+        proposal_by_agent = {proposal.agent_id: proposal for proposal in proposals}
 
         # §8.2 能耗否决权：占用门在 EnergyAgent 内部，这里只负责把评审结果喂给仲裁器。
         energy_review = None
@@ -1387,9 +1404,10 @@ class AgentRuntime:
         # —— 开仲裁窗口：每条胜出命令先出生成 proposed 并进在飞注册表 ——
         # 出生与执行之间隔着若干次事件外发（await），一条用户直控可以在这段窗口里
         # 把它取代掉（S1 把取代范围写成"同批内"，这里扩宽到仲裁窗口）。
-        opened: list[tuple[str, CommandRecord, str]] = []
+        opened: list[_OpenedProposal] = []
         for envelope in envelopes:
             agent_id = envelope.agent_id
+            proposal = proposal_by_agent[agent_id]
             stale_devices = stale_by_agent.get(agent_id, frozenset())
             # 被判陈旧的命令在这里就出局：execution_plan 里因此只剩真会执行的那些，
             # "计划"与"落地"不再各说各话（丢了哪些、为什么，在上面那条
@@ -1409,6 +1427,11 @@ class AgentRuntime:
                     "agent_role": getattr(agent_by_id.get(agent_id), "role", ""),
                     "execution_mode": envelope.mode,
                     "commands": [command.as_proposal().model_dump() for command in approved],
+                    "assumptions": [
+                        item.model_dump(mode="json")
+                        for item in proposal.assumptions
+                    ],
+                    "observed_world_version": proposal.observed_world_version,
                     # 域 agent 的推理贡献（编排器在场时这里是它唯一的落点）。
                     **self._agent_contribution_data(
                         envelope,
@@ -1417,6 +1440,19 @@ class AgentRuntime:
                 },
             )
             self._update_reasoning_step(agent_id, execution_event.event_type)
+
+            post_plan_stale = await self._revalidate_after_plan(
+                root_event=root_event,
+                envelope=envelope,
+                proposal=proposal,
+                approved=approved,
+                causal_parent=execution_event.event_id,
+            )
+            approved = [
+                command
+                for command in approved
+                if command.device_id not in post_plan_stale
+            ]
 
             # 仲裁落败的命令绝不凭空消失：proposed→rejected，detail 带 §9.2 冲突分类。
             for rejected in result.rejected_for(agent_id):
@@ -1430,6 +1466,16 @@ class AgentRuntime:
                     tick=tick,
                 )
 
+            group = _OpenedProposal(
+                envelope=envelope,
+                proposal=proposal,
+                execution_event_id=execution_event.event_id,
+                device_versions={
+                    command.device_id: proposal.observed_world_version or 0
+                    for command in approved
+                },
+                records=[],
+            )
             for command in approved:
                 record = await self.arbitration_gate.open(
                     self._build_device_command(
@@ -1443,14 +1489,20 @@ class AgentRuntime:
                     publish=publishers[agent_id],
                     tick=tick,
                 )
-                opened.append((agent_id, record, command.reason))
+                group.records.append((command, record))
+            if group.records:
+                opened.append(group)
 
         # —— 执行：审计必修①，落地全部交给 CommandExecutor（六级校验 / 十态生命周期 /
         # 失败事件 / effect 钩子都在那一条流水线里）。
         last_actions = {envelope.agent_id: envelope.explanation for envelope in envelopes}
-        for agent_id, record, reason in opened:
+        for group in opened:
             if self._is_stale_run(run_id):
-                await self._cancel_opened_commands(opened, tick=tick)
+                await self._cancel_opened_commands(
+                    [record for item in opened for _, record in item.records],
+                    reason=STALE_RUN_DISCARD_REASON,
+                    tick=tick,
+                )
                 await self._broadcast_pending_deltas(pending_deltas)
                 await self._discard_stale_episode(
                     root_event=root_event,
@@ -1460,11 +1512,115 @@ class AgentRuntime:
                     envelopes=envelopes,
                 )
                 return
-            executed = await self.arbitration_gate.execute(
-                record, publish=publishers[agent_id], tick=tick
-            )
-            if executed.status is CommandStatus.SUCCEEDED and reason:
-                last_actions[agent_id] = reason
+            for index, (command, record) in enumerate(group.records):
+                if record.is_terminal:
+                    continue
+                boundary: tuple[VersionedDecision, StaleDecisionCheck] | None = None
+                guard_error: Exception | None = None
+
+                def revalidate(_record: CommandRecord) -> str | None:
+                    nonlocal boundary, guard_error
+                    remaining = [
+                        item
+                        for item, pending in group.records[index:]
+                        if not pending.is_terminal
+                    ]
+                    try:
+                        boundary = self._check_proposal_boundary(
+                            group.proposal,
+                            remaining,
+                            device_versions=group.device_versions,
+                            causal_parent=group.execution_event_id,
+                            correlation_id=root_event.correlation_id,
+                        )
+                    except Exception as exc:
+                        guard_error = exc
+                        return "pre-execution guard failed"
+                    if boundary is not None:
+                        check = boundary[1]
+                        if check.invalidated_assumptions:
+                            return "proposal assumption invalidated before execution"
+                        if _record.command.device_id in check.stale_device_ids:
+                            return "target device changed after planning"
+                    return None
+
+                executed = await self.arbitration_gate.execute(
+                    record,
+                    publish=publishers[group.envelope.agent_id],
+                    pre_execute=revalidate,
+                    tick=tick,
+                )
+                if guard_error is not None:
+                    remaining_records = [
+                        pending
+                        for _, pending in group.records[index + 1 :]
+                        if not pending.is_terminal
+                    ]
+                    await self._cancel_opened_commands(
+                        remaining_records,
+                        reason="pre-execution guard failed",
+                        tick=tick,
+                    )
+                    await self._emit_agent_event(
+                        root_event=root_event,
+                        agent_id=group.envelope.agent_id,
+                        event_type="system.pre_execution_guard_failed",
+                        causal_parent=group.execution_event_id,
+                        data={
+                            "reason": "pre_execution_guard_error",
+                            "agent_id": group.envelope.agent_id,
+                            "error_type": type(guard_error).__name__,
+                            "discarded_commands": [
+                                item.as_proposal().model_dump(mode="json")
+                                for item, pending in group.records[index:]
+                                if not pending.is_terminal or pending is record
+                            ],
+                        },
+                    )
+                    break
+                if boundary is not None and boundary[1].invalidated_assumptions:
+                    await self._cancel_opened_commands(
+                        [pending for _, pending in group.records[index + 1 :]],
+                        reason="proposal assumption invalidated before execution",
+                        tick=tick,
+                    )
+                    await self._publish_decision_discarded(
+                        root_event=root_event,
+                        envelope=group.envelope,
+                        decision=boundary[0],
+                        check=boundary[1],
+                    )
+                    break
+                if (
+                    boundary is not None
+                    and record.command.device_id in boundary[1].stale_device_ids
+                ):
+                    await self._cancel_opened_commands(
+                        [
+                            pending
+                            for _, pending in group.records[index + 1 :]
+                            if pending.command.device_id
+                            in boundary[1].stale_device_ids
+                        ],
+                        reason="target device changed after planning",
+                        tick=tick,
+                    )
+                    await self._publish_decision_discarded(
+                        root_event=root_event,
+                        envelope=group.envelope,
+                        decision=boundary[0],
+                        check=boundary[1],
+                    )
+                    continue
+                if executed.status is CommandStatus.SUCCEEDED and command.reason:
+                    last_actions[group.envelope.agent_id] = command.reason
+                if (
+                    executed.status is CommandStatus.SUCCEEDED
+                    and executed.applied_device_version is not None
+                ):
+                    group.device_versions[command.device_id] = (
+                        executed.applied_device_version
+                    )
 
         for envelope in envelopes:
             self._set_agent_complete(
@@ -1495,6 +1651,97 @@ class AgentRuntime:
             return None
         tracker = WorldVersionTracker.of(self.state_manager)
         return tracker.version if tracker is not None else None
+
+    def _check_proposal_boundary(
+        self,
+        proposal: AgentProposal,
+        commands: list[ArbitratedCommand],
+        *,
+        device_versions: dict[str, int],
+        causal_parent: str,
+        correlation_id: str,
+    ) -> tuple[VersionedDecision, StaleDecisionCheck] | None:
+        """Synchronously check target versions and shared premises at admission."""
+
+        if (
+            proposal.observed_world_version is None
+            or not commands
+            or self.state_manager is None
+        ):
+            return None
+        tracker = WorldVersionTracker.of(self.state_manager)
+        if tracker is None:
+            return None
+        decision = VersionedDecision(
+            agent_id=proposal.agent_id,
+            decided_at_version=proposal.observed_world_version,
+            device_versions={
+                command.device_id: device_versions.get(
+                    command.device_id,
+                    proposal.observed_world_version,
+                )
+                for command in commands
+            },
+            commands=[command.as_proposal() for command in commands],
+            assumptions=proposal.assumptions,
+            correlation_id=correlation_id,
+            root_event_id=causal_parent,
+        )
+        return (
+            decision,
+            check_stale_decision(
+                decision,
+                tracker,
+                observable_world=self.observable_world(),
+            ),
+        )
+
+    async def _revalidate_after_plan(
+        self,
+        *,
+        root_event: SimEvent,
+        envelope: AgentDecisionEnvelope,
+        proposal: AgentProposal,
+        approved: list[ArbitratedCommand],
+        causal_parent: str,
+    ) -> frozenset[str]:
+        """Recheck observable proposal premises after the plan boundary."""
+
+        if (
+            proposal.observed_world_version is None
+            or not approved
+            or self.state_manager is None
+        ):
+            return frozenset()
+        tracker = WorldVersionTracker.of(self.state_manager)
+        if tracker is None:
+            return frozenset()
+
+        decision = VersionedDecision.at_version(
+            proposal.observed_world_version,
+            agent_id=envelope.agent_id,
+            commands=[command.as_proposal() for command in approved],
+            assumptions=proposal.assumptions,
+            correlation_id=root_event.correlation_id,
+            root_event_id=causal_parent,
+        )
+        check = check_stale_decision(
+            decision,
+            tracker,
+            observable_world=self.observable_world(),
+        )
+        if not check.is_stale:
+            return frozenset()
+
+        await self._publish_decision_discarded(
+            root_event=root_event,
+            envelope=envelope,
+            decision=decision,
+            check=check,
+        )
+        if check.invalidated_assumptions:
+            return frozenset(command.device_id for command in approved)
+        return frozenset(check.stale_device_ids)
 
     async def _discard_stale_decisions(
         self,
@@ -1537,30 +1784,44 @@ class AgentRuntime:
             check = check_stale_decision(decision, tracker)
             if not check.is_stale:
                 continue
-
-            event = build_stale_decision_event(
-                decision,
-                check,
+            await self._publish_decision_discarded(
                 root_event=root_event,
-                source=envelope.agent_id,
-                sim_time_s=root_event.sim_time_s,
-            )
-            # 时间戳与 wall_time 对齐 _emit_agent_event：build_stale_decision_event 是纯函数，
-            # 它拿不到"现在第几拍"。
-            event.timestamp = float(self.state_manager.world.simulation_tick)
-            event.wall_time = time.time()
-            published = await self.publish_event(event)
-            self.memory_store.remember(published, agent_id=envelope.agent_id)
-            log.warning(
-                "agent_decision_discarded_stale",
-                agent_id=envelope.agent_id,
-                correlation_id=root_event.correlation_id,
-                decided_at_version=check.decided_at_version,
-                current_version=check.current_version,
-                stale_device_ids=check.stale_device_ids,
+                envelope=envelope,
+                decision=decision,
+                check=check,
             )
             stale_by_agent[envelope.agent_id] = frozenset(check.stale_device_ids)
         return stale_by_agent
+
+    async def _publish_decision_discarded(
+        self,
+        *,
+        root_event: SimEvent,
+        envelope: AgentDecisionEnvelope,
+        decision: VersionedDecision,
+        check: StaleDecisionCheck,
+    ) -> None:
+        assert self.state_manager is not None and self.publish_event is not None
+        event = build_stale_decision_event(
+            decision,
+            check,
+            root_event=root_event,
+            source=envelope.agent_id,
+            sim_time_s=root_event.sim_time_s,
+        )
+        event.timestamp = float(self.state_manager.world.simulation_tick)
+        event.wall_time = time.time()
+        published = await self.publish_event(event)
+        self.memory_store.remember(published, agent_id=envelope.agent_id)
+        log.warning(
+            "agent_decision_discarded_stale",
+            agent_id=envelope.agent_id,
+            correlation_id=root_event.correlation_id,
+            reason=event.data["reason"],
+            decided_at_version=check.decided_at_version,
+            current_version=check.current_version,
+            stale_device_ids=check.stale_device_ids,
+        )
 
     def _persist_llm_cost(self, run_id: str | None, correlation_id: str) -> None:
         """把本 run 的 LLM 成本汇总落到 ``data/runs/{run_id}/llm_cost.json``。
@@ -2072,19 +2333,23 @@ class AgentRuntime:
         )
 
     async def _cancel_opened_commands(
-        self, opened: list[tuple[str, CommandRecord, str]], *, tick: int | None = None
+        self,
+        records: list[CommandRecord],
+        *,
+        reason: str,
+        tick: int | None = None,
     ) -> None:
-        """episode 中途判定 stale 时，收掉还停在仲裁窗口里的 proposed 记录。
+        """收掉 episode 中还停在仲裁窗口里的记录。
 
         不收的话它们会以非终态永远留在 executor 的在飞注册表里：下一条同控制点的合法
         命令会发出一条它其实没经历过的 superseded，而这条命令自己的生命周期永远没有收尾
         ——正是 S1 全程根治的那类静默失败。
         """
 
-        for _, record, _reason in opened:
+        for record in records:
             if not record.is_terminal and CommandStatus.CANCELLED in LEGAL_TRANSITIONS[record.status]:
                 await record.transition(
-                    CommandStatus.CANCELLED, detail=STALE_RUN_DISCARD_REASON, tick=tick
+                    CommandStatus.CANCELLED, detail=reason, tick=tick
                 )
             # 注册表与仲裁窗口都要清干净：终态记录留在里面会让下一条同控制点命令
             # 发出一条它其实没经历过的 superseded。

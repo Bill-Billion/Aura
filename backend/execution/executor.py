@@ -34,6 +34,8 @@ apply 前干净、apply 后违规 → 本命令改坏了世界，逆序回滚全
     ``PreSubmitDecision | None``（None=直通放行）。S1 出厂即 no-op；S3-T5 在此装
     仲裁/取代逻辑。hook 只对当前命令放行 + 取代其他在飞命令（当前命令的拒绝属仲裁，
     位于 proposed→approved，由 S3 另行接入），因 VALIDATED 只合法迁向 EXECUTING。
+  - ``execute_approved(..., pre_execute=hook)``：只给已仲裁的 Agent 命令使用；在
+    ``validated → executing`` 边界及 executing 事件返回后同步复核提案前提，失效即取消。
   - ``submit(..., source=...)``：覆盖命令来源并贯穿全部事件，供 S2
     ``executor.submit(source="scenario")`` 直接调用。
   - ``cancel_pending(reason)``：把在飞（未终态）命令迁到 cancelled，供 S2 reset 取消在飞。
@@ -153,11 +155,14 @@ class PreSubmitDecision:
 
 # pre_submit hook：给定当前命令，返回取代决策；返回 None 即 no-op 直通。
 PreSubmitHook = Callable[[DeviceCommand], "PreSubmitDecision | None"]
+# pre_execute hook：在 VALIDATED → EXECUTING 的同步边界返回取消原因；None=放行。
+PreExecuteHook = Callable[[CommandRecord], str | None]
 
 # 可注入时钟：默认单调钟，测试注入假钟以诚实触发反馈超时。
 Clock = Callable[[], float]
 RuntimeProfileResolver = Callable[[DeviceCommand], DeviceRuntimeProfile]
 DeviceFailureHandler = Callable[[str, float, int | None], Awaitable[None]]
+DeviceVersionSource = Callable[[str], int]
 
 
 def _property_path(capability: str) -> str:
@@ -313,6 +318,7 @@ class CommandExecutor:
         sim_time_source: Callable[[], float] = lambda: 0.0,
         run_id_source: Callable[[], str | None] = lambda: None,
         device_failure_handler: DeviceFailureHandler | None = None,
+        device_version_source: DeviceVersionSource | None = None,
     ) -> None:
         self.state_manager = state_manager
         self.publish_event = publish_event
@@ -323,6 +329,7 @@ class CommandExecutor:
         self.sim_time_source = sim_time_source
         self.run_id_source = run_id_source
         self.device_failure_handler = device_failure_handler
+        self.device_version_source = device_version_source
         self.device_runtime = device_runtime or DeviceRuntime()
         self.device_runtime.bind_driver(self)
         # 与仿真写入路径共用的违规上报去抖（引擎注入同一实例）；独立构造时自带一份。
@@ -472,6 +479,7 @@ class CommandExecutor:
         record: CommandRecord,
         *,
         pre_submit: PreSubmitHook | None = None,
+        pre_execute: PreExecuteHook | None = None,
         tick: int | None = None,
         publish: PublishEvent | None = None,
     ) -> CommandRecord:
@@ -482,6 +490,7 @@ class CommandExecutor:
 
         终态早退是必须的：开窗期间它可能已经被用户命令取代，此时再迁移会抛
         IllegalTransitionError 冲出调用方（正是 review2 finding-1 的现场）。
+        ``pre_execute`` 是同步的最后使用点复核；返回原因就取消，不发 action。
         """
 
         if record.is_terminal:
@@ -492,6 +501,7 @@ class CommandExecutor:
                 record,
                 record.command,
                 pre_submit=pre_submit,
+                pre_execute=pre_execute,
                 tick=tick,
                 publish=resolved_publish,
             )
@@ -580,7 +590,12 @@ class CommandExecutor:
         record = await self._propose(command, tick, publish=publish)
         try:
             return await self._pipeline(
-                record, command, pre_submit=pre_submit, tick=tick, publish=publish
+                record,
+                command,
+                pre_submit=pre_submit,
+                pre_execute=None,
+                tick=tick,
+                publish=publish,
             )
         except asyncio.CancelledError:
             # 提交任务被取消（runtime 砍上一轮 episode / reset）时绝不能留幽灵记录：
@@ -604,6 +619,7 @@ class CommandExecutor:
         command: DeviceCommand,
         *,
         pre_submit: PreSubmitHook | None,
+        pre_execute: PreExecuteHook | None,
         tick: int | None,
         publish: PublishEvent,
     ) -> CommandRecord:
@@ -663,8 +679,31 @@ class CommandExecutor:
 
         if record.is_terminal:
             return record
+        def cancellation_detail() -> str | None:
+            if pre_execute is None:
+                return None
+            return pre_execute(record)
+
+        cancel_detail = cancellation_detail()
+        if cancel_detail:
+            await record.transition(
+                CommandStatus.CANCELLED,
+                detail=cancel_detail,
+                tick=tick,
+            )
+            self._deregister(record)
+            return record
         await record.transition(CommandStatus.EXECUTING, tick=tick)
         if record.is_terminal:
+            return record
+        cancel_detail = cancellation_detail()
+        if cancel_detail:
+            await record.transition(
+                CommandStatus.CANCELLED,
+                detail=cancel_detail,
+                tick=tick,
+            )
+            self._deregister(record)
             return record
         action_event = await self._emit_action(command, tick, publish=publish)
 
@@ -776,6 +815,9 @@ class CommandExecutor:
                 sim_time_s=sim_time_s,
             )
             return False
+
+        if deltas and self.device_version_source is not None:
+            record.applied_device_version = self.device_version_source(command.device_id)
 
         if (
             dispatch_at is not None

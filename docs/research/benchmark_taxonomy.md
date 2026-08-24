@@ -17,6 +17,8 @@ AuraBench 使用反事实配对组织任务。每个动态 episode 必须有一�
 
 事件相对运行时只在 anchor 已持久化后注入；零偏移在同一次事件派发中完成，非零偏移按精确模拟时间推进。证据事件记录 anchor ID、实际 `seq`/模拟时间和预期前后继。若后继先到、anchor 缺失或注入失败，runtime 会持久化 `benchmark.perturbation_phase_violation`，并将该 run 判为不可评价，而不是退化成 2.0 的绝对时间语义。
 
+首个 resident-state pilot 为 Lighting proposal 冻结有限的居民上下文 guard，并记录当前规则读取的 `time_of_day`；这不是完整 LLM prompt dependency set。runtime 在持久化 `reasoning.execution_plan` 后，以及每条命令进入执行器的最后同步边界，用最新可观测视图复核这些假设；任一共享假设失效，就持久化 `reasoning.decision_discarded` 并淘汰尚未执行的旧命令。安全根事件不受普通居民上下文假设约束。其他 Agent 的完整观测依赖随 observation-model 实验契约冻结，不在此处伪装成已覆盖。
+
 ## 八个场景族
 
 1. 状态感知与执行前复核；

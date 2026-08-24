@@ -183,6 +183,9 @@ class CommandRecord:
         self.status = status
         self.failure_code: str | None = None
         self.detail: str | None = None
+        # apply_action 同步返回时的目标设备版本；供同一 proposal 的后续命令区分
+        # “本组前一条命令”与期间插入的外部改动。
+        self.applied_device_version: int | None = None
         now = time.time()
         self.created_at: float = now
         self.updated_at: float = now

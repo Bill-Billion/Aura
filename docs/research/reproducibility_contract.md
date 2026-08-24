@@ -7,6 +7,7 @@
 - scenario ID、schema version 与 contract hash；
 - counterfactual group、variant 与 TraceSpec hash；
 - event-relative 干预的 anchor event ID、注入 `seq`/模拟时间和预期前后继；
+- proposal 观察到的世界版本、有限假设集，以及执行前复核失败时的实际值；
 - seed、初始状态 hash 与命名 RNG 子流约定；
 - source、simulator、Agent、evaluator 与 resolver revision；
 - 模型/provider/prompt hash/temperature/token cap/timeout；
@@ -14,6 +15,8 @@
 - 预算和运行模式（rule/mock/recorded/live）。
 
 不得记录 API key、认证 header、raw secret 或未脱敏 provider payload。
+
+proposal 假设只能来自 Agent 当次推理所见的可观测快照，不能读取 ground truth 或执行时 oracle。假设路径、期望值和失效证据必须进入事件日志，保证同一 recorded run 可以复核为何某份计划被丢弃。PR14 先冻结 Lighting resident-state pilot；其他 Agent 与 LLM 完整 prompt slice 的依赖由 observation-model 契约继续冻结。
 
 ## 时间与随机性
 
