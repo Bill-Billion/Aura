@@ -804,8 +804,8 @@ def wilson_interval(
     )
     interval = ConfidenceInterval(
         confidence_level=confidence_level,
-        lower=max(0.0, center - half_width),
-        upper=min(1.0, center + half_width),
+        lower=(0.0 if successes == 0 else max(0.0, center - half_width)),
+        upper=(1.0 if successes == total else min(1.0, center + half_width)),
         method="wilson_score",
     )
     return ProportionResult(
