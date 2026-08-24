@@ -6,7 +6,7 @@
 
 ## 冻结输入
 
-每份复核工件必须绑定 `manifest.json` 中的 `pair_set_hash` 和同一个 `source_revision`，并覆盖 manifest 列出的全部 pair。只要场景、设备注册表、pair 指纹或评价契约变化，旧复核立即失效。
+每份复核工件必须绑定 `manifest.json` 中的 `pair_set_hash`、resolved matrix hash、results manifest seal、run inventory seal 和同一个 `source_revision`，并覆盖 manifest 列出的全部 pair。只要场景、设备注册表、pair 指纹、评价契约或任一运行工件变化，旧复核立即失效。
 
 复核者应读取 static/dynamic YAML、运行时干预语义和一次密封的动态轨迹。动态轨迹必须同时包含 `benchmark.perturbation_injected` 与对应的物理干预事件；只有注入标记不算干预已经实现。
 
@@ -21,14 +21,17 @@
 
 ## 独立性与提交格式
 
-两个 reviewer ID 必须不同。复核者不得查看另一人的判断后再填写自己的结果。每人提交一个新的、不可原地改写的 JSON 文件，格式如下：
+两个 reviewer ID 经 Unicode 规范化和大小写折叠后必须不同。验证器只能证明工件声明了两个不同 ID，不能从字符串推断现实身份；两名真实复核者及其独立提交由仓库 review 流程确认。复核者不得查看另一人的判断后再填写自己的结果。每人提交一个新的、不可原地改写的 JSON 文件，格式如下：
 
 ```json
 {
-  "human_review_schema_version": "1.0",
+  "human_review_schema_version": "1.1",
   "benchmark_id": "aurabench_dev_pilot",
   "pair_set_hash": "<manifest pair_set_hash>",
+  "matrix_hash": "<resolved matrix hash>",
   "source_revision": "<sealed run source revision>",
+  "results_manifest_sha256": "<results manifest seal>",
+  "run_inventory_sha256": "<run inventory seal>",
   "reviewer_id": "<stable reviewer id>",
   "submitted_at": "<ISO-8601 timestamp>",
   "assessments": [
@@ -38,7 +41,12 @@
       "oracle_reasonable": true,
       "only_declared_difference": true,
       "tracespec_allows_reasonable_policies": true,
-      "rationale": "<specific evidence and reasoning>"
+      "rationale": "<specific evidence and reasoning>",
+      "evidence": {
+        "cell_id": "<one admitted dynamic cell for this pair>",
+        "run_id": "<the cell run id>",
+        "result_seal": "<the cell result seal>"
+      }
     }
   ]
 }
@@ -51,4 +59,4 @@
 - 缺人、重复 reviewer、hash/source 不一致或工件不完整时，gate 保持 `pending` 或验证失败；
 - PR16 只提交未分配的 pending 状态，绝不伪造姓名、日期或通过结论；正式双人复核必须在 PR20 benchmark freeze 前完成。
 
-PR16 的验证器只接受上述未分配 `pending` 状态。PR20 必须先把 reviewer 判断绑定到密封 run、resolved matrix 和 evaluator provenance，才能启用 `approved`/`needs_adjudication` 状态；在此之前，手工填写“已通过”会 fail closed。
+`reviews/status.json` 是运行前门，只接受未分配的 `pending` 状态。PR20 不改写它；运行完成后由 `inventory-pilot` 对全部 raw result、`run.json` 和 `events.jsonl` 重新验封，再由 `freeze-pilot` 将两份 reviewer 工件绑定到 resolved matrix、results manifest 和逐 cell run inventory。最终 `freeze.json` 的 gate 由四项布尔判断自动推导：全部为真才是 `approved`，否则只能是 `needs_adjudication`，手工填写状态无效。

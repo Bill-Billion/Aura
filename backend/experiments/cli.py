@@ -13,6 +13,11 @@ from .adapters import AuraCellExecutor
 from .analysis import AnalysisPlan, analyze_matrix_results, render_analysis_bundle
 from .artifacts import read_resolved_matrix, write_resolved_matrix
 from .pilot_bundle import validate_pilot_bundle
+from .pilot_freeze import (
+    validate_pilot_freeze,
+    write_pilot_freeze,
+    write_pilot_run_inventory,
+)
 from .resolve import load_and_resolve_matrix
 from .runner import MatrixRunner, summarize_results
 
@@ -60,6 +65,34 @@ def _parser() -> argparse.ArgumentParser:
     )
     validate_pilot.add_argument("manifest", type=Path)
     validate_pilot.add_argument("--require-approved", action="store_true")
+
+    inventory = commands.add_parser(
+        "inventory-pilot", help="seal the raw evidence for a completed pilot"
+    )
+    inventory.add_argument("--resolved-matrix", type=Path, required=True)
+    inventory.add_argument("--result-root", type=Path, required=True)
+    inventory.add_argument("--benchmark-manifest", type=Path, required=True)
+    inventory.add_argument("--results-manifest", type=Path, required=True)
+    inventory.add_argument("--output", type=Path, required=True)
+
+    freeze = commands.add_parser(
+        "freeze-pilot", help="bind a completed pilot to two independent reviews"
+    )
+    freeze.add_argument("--bundle-root", type=Path, required=True)
+    freeze.add_argument("--result-root", type=Path, required=True)
+    freeze.add_argument("--benchmark-manifest", type=Path, required=True)
+    freeze.add_argument("--resolved-matrix", type=Path, required=True)
+    freeze.add_argument("--results-manifest", type=Path, required=True)
+    freeze.add_argument("--run-inventory", type=Path, required=True)
+    freeze.add_argument("--review", type=Path, action="append", required=True)
+    freeze.add_argument("--output", type=Path, required=True)
+
+    validate_freeze = commands.add_parser(
+        "validate-freeze", help="validate a sealed pilot and human-review gate"
+    )
+    validate_freeze.add_argument("freeze", type=Path)
+    validate_freeze.add_argument("--result-root", type=Path, required=True)
+    validate_freeze.add_argument("--require-approved", action="store_true")
     return parser
 
 
@@ -146,10 +179,38 @@ def main(argv: Sequence[str] | None = None) -> int:
                         bootstrap_resamples=args.bootstrap_resamples,
                     ),
                 )
-        else:
+        elif args.command == "validate-pilot":
             payload = validate_pilot_bundle(args.manifest)
             if args.require_approved and payload["gate_status"] != "approved":
                 raise ValueError("pilot human-review gate is not approved")
+        elif args.command == "inventory-pilot":
+            path = write_pilot_run_inventory(
+                resolved_matrix=args.resolved_matrix,
+                result_root=args.result_root,
+                benchmark_manifest=args.benchmark_manifest,
+                results_manifest=args.results_manifest,
+                output=args.output,
+            )
+            payload = {"path": str(path)}
+        elif args.command == "freeze-pilot":
+            path = write_pilot_freeze(
+                bundle_root=args.bundle_root,
+                result_root=args.result_root,
+                benchmark_manifest=args.benchmark_manifest,
+                resolved_matrix=args.resolved_matrix,
+                results_manifest=args.results_manifest,
+                run_inventory=args.run_inventory,
+                review_artifacts=args.review,
+                output=args.output,
+            )
+            payload = {"path": str(path)}
+        else:
+            payload = validate_pilot_freeze(
+                args.freeze,
+                result_root=args.result_root,
+            )
+            if args.require_approved and payload["gate_status"] != "approved":
+                raise ValueError("pilot freeze gate is not approved")
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
