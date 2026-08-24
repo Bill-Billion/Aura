@@ -15,11 +15,16 @@ from backend.agents.runtime import (
 )
 from backend.api.ws import ConnectionManager
 from backend.core.logging import log
+from backend.devices.latency import (
+    legacy_runtime_profile,
+    simulated_v2_runtime_profile,
+)
 from backend.engine.event_bus import EventBus, SimEvent, WorldEvent
 from backend.engine.event_log import RunArtifactRecorder, attach_run_artifacts
 from backend.engine.event_types import (
     ENGINE_ERROR_EVENT_TYPE,
     ENVIRONMENT_STATE_REFRESH,
+    SAFETY_SMOKE_DETECTED,
     TIMER_TICK_EVENT_TYPE,
     USER_ACTIVITY_CHANGE,
     USER_MOVEMENT_EVENT_TYPES,
@@ -60,7 +65,12 @@ from backend.scenarios.generator import (
     build_generation_sources,
 )
 from backend.scenarios.spec import ScenarioSpec
-from backend.scenarios.spec_v2 import ScenarioSpecV2
+from backend.scenarios.spec_v2 import (
+    ScenarioSpecV2,
+    apply_compiled_device_perturbations,
+    compile_device_perturbations,
+    unsupported_perturbations,
+)
 from backend.simulators.environment import EnvironmentSimulator
 from backend.simulators.user_behavior import UserBehaviorSimulator
 
@@ -82,12 +92,13 @@ class PerturbationRuntimeUnavailableError(RuntimeError):
     code = "perturbation_runtime_unavailable"
 
     def __init__(self, spec: ScenarioSpecV2) -> None:
+        unsupported = unsupported_perturbations(spec)
         self.scenario_id = spec.id
         self.unsupported_perturbation_types = tuple(
-            sorted({item.type for item in spec.perturbations})
+            sorted({item.type for item in unsupported})
         )
         self.unsupported_perturbation_phases = tuple(
-            sorted({item.phase for item in spec.perturbations})
+            sorted({item.phase for item in unsupported})
         )
         self.message = (
             f"scenario {spec.id!r} declares perturbations, but this runtime "
@@ -163,8 +174,13 @@ class SimulationEngine:
         # 会让 _pending 注册表没有生产寿命——cancel_pending 无事可取消、跨调用取代不成立。
         # 不在此处绑 publish：引擎自身不发命令，包装归各条腿所有。
         self.command_executor = CommandExecutor(
-            self.state_manager, invariant_debounce=self._invariant_report
+            self.state_manager,
+            invariant_debounce=self._invariant_report,
+            sim_time_source=lambda: self.sim_time_s,
+            run_id_source=lambda: self.run_id,
+            device_failure_handler=self._activate_runtime_device_failure,
         )
+        self.device_execution_model = "legacy_sync_v1"
 
         self.agent_runtime = AgentRuntime(
             llm_provider=llm_provider,
@@ -226,7 +242,7 @@ class SimulationEngine:
         方式下同一拍的 sim_time 完全一致（这是双模式一致性的全部实现）。
         """
 
-        return max(0, self.timer.current_tick - 1) * float(self.timer.simulated_dt)
+        return self.timer.sim_time_s
 
     def bind_generation_sources(self, sources: GenerationSources | None) -> None:
         """挂上（或摘掉）本 run 的三条 §4.5 生成产线。
@@ -437,8 +453,18 @@ class SimulationEngine:
         # 解析放在最前面：未知场景 id 必须在 pause/取消/换世界**之前**被拒，
         # 否则一次拼错的启动会把正在跑的 run 拆掉再报错。
         spec = resolve_run_scenario(scenario, dirs=scenario_dirs)
-        if isinstance(spec, ScenarioSpecV2) and spec.perturbations:
+        if isinstance(spec, ScenarioSpecV2) and unsupported_perturbations(spec):
             raise PerturbationRuntimeUnavailableError(spec)
+        compiled_perturbations = (
+            compile_device_perturbations(spec)
+            if isinstance(spec, ScenarioSpecV2)
+            else ()
+        )
+        resolved_execution_model = (
+            "simulated_time_v2"
+            if isinstance(spec, ScenarioSpecV2)
+            else "legacy_sync_v1"
+        )
         resolved_seed = seed if seed is not None else (spec.seed if spec is not None else None)
         if resolved_seed is not None:
             # Validate before pause/cancel/world swap.  A late failure in
@@ -511,6 +537,12 @@ class SimulationEngine:
         await self.command_executor.bind_state_manager(
             self.state_manager, reason="simulation_reset"
         )
+        self.device_execution_model = resolved_execution_model
+        self.command_executor.runtime_profile = (
+            simulated_v2_runtime_profile
+            if isinstance(spec, ScenarioSpecV2)
+            else legacy_runtime_profile
+        )
         self.agent_runtime.update_state_manager(self.state_manager)
         self.agent_runtime.reset()
         self._sync_world_timing_state(reset_mode=True)
@@ -555,6 +587,10 @@ class SimulationEngine:
         # 随机子流取自新 run 的 SimRandom（一 run 一 seed）。没有场景就摘干净——
         # 留着上一个场景的产线，等于用旧场景的 timeline 驱动一个匿名的新实验。
         try:
+            if isinstance(spec, ScenarioSpecV2):
+                apply_compiled_device_perturbations(
+                    compiled_perturbations, self.command_executor.device_runtime
+                )
             if spec is not None:
                 self._install_generation_sources(spec, stochastic_overrides=stochastic_overrides)
             else:
@@ -614,6 +650,7 @@ class SimulationEngine:
             return
 
         self.event_bus.subscribe(TIMER_TICK_EVENT_TYPE, self._handle_timer_tick)
+        self.event_bus.subscribe(SAFETY_SMOKE_DETECTED, self._handle_safety_interrupt)
         for event_type in self._USER_MOVEMENT_SUBSCRIPTIONS:
             self.event_bus.subscribe(event_type, self._handle_user_activity_change)
         self.event_bus.subscribe(ENVIRONMENT_STATE_REFRESH, self._handle_environment_refresh)
@@ -628,6 +665,7 @@ class SimulationEngine:
             return
 
         self.event_bus.unsubscribe(TIMER_TICK_EVENT_TYPE, self._handle_timer_tick)
+        self.event_bus.unsubscribe(SAFETY_SMOKE_DETECTED, self._handle_safety_interrupt)
         for event_type in self._USER_MOVEMENT_SUBSCRIPTIONS:
             self.event_bus.unsubscribe(event_type, self._handle_user_activity_change)
         self.event_bus.unsubscribe(ENVIRONMENT_STATE_REFRESH, self._handle_environment_refresh)
@@ -695,6 +733,7 @@ class SimulationEngine:
         )
 
         sim_time_s = self.sim_time_s
+        await self.command_executor.advance_device_runtime(sim_time_s, tick=timer_tick)
         sources = self.generation_sources
 
         # —— ① scripted：timeline 到点的根事件（+ 其设备命令，走 CommandExecutor）——
@@ -854,6 +893,45 @@ class SimulationEngine:
             )
         )
 
+    async def _activate_runtime_device_failure(
+        self, device_id: str, sim_time_s: float, tick: int | None
+    ) -> None:
+        """Materialize a due v2 device failure as world truth plus a root event."""
+
+        event = await self._publish_sim_event(
+            SimEvent(
+                event_type="device.offline",
+                source=FAILURE_INJECTION_CAUSED_BY,
+                timestamp=float(tick if tick is not None else self.timer.current_tick),
+                priority=2,
+                event_generation_mode="scripted",
+                generation_rule_id="perturbation.device_failure",
+                sim_time_s=sim_time_s,
+                data={
+                    "device_id": device_id,
+                    "online": False,
+                    "at_sim_time_s": sim_time_s,
+                    "reason": "v2 device_failure perturbation",
+                },
+            )
+        )
+        self._apply_availability_write(
+            DeviceAvailabilityWrite(
+                device_id=device_id,
+                online=False,
+                reason="v2 device_failure perturbation",
+            ),
+            event,
+        )
+
+    async def _handle_safety_interrupt(self, event: SimEvent) -> None:
+        """A safety root event preempts every currently executing device operation."""
+
+        await self.command_executor.interrupt_device_operations(
+            reason=f"safety interrupt: {event.event_type}",
+            tick=self.state_manager.world.simulation_tick,
+        )
+
     # ------------------------------------------------------------------
     # 主循环故障（critic 修正③：绝不假活）
     # ------------------------------------------------------------------
@@ -875,6 +953,7 @@ class SimulationEngine:
             "tick": self.timer.current_tick,
             "run_id": self.run_id,
             "scenario_id": self.scenario_id,
+            "device_execution_model": self.device_execution_model,
         }
         self.last_engine_error = detail
         log.error("engine_tick_failed", **detail)
@@ -1119,6 +1198,7 @@ class SimulationEngine:
             # 但研究者从此能在任意一条状态消息上回答"我现在看的是哪次实验"（§18）。
             "run_id": self.run_id,
             "scenario_id": self.scenario_id,
+            "device_execution_model": self.device_execution_model,
             "seed": metadata.seed if metadata is not None else None,
             "baseline_policy": (
                 metadata.baseline_policy.value
