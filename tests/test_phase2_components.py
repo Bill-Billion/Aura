@@ -5,7 +5,7 @@ from backend.agents.contracts import AgentProposal, PriorityLevel
 from backend.agents.memory import AgentMemoryStore
 from backend.agents.llm import AnthropicCompatibleProvider
 from backend.agents.runtime import AgentRuntime, TriggerClassifier
-from backend.agents.types import AgentCommandProposal
+from backend.agents.types import AgentCommandProposal, LLMDecisionRequest
 from backend.engine.event_bus import SimEvent
 
 
@@ -98,6 +98,28 @@ def test_memory_prompt_omits_volatile_event_identities():
         "environment.light_level_threshold: "
         "{'nested': {'value': 10}, 'room_id': 'living_room'}"
     ]
+
+
+def test_memory_prompt_bounds_large_audit_event_for_next_request():
+    store = AgentMemoryStore()
+    store.remember(
+        _event(
+            "reasoning.execution_plan",
+            data={"commands": [{"reason": "x" * 3_000}]},
+        )
+    )
+    store.remember(_event("safety.smoke_detected"))
+
+    recent_events = store.build_recent_event_lines("security_agent", "corr-1")
+    request = LLMDecisionRequest(
+        agent_id="security_agent",
+        agent_name="Security Agent",
+        root_event_type="safety.smoke_detected",
+        world_summary="smoke detected",
+        recent_events=recent_events,
+    )
+
+    assert request.recent_events[0].endswith("…")
 
 
 def test_arbiter_prefers_higher_priority():

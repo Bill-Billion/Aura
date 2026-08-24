@@ -4,6 +4,7 @@ from collections import defaultdict, deque
 from collections.abc import Mapping
 from typing import Any
 
+from backend.agents.types import MAX_RECENT_EVENT_CHARS
 from backend.engine.event_bus import SimEvent
 
 
@@ -50,7 +51,13 @@ class AgentMemoryStore:
         if not recent_events:
             recent_events = self.get_agent_recent_events(agent_id)[-limit:]
 
-        return [self._format_event_line(event) for event in recent_events]
+        lines = [self._format_event_line(event) for event in recent_events]
+        return [
+            line
+            if len(line) <= MAX_RECENT_EVENT_CHARS
+            else f"{line[: MAX_RECENT_EVENT_CHARS - 1]}…"
+            for line in lines
+        ]
 
     @staticmethod
     def _format_event_line(event: SimEvent) -> str:
