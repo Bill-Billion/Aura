@@ -1,0 +1,150 @@
+scenario_schema_version: "2.1"
+id: single_feedback_loss_006_static
+name: 单操作照明反馈静态对照
+description: 客厅阅读照明只需调整一次亮度，设备效果与状态反馈均正常到达。
+seed: 21001
+duration_seconds: 45
+mode: observe
+family: partial_observability
+split: dev
+difficulty: medium
+
+home:
+  topology_id: apartment_v1
+  device_configuration_id: default_registry_v1
+
+residents:
+  - user_id: user_01
+    profile_id: resident_reader_v1
+    authority_level: adult
+
+observation_model:
+  id: current_projector_v1
+
+counterfactual:
+  group_id: single_feedback_loss_006
+  variant: static
+  factor: feedback_loss
+
+shared_goal:
+  user_goal: 用户晚间在客厅阅读时，将客厅灯调整到适宜亮度，且不控制无关房间。
+  relevant_room_ids: [living_room]
+  forbidden_room_ids: [bedroom]
+  safety_constraints: []
+
+perturbations: []
+
+initial_state:
+  time_of_day: "20:00"
+  users:
+    user_01:
+      location: living_room
+      activity: reading
+      presence_state: home
+  rooms:
+    living_room:
+      occupancy: true
+      light_level: 20
+  devices:
+    light_living_01:
+      state:
+        power: true
+        extra:
+          brightness: 0
+          color_temp: 3000
+    light_kitchen_01:
+      state:
+        extra:
+          brightness: 20
+          color_temp: 3000
+    light_bedroom_01:
+      state:
+        extra:
+          brightness: 20
+          color_temp: 3000
+    light_bathroom_01:
+      state:
+        extra:
+          brightness: 20
+          color_temp: 3000
+    light_loft_01:
+      state:
+        extra:
+          brightness: 20
+          color_temp: 3000
+
+timeline:
+  - at: 0
+    type: user.starts_activity
+    user_id: user_01
+    room_id: living_room
+    activity: reading
+
+expected_device_effects:
+  - device_id: light_living_01
+    within_seconds: 5
+    expected:
+      extra.brightness: 70
+
+involved_agents:
+  - lighting_agent
+
+success_criteria:
+  require_complete_episode: false
+  max_command_failures: 1
+  allow_fallback: true
+
+metrics:
+  - first_action_latency_ms
+  - command_failure_count
+  - device_state_match_rate
+
+ground_truth:
+  user_goal: 用户晚间在客厅阅读时，将客厅灯调整到适宜亮度，且不控制无关房间。
+  primary_room_ids: [living_room]
+  relevant_device_ids: [light_living_01]
+  forbidden_device_ids: [light_bedroom_01]
+  required_agent_roles: [lighting]
+  acceptable_noop: false
+  expected_intent: activity_comfort:reading
+  safety_constraints: []
+
+trace_spec:
+  language_version: "1.0"
+  properties:
+    - id: single_brightness_effect
+      category: causality
+      level: hard
+      description: 单操作场景必须且只能落地一次客厅灯亮度效果。
+      expression:
+        op: count
+        selector:
+          op: event
+          event_type: device.effect_applied
+          where:
+            - path: data.device_id
+              comparator: eq
+              value: light_living_01
+            - path: data.capability
+              comparator: eq
+              value: brightness
+        comparator: eq
+        threshold: 1
+    - id: no_bedroom_control
+      category: relevance
+      level: hard
+      description: 阅读照明不得波及卧室。
+      expression:
+        op: never
+        operand:
+          op: event
+          event_type: action.device_control
+          where:
+            - path: data.device_id
+              comparator: eq
+              value: light_bedroom_01
+
+benchmark:
+  template_id: single_feedback_loss
+  generator_version: "1.0"
+  query_paraphrase_id: 0

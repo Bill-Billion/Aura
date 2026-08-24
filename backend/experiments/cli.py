@@ -11,6 +11,7 @@ from typing import Sequence
 
 from .adapters import AuraCellExecutor
 from .artifacts import read_resolved_matrix, write_resolved_matrix
+from .pilot_bundle import validate_pilot_bundle
 from .resolve import load_and_resolve_matrix
 from .runner import MatrixRunner, summarize_results
 
@@ -41,6 +42,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     summarize.add_argument("resolved_matrix", type=Path)
     summarize.add_argument("--output", type=Path, required=True)
+
+    validate_pilot = commands.add_parser(
+        "validate-pilot", help="validate a scientific pilot manifest"
+    )
+    validate_pilot.add_argument("manifest", type=Path)
+    validate_pilot.add_argument("--require-approved", action="store_true")
     return parser
 
 
@@ -72,7 +79,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
         elif args.command == "run":
             payload = _asyncio_run(_run_command(args))
-        else:
+        elif args.command == "summarize":
             matrix = read_resolved_matrix(args.resolved_matrix)
             summary = summarize_results(
                 matrix,
@@ -80,6 +87,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 validator=AuraCellExecutor(data_root=args.output / "runs"),
             )
             payload = summary.model_dump(mode="json")
+        else:
+            payload = validate_pilot_bundle(args.manifest)
+            if args.require_approved and payload["gate_status"] != "approved":
+                raise ValueError("pilot human-review gate is not approved")
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

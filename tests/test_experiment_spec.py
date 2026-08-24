@@ -182,7 +182,7 @@ def test_resolved_matrix_rejects_cross_field_provenance_drift() -> None:
         ResolvedMatrix.model_validate(raw)
 
 
-def test_pilot_matrix_resolves_to_exactly_eight_cells() -> None:
+def test_pilot_matrix_resolves_to_exactly_forty_eight_cells() -> None:
     from backend.experiments.resolve import (
         FileOrLibraryScenarioResolver,
         load_matrix_file,
@@ -197,8 +197,9 @@ def test_pilot_matrix_resolves_to_exactly_eight_cells() -> None:
             base_dir="benchmarks/aurabench-dev"
         ),
     )
-    assert len(resolved.cells) == 8
-    assert {cell.model for cell in resolved.cells} == {"rule_based", "mocked"}
+    assert len(resolved.cells) == 48
+    assert {cell.model for cell in resolved.cells} == {"rule_based"}
+    assert {cell.seed for cell in resolved.cells} == {21001, 21002, 21003}
     assert {cell.topology for cell in resolved.cells} == {"domain_multi"}
     assert {cell.governance for cell in resolved.cells} == {"aura"}
     assert {cell.observation for cell in resolved.cells} == {"stale_offline"}

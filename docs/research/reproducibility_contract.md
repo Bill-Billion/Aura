@@ -29,6 +29,10 @@ proposal 假设只能来自 Agent 当次推理所见的可观测快照，不能�
 
 run 继续使用 sealed `run.json`、`events.jsonl` 和既有完整性校验。实验目录只引用 run ID 与事件日志摘要，不复制或改写原始 trace。
 
+pilot 根目录还必须提交 `manifest.json`。manifest 冻结 matrix contract hash、seed、每个 static/dynamic 场景 contract hash、pair fingerprint、`pair_set_hash`，以及 human-review 协议和状态工件的内容 hash。验证器重新加载 YAML 和设备注册表计算这些值，并要求 matrix 的 scenario/seed 轴与 manifest 完全一致；任一漂移都 fail closed。
+
+人审工件同时绑定 `pair_set_hash` 和 sealed run 的 `source_revision`。PR16 的初始状态必须明确为两个未分配 reviewer slot 和 `pending`，不得填写虚构身份或日期；验证器在密封 run 绑定于 PR20 落地前拒绝任何人工填写的终态。此后只有两个不同 reviewer 对同一 revision 提交覆盖全部 pair 的不可变工件，gate 才能转为 `approved`；分歧必须保留原工件并进入单独 adjudication。
+
 旧 ScenarioSpec 1.x 与历史工件必须继续可加载和重评；2.x 采用新增字段和新 major，不原地迁移或改写 v1 文件。未知 major 必须 fail closed。
 
 ## 恢复与重试

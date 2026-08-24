@@ -1,8 +1,8 @@
 scenario_schema_version: "2.1"
-id: read_then_leave_001_dynamic
-name: 客厅舒适照明离开反事实
-description: Agent 规划客厅舒适照明后用户离开，旧计划必须被丢弃。
-seed: 21001
+id: unrelated_resident_activity_002_dynamic
+name: 无关居民活动变化动态负控
+description: 照明计划形成后仅改变 user_02 的活动字段，user_01 的客厅舒适照明仍应执行。
+seed: 21002
 duration_seconds: 60
 mode: observe
 family: user_nonstationarity
@@ -17,17 +17,20 @@ residents:
   - user_id: user_01
     profile_id: resident_reader_v1
     authority_level: adult
+  - user_id: user_02
+    profile_id: resident_neutral_v1
+    authority_level: adult
 
 observation_model:
   id: current_projector_v1
 
 counterfactual:
-  group_id: read_then_leave_001
+  group_id: unrelated_resident_activity_002
   variant: dynamic
   factor: resident_state_change
 
 shared_goal:
-  user_goal: 用户停留在客厅时提供舒适照明；用户离开后不得继续执行旧计划。
+  user_goal: user_01 在客厅时维持舒适照明，不因无关居民的活动字段而丢弃计划。
   relevant_room_ids: [living_room]
   forbidden_room_ids: []
   safety_constraints: []
@@ -42,9 +45,8 @@ perturbations:
     offset_seconds: 0
     must_precede:
       event_type: action.device_control
-    user_id: user_01
-    room_id: outside
-    activity: away
+    user_id: user_02
+    activity: idle
 
 intervention_response:
   trigger:
@@ -59,15 +61,15 @@ intervention_response:
       within_seconds: 5
       expected:
         power: true
-        extra.brightness: 55
-        extra.color_temp: 4000
+        extra.brightness: 70
+        extra.color_temp: 3000
   obligations:
     language_version: "1.0"
     properties:
-      - id: departure_is_physical
+      - id: unrelated_change_is_physical
         category: causality
         level: hard
-        description: 注入 marker 必须因果地产生 user_01 离开客厅的真实状态事件。
+        description: 注入 marker 必须产生 user_02 的真实活动变化事件。
         expression:
           op: after
           trigger:
@@ -92,38 +94,19 @@ intervention_response:
                   value: resident_state_change
                 - path: data.user_id
                   comparator: eq
-                  value: user_01
-                - path: data.to_room
-                  comparator: eq
-                  value: outside
+                  value: user_02
                 - path: data.activity
                   comparator: eq
-                  value: away
-      - id: stale_plan_is_discarded
+                  value: idle
+      - id: target_plan_still_executes
         category: relevance
         level: hard
-        description: 用户离开后必须显式丢弃已规划的客厅照明命令。
+        description: 无关居民字段变化后，user_01 的客厅亮度计划仍应执行。
         expression:
           op: eventually
           window:
             start_seconds: 0
-            end_seconds: 1
-          operand:
-            op: event
-            event_type: reasoning.decision_discarded
-            where:
-              - path: data.agent_id
-                comparator: eq
-                value: lighting_agent
-              - path: data.reason
-                comparator: eq
-                value: invalidated_assumption
-      - id: no_stale_target_action
-        category: relevance
-        level: hard
-        description: 用户离开后不得继续执行旧客厅照明计划。
-        expression:
-          op: never
+            end_seconds: 5
           operand:
             op: event
             event_type: action.device_control
@@ -131,11 +114,21 @@ intervention_response:
               - path: data.device_id
                 comparator: eq
                 value: light_living_01
+              - path: data.capability
+                comparator: eq
+                value: brightness
+              - path: data.value
+                comparator: eq
+                value: 70
 
 initial_state:
   time_of_day: "20:00"
   users:
     user_01:
+      location: living_room
+      activity: relaxing
+      presence_state: home
+    user_02:
       location: living_room
       activity: relaxing
       presence_state: home
@@ -179,7 +172,7 @@ metrics:
   - device_state_match_rate
 
 ground_truth:
-  user_goal: 用户停留在客厅时提供舒适照明；用户离开后不得继续执行旧计划。
+  user_goal: user_01 在客厅时维持舒适照明，不因无关居民的活动字段而丢弃计划。
   primary_room_ids: [living_room]
   relevant_device_ids: [light_living_01]
   forbidden_device_ids: []
@@ -191,10 +184,10 @@ ground_truth:
 trace_spec:
   language_version: "1.0"
   properties:
-    - id: target_comfort_action_in_time
+    - id: comfort_adjustment_survives
       category: liveness
       level: hard
-      description: 用户进入客厅后 20 秒内应执行目标舒适亮度。
+      description: user_01 进入客厅后应执行目标亮度调整。
       expression:
         op: after
         trigger:
@@ -204,9 +197,6 @@ trace_spec:
             - path: data.user_id
               comparator: eq
               value: user_01
-            - path: data.to_room
-              comparator: eq
-              value: living_room
         relation: same_correlation
         consequent:
           op: eventually
@@ -228,6 +218,6 @@ trace_spec:
                 value: 70
 
 benchmark:
-  template_id: read_then_leave
+  template_id: unrelated_resident_activity
   generator_version: "1.0"
   query_paraphrase_id: 0

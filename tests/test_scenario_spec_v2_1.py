@@ -68,16 +68,16 @@ def test_v2_0_pilot_remains_readable_and_fingerprint_stable() -> None:
     dynamic_spec = ScenarioSpecV2.model_validate(dynamic)
     assert scenario_contract_fingerprint(
         static_spec
-    ) == "ddce7cd266aec236eea0732833d8d33e8d1e9dc6053401a7710643e62871d957"
+    ) == "5c233ac7bd45e7c72dbe22eaf8b33c5ffcee776a511f357d8bca2c73705267f6"
     assert scenario_contract_fingerprint(
         dynamic_spec
-    ) == "727f3ecf1a07a1e63b8b0a5a81bd1955da34b9c0cb9a96d6d3395ca396ae3fd9"
+    ) == "f1b94f8e247525584439ef38ede8023c4bf2f3192bd6df999603a3c215211070"
 
     alternate_spelling = static | {"scenario_schema_version": " 2.0 "}
     alternate = ScenarioSpecV2.model_validate(alternate_spelling)
     assert alternate.model_dump(mode="json")["shared_goal"] is None
     assert scenario_contract_fingerprint(alternate) == (
-        "fc4c085ea43b9ca7d372e04755c7d70bc63bb1e7912497f12eb40f7fb1d17d98"
+        "f1b98c6322ff62acbdb5b26200550e3770f01d750471ac1729e13ba258440c46"
     )
 
 

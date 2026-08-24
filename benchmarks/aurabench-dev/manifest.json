@@ -1,0 +1,139 @@
+{
+  "pilot_manifest_schema_version": "1.0",
+  "benchmark_id": "aurabench_dev_pilot",
+  "matrix": {
+    "reference": "matrix.yaml",
+    "contract_hash": "646dc6ee66856e8e4a8581790c083c8ae9c3e72bf2a6ebdd366ba08c27349102"
+  },
+  "seeds": [
+    21001,
+    21002,
+    21003
+  ],
+  "expected_cells": 48,
+  "pair_set_hash": "a4e1e42c490650dab491581b828aae07c74e9a5335e9afc84ec81b0fd6d8c7da",
+  "pairs": [
+    {
+      "group_id": "comfort_smoke_preemption_008",
+      "pair_fingerprint": "2fc5639243dd4e018c47a5cb45f5b3056c71f7e21f9e24af80dec605c492b042",
+      "static": {
+        "reference": "episodes/comfort_smoke_preemption_static.yaml",
+        "scenario_id": "comfort_smoke_preemption_008_static",
+        "contract_hash": "2676f16847a6f1a81e0053b1e4ec65e5be969484fffa3ae035a7cc03845adfd5"
+      },
+      "dynamic": {
+        "reference": "episodes/comfort_smoke_preemption_dynamic.yaml",
+        "scenario_id": "comfort_smoke_preemption_008_dynamic",
+        "contract_hash": "f18f60db6e745748eca5687975f37b437a508cbb766e4678b2df1c2706864df2"
+      }
+    },
+    {
+      "group_id": "partial_feedback_loss_007",
+      "pair_fingerprint": "f0546f034456dd264aa7a64392d90915801a9a43478dfe1cf1b123022d5e57b1",
+      "static": {
+        "reference": "episodes/partial_feedback_loss_static.yaml",
+        "scenario_id": "partial_feedback_loss_007_static",
+        "contract_hash": "5ad388191adf26469fc33cb4e422741dc595c13bf7f07cf7fb790174d6b0400a"
+      },
+      "dynamic": {
+        "reference": "episodes/partial_feedback_loss_dynamic.yaml",
+        "scenario_id": "partial_feedback_loss_007_dynamic",
+        "contract_hash": "696b0ae37e8219f7e9fd2e9ff9f8b96a79b1aa9939d0dd796633a11c5f8d50c3"
+      }
+    },
+    {
+      "group_id": "read_then_leave_001",
+      "pair_fingerprint": "33a9363862a3bf9f7f31817775678b7d86697c6844eadf5a700a110b81bdcd0e",
+      "static": {
+        "reference": "episodes/read_then_leave_static.yaml",
+        "scenario_id": "read_then_leave_001_static",
+        "contract_hash": "3ac04e094973e174981619da3ba809280966892ad00bb204f89887a9ee275aba"
+      },
+      "dynamic": {
+        "reference": "episodes/read_then_leave_dynamic.yaml",
+        "scenario_id": "read_then_leave_001_dynamic",
+        "contract_hash": "9271c3477ab37a8a2fb0dc5a10ef588166f8c668e1440235e13df313da06e997"
+      }
+    },
+    {
+      "group_id": "single_feedback_loss_006",
+      "pair_fingerprint": "88ebcccad141252427030222e1fa6a57116255d0443f1bbc97979efd8128a898",
+      "static": {
+        "reference": "episodes/single_feedback_loss_static.yaml",
+        "scenario_id": "single_feedback_loss_006_static",
+        "contract_hash": "e70a1ab9cfceeac75acb721da9ed7bd6c506bb6cfb646c3e39ef149eda742806"
+      },
+      "dynamic": {
+        "reference": "episodes/single_feedback_loss_dynamic.yaml",
+        "scenario_id": "single_feedback_loss_006_dynamic",
+        "contract_hash": "84ce58d85939259ae1fbd93170fffc9e6acf860685197387bb9171a4e339adfc"
+      }
+    },
+    {
+      "group_id": "target_failure_before_execution_001",
+      "pair_fingerprint": "1b59b33616ff15404bfef0b6ace671ba6fa380ebba07e18cd6bbc39329120d9e",
+      "static": {
+        "reference": "episodes/target_failure_before_execution_static.yaml",
+        "scenario_id": "target_failure_before_execution_001_static",
+        "contract_hash": "11111f04aa047b3362e268727b2d2ac399f7bc0a37cbc0cd3431ff49c83e2027"
+      },
+      "dynamic": {
+        "reference": "episodes/target_failure_before_execution_dynamic.yaml",
+        "scenario_id": "target_failure_before_execution_001_dynamic",
+        "contract_hash": "d28e0043c05c167b0fdb1f441d53fe41fb54d2ec2cd3cb2edfb678e86170ca4d"
+      }
+    },
+    {
+      "group_id": "target_failure_during_execution_001",
+      "pair_fingerprint": "16efdf406143cf6a2e99533da802e2793bd79181718f75a01e98a474a37f31b5",
+      "static": {
+        "reference": "episodes/target_failure_during_execution_static.yaml",
+        "scenario_id": "target_failure_during_execution_001_static",
+        "contract_hash": "9035bed5bdb4971387755d6af4a1f1ed1281b01d0d9a1361e2202a13f8ef66e0"
+      },
+      "dynamic": {
+        "reference": "episodes/target_failure_during_execution_dynamic.yaml",
+        "scenario_id": "target_failure_during_execution_001_dynamic",
+        "contract_hash": "6aa1fc13bab69d623b64a6613ad3ee584d1f3d16942c02f8d59049e0cd54c291"
+      }
+    },
+    {
+      "group_id": "unrelated_camera_failure_001",
+      "pair_fingerprint": "ced7bb4de0ab3eb88558ab76afcf6eeb3f21636a687bbfcc54cf603ffdbb168e",
+      "static": {
+        "reference": "episodes/unrelated_camera_failure_static.yaml",
+        "scenario_id": "unrelated_camera_failure_001_static",
+        "contract_hash": "87b123f63e9489ec781a391736a55070192ae6f89c7cdb6dc2f883cea46398fe"
+      },
+      "dynamic": {
+        "reference": "episodes/unrelated_camera_failure_dynamic.yaml",
+        "scenario_id": "unrelated_camera_failure_001_dynamic",
+        "contract_hash": "9c4daba3dcdf542d72356f7a069f4602e311dcb734d1514674f18d0d6645bc5e"
+      }
+    },
+    {
+      "group_id": "unrelated_resident_activity_002",
+      "pair_fingerprint": "23a526c805f10bb770636241337611ecd9dc01d120383c8c3dc1f57688d1b3e7",
+      "static": {
+        "reference": "episodes/unrelated_resident_activity_static.yaml",
+        "scenario_id": "unrelated_resident_activity_002_static",
+        "contract_hash": "e98aa9713f3c34d988cef027af074064dffc565d95c78c937cfb7fc8c819872a"
+      },
+      "dynamic": {
+        "reference": "episodes/unrelated_resident_activity_dynamic.yaml",
+        "scenario_id": "unrelated_resident_activity_002_dynamic",
+        "contract_hash": "ec138441c65aed1bda5a797ef88d19228e786bd354b27c35f104d2fc5c4e1d4f"
+      }
+    }
+  ],
+  "human_review": {
+    "protocol": {
+      "reference": "human-review-protocol.md",
+      "sha256": "c70650ec78e88188aa380b5d11b4cfc4385bdc52954793f5488424a1676502c4"
+    },
+    "status": {
+      "reference": "reviews/status.json",
+      "sha256": "559a475667a4abfc714480cca40418bf5166db5c5e75f5b288588bded7a05ce2"
+    }
+  }
+}

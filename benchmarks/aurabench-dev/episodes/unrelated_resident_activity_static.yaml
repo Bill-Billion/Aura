@@ -1,8 +1,8 @@
 scenario_schema_version: "2.1"
-id: read_then_leave_001_static
-name: 客厅舒适照明静态对照
-description: 用户停留在客厅时，已规划的舒适照明正常执行。
-seed: 21001
+id: unrelated_resident_activity_002_static
+name: 无关居民活动变化静态对照
+description: user_01 在客厅时，舒适照明计划不受未发生的无关居民活动变化影响。
+seed: 21002
 duration_seconds: 60
 mode: observe
 family: user_nonstationarity
@@ -17,17 +17,20 @@ residents:
   - user_id: user_01
     profile_id: resident_reader_v1
     authority_level: adult
+  - user_id: user_02
+    profile_id: resident_neutral_v1
+    authority_level: adult
 
 observation_model:
   id: current_projector_v1
 
 counterfactual:
-  group_id: read_then_leave_001
+  group_id: unrelated_resident_activity_002
   variant: static
   factor: resident_state_change
 
 shared_goal:
-  user_goal: 用户停留在客厅时提供舒适照明；用户离开后不得继续执行旧计划。
+  user_goal: user_01 在客厅时维持舒适照明，不因无关居民的活动字段而丢弃计划。
   relevant_room_ids: [living_room]
   forbidden_room_ids: []
   safety_constraints: []
@@ -38,6 +41,10 @@ initial_state:
   time_of_day: "20:00"
   users:
     user_01:
+      location: living_room
+      activity: relaxing
+      presence_state: home
+    user_02:
       location: living_room
       activity: relaxing
       presence_state: home
@@ -81,7 +88,7 @@ metrics:
   - device_state_match_rate
 
 ground_truth:
-  user_goal: 用户停留在客厅时提供舒适照明；用户离开后不得继续执行旧计划。
+  user_goal: user_01 在客厅时维持舒适照明，不因无关居民的活动字段而丢弃计划。
   primary_room_ids: [living_room]
   relevant_device_ids: [light_living_01]
   forbidden_device_ids: []
@@ -93,10 +100,10 @@ ground_truth:
 trace_spec:
   language_version: "1.0"
   properties:
-    - id: target_comfort_action_in_time
+    - id: comfort_adjustment_survives
       category: liveness
       level: hard
-      description: 用户进入客厅后 20 秒内应执行目标舒适亮度。
+      description: user_01 进入客厅后应执行目标亮度调整。
       expression:
         op: after
         trigger:
@@ -106,9 +113,6 @@ trace_spec:
             - path: data.user_id
               comparator: eq
               value: user_01
-            - path: data.to_room
-              comparator: eq
-              value: living_room
         relation: same_correlation
         consequent:
           op: eventually
@@ -130,6 +134,6 @@ trace_spec:
                 value: 70
 
 benchmark:
-  template_id: read_then_leave
+  template_id: unrelated_resident_activity
   generator_version: "1.0"
   query_paraphrase_id: 0

@@ -34,7 +34,7 @@ def test_valid_pair_has_stable_fingerprint() -> None:
     assert first[0].group_id == "read_then_leave_001"
     assert first[0].fingerprint == second[0].fingerprint
     assert first[0].fingerprint == (
-        "c1f1e567b60977c5f67ab1b5efffcbb0d0475bcb89bf7a0df5e7c0fd7e16cadc"
+        "33a9363862a3bf9f7f31817775678b7d86697c6844eadf5a700a110b81bdcd0e"
     )
 
 
