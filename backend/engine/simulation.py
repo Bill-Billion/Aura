@@ -67,10 +67,12 @@ from backend.scenarios.generator import (
 from backend.scenarios.spec import ScenarioSpec
 from backend.scenarios.spec_v2 import (
     ScenarioSpecV2,
-    apply_compiled_device_perturbations,
-    compile_device_perturbations,
+    apply_compiled_perturbations,
+    compile_perturbations,
     unsupported_perturbations,
 )
+from backend.residents import ResidentEngine
+from backend.residents.policy import RESPONSIVE_EVENT_TYPES
 from backend.simulators.environment import EnvironmentSimulator
 from backend.simulators.user_behavior import UserBehaviorSimulator
 
@@ -143,6 +145,10 @@ class SimulationEngine:
 
         self.env_sim = EnvironmentSimulator()
         self.user_sim = UserBehaviorSimulator()
+        # v1 continues to use ``user_sim`` unchanged.  A v2 reset installs one
+        # deterministic resident runtime whose latent profile never enters
+        # WorldState (and therefore never enters the agent observation).
+        self.resident_engine: ResidentEngine | None = None
         self.timer = SimulatorTimer(
             publish_event=self._publish_sim_event,
             tick_interval=self.TICK_INTERVAL,
@@ -456,7 +462,7 @@ class SimulationEngine:
         if isinstance(spec, ScenarioSpecV2) and unsupported_perturbations(spec):
             raise PerturbationRuntimeUnavailableError(spec)
         compiled_perturbations = (
-            compile_device_perturbations(spec)
+            compile_perturbations(spec)
             if isinstance(spec, ScenarioSpecV2)
             else ()
         )
@@ -525,6 +531,7 @@ class SimulationEngine:
         self.timer.reset()
         self.timer.set_mode(self.DEFAULT_MODE)
         self.user_sim = UserBehaviorSimulator()
+        self.resident_engine = None
         self.last_engine_error = None
         self._pending_deltas = []
         # 换了世界（或清了世界）之后旧违规不再成立，去抖状态必须跟着复位。
@@ -583,13 +590,22 @@ class SimulationEngine:
                 scenario_trace_spec_fingerprint(spec) if spec is not None else None
             ),
         )
+        if isinstance(spec, ScenarioSpecV2):
+            self.resident_engine = ResidentEngine(
+                spec.residents,
+                world=self.state_manager.world,
+                policy_kind="responsive",
+                # Share the run's named-stream registry so any future seeded
+                # resident policy is represented in run provenance.
+                rng=self.run_manager.rng,
+            )
         # 产线绑定必须在 _start_run 之后：GenerationContext 盖的是**新** run 的章，
         # 随机子流取自新 run 的 SimRandom（一 run 一 seed）。没有场景就摘干净——
         # 留着上一个场景的产线，等于用旧场景的 timeline 驱动一个匿名的新实验。
         try:
             if isinstance(spec, ScenarioSpecV2):
-                apply_compiled_device_perturbations(
-                    compiled_perturbations, self.command_executor.device_runtime
+                apply_compiled_perturbations(
+                    compiled_perturbations, self
                 )
             if spec is not None:
                 self._install_generation_sources(spec, stochastic_overrides=stochastic_overrides)
@@ -654,6 +670,10 @@ class SimulationEngine:
         for event_type in self._USER_MOVEMENT_SUBSCRIPTIONS:
             self.event_bus.subscribe(event_type, self._handle_user_activity_change)
         self.event_bus.subscribe(ENVIRONMENT_STATE_REFRESH, self._handle_environment_refresh)
+        for event_type in sorted(RESPONSIVE_EVENT_TYPES):
+            self.event_bus.subscribe(event_type, self._handle_resident_input)
+        for event_type in self._RESIDENT_STATE_EVENT_TYPES:
+            self.event_bus.subscribe(event_type, self._handle_resident_state_event)
         # 工件写入订阅在总线的 wildcard 上（而不是包在 _publish_sim_event 里）：
         # 只有这样才能连"不经引擎、直接 bus.publish"的事件（main.py 的 UI 根事件）
         # 一起收进工件，且拿到的是已经盖好 seq/run_id 章的那一份。
@@ -669,6 +689,10 @@ class SimulationEngine:
         for event_type in self._USER_MOVEMENT_SUBSCRIPTIONS:
             self.event_bus.unsubscribe(event_type, self._handle_user_activity_change)
         self.event_bus.unsubscribe(ENVIRONMENT_STATE_REFRESH, self._handle_environment_refresh)
+        for event_type in sorted(RESPONSIVE_EVENT_TYPES):
+            self.event_bus.unsubscribe(event_type, self._handle_resident_input)
+        for event_type in self._RESIDENT_STATE_EVENT_TYPES:
+            self.event_bus.unsubscribe(event_type, self._handle_resident_state_event)
         self.event_bus.unsubscribe("*", self._record_event_artifact)
         self._subscriptions_registered = False
 
@@ -733,6 +757,14 @@ class SimulationEngine:
         )
 
         sim_time_s = self.sim_time_s
+        # Resident/safety perturbations are due before device completions at
+        # the same simulated instant.  This makes a scheduled safety event a
+        # real preemption boundary instead of an after-the-fact notification.
+        if self.resident_engine is not None:
+            for resident_event in self.resident_engine.advance(
+                world, sim_time_s=sim_time_s, tick=timer_tick
+            ):
+                await self._publish_sim_event(resident_event)
         await self.command_executor.advance_device_runtime(sim_time_s, tick=timer_tick)
         sources = self.generation_sources
 
@@ -924,6 +956,80 @@ class SimulationEngine:
             event,
         )
 
+    # ScenarioSpecV2 perturbation-runtime protocol.  Device interventions are
+    # delegated to PR-2's runtime; resident and safety interventions share the
+    # resident simulated-time queue so equal-time ordering stays deterministic.
+    def inject_device_failure(
+        self, device_id: str, *, at_sim_time_s: float = 0.0
+    ) -> None:
+        self.command_executor.device_runtime.inject_device_failure(
+            device_id, at_sim_time_s=at_sim_time_s
+        )
+
+    def inject_feedback_loss(
+        self,
+        device_id: str,
+        *,
+        drop_count: int = 1,
+        at_sim_time_s: float = 0.0,
+    ) -> None:
+        self.command_executor.device_runtime.inject_feedback_loss(
+            device_id,
+            drop_count=drop_count,
+            at_sim_time_s=at_sim_time_s,
+        )
+
+    def inject_resident_state_change(
+        self,
+        user_id: str,
+        *,
+        room_id: str | None,
+        activity: str | None,
+        at_sim_time_s: float,
+    ) -> None:
+        if self.resident_engine is None:
+            raise RuntimeError("resident perturbation requires a v2 resident runtime")
+        self.resident_engine.inject_resident_state_change(
+            user_id,
+            room_id=room_id,
+            activity=activity,
+            at_sim_time_s=at_sim_time_s,
+        )
+
+    def inject_conflicting_request(
+        self,
+        user_id: str,
+        *,
+        room_id: str,
+        intent: str,
+        at_sim_time_s: float,
+    ) -> None:
+        if self.resident_engine is None:
+            raise RuntimeError("conflicting request requires a v2 resident runtime")
+        self.resident_engine.inject_conflicting_request(
+            user_id,
+            room_id=room_id,
+            intent=intent,
+            at_sim_time_s=at_sim_time_s,
+        )
+
+    def inject_safety_interrupt(
+        self,
+        *,
+        room_id: str,
+        event_type: str,
+        severity: str,
+        at_sim_time_s: float,
+    ) -> None:
+        if self.resident_engine is None:
+            raise RuntimeError("safety interrupt requires a v2 resident runtime")
+        self.resident_engine.inject_safety_interrupt(
+            room_id=room_id,
+            event_type=event_type,
+            severity=severity,
+            at_sim_time_s=at_sim_time_s,
+        )
+
     async def _handle_safety_interrupt(self, event: SimEvent) -> None:
         """A safety root event preempts every currently executing device operation."""
 
@@ -931,6 +1037,52 @@ class SimulationEngine:
             reason=f"safety interrupt: {event.event_type}",
             tick=self.state_manager.world.simulation_tick,
         )
+
+    _RESIDENT_STATE_EVENT_TYPES: tuple[str, ...] = (
+        "resident.satisfied",
+        "resident.dissatisfied",
+        "resident.regret",
+        "resident.correction",
+        "resident.override",
+    )
+
+    async def _handle_resident_input(self, event: SimEvent) -> None:
+        runtime = self.resident_engine
+        if runtime is None:
+            return
+        for response_event in runtime.handle_event(
+            self.state_manager.world,
+            event,
+            sim_time_s=float(event.sim_time_s if event.sim_time_s is not None else self.sim_time_s),
+        ):
+            await self._publish_sim_event(response_event)
+
+    async def _handle_resident_state_event(self, event: SimEvent) -> None:
+        """Expose satisfaction only; profile/preferences stay latent."""
+
+        user_id = str(event.data.get("user_id") or "")
+        user = self.state_manager.world.users.get(user_id)
+        if user is None:
+            return
+        satisfaction = event.data.get("satisfaction")
+        if isinstance(satisfaction, bool) or not isinstance(satisfaction, (int, float)):
+            return
+        self._pending_deltas.extend(
+            self.state_manager.apply_path_update(
+                caused_by=event.source,
+                path=f"users[{user_id}].comfort_score",
+                new_value=float(satisfaction),
+                reason="resident satisfaction response",
+                caused_by_event_id=event.event_id,
+            )
+        )
+        if not self._is_processing_timer_tick:
+            await self._flush_pending_deltas()
+            await self._report_world_invariants(
+                phase="resident_state_response",
+                attributed_to=event.source,
+                root_event=event,
+            )
 
     # ------------------------------------------------------------------
     # 主循环故障（critic 修正③：绝不假活）
@@ -989,7 +1141,13 @@ class SimulationEngine:
 
         updates: list[tuple[str, Any]] = []
         if target_room:
-            updates.append((f"users[{user_id}].location", Location3D(room=target_room)))
+            location = (
+                None
+                if target_room == "outside"
+                and event.data.get("perturbation_type") == "resident_state_change"
+                else Location3D(room=target_room)
+            )
+            updates.append((f"users[{user_id}].location", location))
         if activity:
             updates.append((f"users[{user_id}].activity", activity))
 
@@ -1021,6 +1179,12 @@ class SimulationEngine:
                 caused_by=event.source,
                 updates=updates,
                 reason="apply user activity change",
+                caused_by_event_id=(
+                    event.event_id
+                    if event.data.get("perturbation_type")
+                    == "resident_state_change"
+                    else None
+                ),
             )
         )
 

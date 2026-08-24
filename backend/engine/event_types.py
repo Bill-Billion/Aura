@@ -161,6 +161,8 @@ def starts_agent_episode(event_type: str, data: Mapping[str, Any] | None = None)
         reasons = payload.get("significant_change_reasons")
         return isinstance(reasons, list) and bool(reasons)
     if event_type == USER_COMMAND:
+        if payload.get("resident_request") is True:
+            return True
         if payload.get("message_type") == "CMD_DEVICE_CONTROL":
             return False
         if payload.get("device_id") and (payload.get("capability") or payload.get("property")):
