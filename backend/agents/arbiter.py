@@ -78,6 +78,7 @@ from backend.execution.command import (
 from backend.execution.executor import (
     CommandExecutor,
     CommandTarget,
+    PreExecuteHook,
     PreSubmitDecision,
 )
 
@@ -1001,6 +1002,7 @@ class ArbitrationGate:
         record: CommandRecord,
         *,
         publish: PublishEvent,
+        pre_execute: PreExecuteHook | None = None,
         tick: int | None = None,
     ) -> CommandRecord:
         """把一条已批准的 ``proposed`` 记录交给 executor 跑完剩余流水线。
@@ -1013,7 +1015,11 @@ class ArbitrationGate:
         if record.is_terminal:
             return record
         return await executor.execute_approved(
-            record, pre_submit=self.pre_submit, tick=tick, publish=publish
+            record,
+            pre_submit=self.pre_submit,
+            pre_execute=pre_execute,
+            tick=tick,
+            publish=publish,
         )
 
     def _require_executor(self) -> CommandExecutor:

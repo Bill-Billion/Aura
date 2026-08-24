@@ -283,6 +283,20 @@ class StateManager:
         """Return a plain-dict deep copy of the entire world state."""
         return self.world.snapshot().model_dump()
 
+    @classmethod
+    def read_path(cls, obj: BaseModel | dict, path: str) -> Any:
+        """Read a state path without exposing a mutable value."""
+
+        current: Any = obj
+        for part in cls._tokenize_path(path):
+            if current is None:
+                return None
+            if isinstance(current, dict):
+                current = current[part]
+            else:
+                current = getattr(current, part)
+        return copy.deepcopy(current)
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------

@@ -33,6 +33,7 @@
 
 from __future__ import annotations
 
+import re
 from enum import Enum
 from typing import Any, Iterable
 
@@ -54,6 +55,7 @@ __all__ = [
     "OrchestrationPolicy",
     "PRIORITY_LEVELS",
     "PriorityLevel",
+    "ProposalAssumption",
     "ProposalOutcome",
     "RootEventContext",
     "RootEventRef",
@@ -457,6 +459,30 @@ NON_ACTION_OUTCOMES: frozenset[ProposalOutcome] = frozenset(
 )
 
 
+_ASSUMPTION_PATH_RE = re.compile(
+    r"^(?:"
+    r"users\[[^\]]+\]\.(?:activity|location\.room)|"
+    r"rooms\[[^\]]+\]\.occupancy|"
+    r"devices\[[^\]]+\]\.state\.(?:power|extra\.[A-Za-z0-9_-]+)|"
+    r"environment\.(?:time_of_day|weather|outdoor_temp|outdoor_humidity)"
+    r")$"
+)
+
+
+class ProposalAssumption(_StrictModel):
+    """One observable guard that must still hold when a proposal executes."""
+
+    path: str = Field(min_length=1, max_length=512)
+    equals: str | int | float | bool | None
+
+    @field_validator("path")
+    @classmethod
+    def _allow_observable_path(cls, value: str) -> str:
+        if not _ASSUMPTION_PATH_RE.fullmatch(value):
+            raise ValueError(f"unsupported proposal assumption path: {value!r}")
+        return value
+
+
 class AgentProposal(_StrictModel):
     """§8.4 统一提案契约：agent **只提案，不写世界**。
 
@@ -482,6 +508,8 @@ class AgentProposal(_StrictModel):
     withheld_commands: list[AgentCommandProposal] = Field(default_factory=list)
     confidence_source: ConfidenceSource = ConfidenceSource.RULE_BASED
     agent_role: str = ""
+    assumptions: list[ProposalAssumption] = Field(default_factory=list)
+    observed_world_version: int | None = Field(default=None, ge=0)
 
     _no_legacy_priority = field_validator("priority", mode="before")(
         _reject_unmapped_legacy_label

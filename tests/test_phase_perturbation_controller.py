@@ -302,7 +302,10 @@ async def test_dynamic_pilot_persists_anchor_evidence_and_physical_change() -> N
         event
         for event in history
         if event.event_type == "action.device_control"
-        and event.correlation_id == evidence.correlation_id
+        and event.data.get("device_id") == "light_living_01"
+        and event.seq is not None
+        and evidence.seq is not None
+        and event.seq > evidence.seq
     ]
     physical = next(
         event
@@ -310,16 +313,157 @@ async def test_dynamic_pilot_persists_anchor_evidence_and_physical_change() -> N
         if event.event_type == "user.activity_change"
         and event.data.get("perturbation_type") == "resident_state_change"
     )
+    discarded_events = [
+        event
+        for event in history
+        if event.event_type == "reasoning.decision_discarded"
+        and event.causal_parent == plan.event_id
+    ]
+    assert len(discarded_events) == 1
+    discarded = discarded_events[0]
 
-    assert plan.seq is not None and evidence.seq is not None
-    assert plan.seq < evidence.seq
-    assert physical.seq is not None and evidence.seq < physical.seq
-    if actions:
-        assert actions[0].seq is not None and physical.seq < actions[0].seq
+    assert all(
+        seq is not None
+        for seq in (plan.seq, evidence.seq, physical.seq, discarded.seq)
+    )
+    assert plan.seq < evidence.seq < physical.seq < discarded.seq
     assert physical.causal_parent == evidence.event_id
     assert physical.correlation_id == evidence.correlation_id
+    assert discarded.data["reason"] == "invalidated_assumption"
+    assert {
+        item["path"]: (item["expected"], item["actual"], item["missing"])
+        for item in discarded.data["invalidated_assumptions"]
+    } == {
+        "rooms[living_room].occupancy": (True, False, False),
+        "users[user_01].activity": ("reading", "away", False),
+        "users[user_01].location.room": ("living_room", None, False),
+    }
+    assert discarded.data["discarded_commands"] == plan.data["commands"]
+    assert not actions
+    assert not any(
+        event.event_type == "action.device_control"
+        and event.causal_parent == plan.event_id
+        for event in history
+    )
+    assert not any(
+        event.event_type == "command.lifecycle"
+        and event.causal_parent == plan.event_id
+        and event.data.get("to_status")
+        in {"approved", "validated", "executing", "succeeded"}
+        for event in history
+    )
     assert runner.state_manager.world.users["user_01"].location is None
     assert runner.state_manager.world.users["user_01"].activity == "away"
+    assert runner.state_manager.world.devices["light_living_01"].state.power is False
+
+
+@pytest.mark.anyio
+async def test_resident_change_at_executor_boundary_cancels_stale_plan() -> None:
+    spec = _phase_spec(
+        "resident_state_change",
+        "during_execution",
+        "command.lifecycle",
+        "device.effect_applied",
+        anchor_where=[
+            {"path": "data.to_status", "comparator": "eq", "value": "executing"}
+        ],
+    )
+    result = await ScenarioRunner(spec).run()
+    history = list(result.events)
+
+    evidence = next(
+        event
+        for event in history
+        if event.event_type == PERTURBATION_INJECTED_EVENT_TYPE
+    )
+    executing = next(event for event in history if event.event_id == evidence.causal_parent)
+    plan = next(event for event in history if event.event_id == executing.causal_parent)
+    discarded_events = [
+        event
+        for event in history
+        if event.event_type == "reasoning.decision_discarded"
+        and event.causal_parent == plan.event_id
+    ]
+    assert len(discarded_events) == 1
+    discarded = discarded_events[0]
+
+    assert executing.data["to_status"] == "executing"
+    assert discarded.data["reason"] == "invalidated_assumption"
+    assert discarded.data["discarded_commands"] == plan.data["commands"]
+    assert not any(
+        event.event_type == "action.device_control"
+        and event.causal_parent == plan.event_id
+        for event in history
+    )
+    cancelled = [
+        event
+        for event in history
+        if event.event_type == "command.lifecycle"
+        and event.causal_parent == plan.event_id
+        and event.data.get("to_status") == "cancelled"
+        and event.data.get("detail")
+        == "proposal assumption invalidated before execution"
+    ]
+    assert len(cancelled) == len(plan.data["commands"])
+
+
+@pytest.mark.anyio
+async def test_device_change_at_executor_boundary_cancels_stale_target() -> None:
+    spec = _phase_spec(
+        "device_failure",
+        "during_execution",
+        "command.lifecycle",
+        "device.effect_applied",
+        anchor_where=[
+            {"path": "data.to_status", "comparator": "eq", "value": "executing"}
+        ],
+    )
+    result = await ScenarioRunner(spec).run()
+    history = list(result.events)
+
+    evidence = next(
+        event
+        for event in history
+        if event.event_type == PERTURBATION_INJECTED_EVENT_TYPE
+    )
+    executing = next(event for event in history if event.event_id == evidence.causal_parent)
+    plan = next(event for event in history if event.event_id == executing.causal_parent)
+    discarded = next(
+        event
+        for event in history
+        if event.event_type == "reasoning.decision_discarded"
+        and event.causal_parent == plan.event_id
+    )
+
+    assert discarded.data["reason"] == "stale"
+    assert discarded.data["stale_device_ids"] == ["light_living_01"]
+    living_commands = [
+        item
+        for item in plan.data["commands"]
+        if item["device_id"] == "light_living_01"
+    ]
+    assert discarded.data["discarded_commands"] == living_commands
+    assert not any(
+        event.event_type == "action.device_control"
+        and event.data.get("device_id") == "light_living_01"
+        and event.seq is not None
+        and evidence.seq is not None
+        and event.seq > evidence.seq
+        for event in history
+    )
+    assert [
+        (event.data["device_id"], event.data["property"])
+        for event in history
+        if event.event_type == "action.device_control"
+        and event.causal_parent == plan.event_id
+        and event.seq is not None
+        and evidence.seq is not None
+        and event.seq > evidence.seq
+    ] == [
+        (item["device_id"], item["property"])
+        for item in plan.data["commands"]
+        if item["device_id"] != "light_living_01"
+    ]
 
 
 @pytest.mark.anyio
