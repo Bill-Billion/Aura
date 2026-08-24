@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import pytest
 
-from backend.engine.provenance import ResearchRuntimeProfile
+from backend.engine.provenance import ObservationCondition, ResearchRuntimeProfile
 from backend.experiments.fairness import (
     audit_comparison_outputs,
+    audit_observation_comparison_outputs,
     build_fairness_payload,
     comparison_group_id,
+    observation_comparison_group_id,
     validate_comparison_plan,
+    validate_observation_comparison_plan,
 )
 from backend.experiments.resolve import resolve_matrix
 from backend.experiments.runner import MatrixRunner, summarize_results
@@ -27,7 +30,12 @@ PROFILES = (
 )
 
 
-def _cell(scenario_id: str, topology: str, governance: str) -> ExperimentCell:
+def _cell(
+    scenario_id: str,
+    topology: str,
+    governance: str,
+    observation: str = "stale_offline",
+) -> ExperimentCell:
     return ExperimentCell.build(
         combination=ExactExclusion(
             scenario=scenario_id,
@@ -35,7 +43,7 @@ def _cell(scenario_id: str, topology: str, governance: str) -> ExperimentCell:
             model="rule_based",
             topology=topology,
             governance=governance,
-            observation="stale_offline",
+            observation=observation,
             repetition=0,
         ),
         scenario=ScenarioContract(
@@ -52,6 +60,13 @@ def _cell(scenario_id: str, topology: str, governance: str) -> ExperimentCell:
 
 def _group(scenario_id: str = "scenario-a") -> list[ExperimentCell]:
     return [_cell(scenario_id, topology, governance) for topology, governance in PROFILES]
+
+
+def _observation_group(scenario_id: str = "scenario-a") -> list[ExperimentCell]:
+    return [
+        _cell(scenario_id, "domain_multi", "aura", observation)
+        for observation in ("perfect", "stale_offline")
+    ]
 
 
 def _metadata(
@@ -187,6 +202,63 @@ def test_single_profile_matrix_is_not_misreported_as_a_comparison() -> None:
     )
     assert audit.valid_groups == 0
     assert audit.invalid_groups == 0
+
+
+def test_observation_plan_and_audit_require_both_conditions_at_fixed_profile() -> None:
+    cells = _observation_group()
+    validate_observation_comparison_plan(
+        cells,
+        expected_observations=list(ObservationCondition),
+    )
+    with pytest.raises(ValueError, match=r"missing=\['stale_offline'\]"):
+        validate_observation_comparison_plan(
+            cells[:1],
+            expected_observations=list(ObservationCondition),
+        )
+
+    outputs = {
+        cell.cell_id: {
+            "fairness": build_fairness_payload(
+                cell,
+                run_metadata=_metadata(cell),
+                evaluation=EVALUATION,
+            )
+        }
+        for cell in cells
+    }
+    audit = audit_observation_comparison_outputs(
+        cells,
+        outputs,
+        expected_observations=list(ObservationCondition),
+    )
+    assert audit.valid_groups == 1
+    assert audit.invalid_groups == 0
+    assert audit.valid_group_ids == (observation_comparison_group_id(cells[0]),)
+
+
+def test_observation_audit_invalidates_fixed_profile_provenance_drift() -> None:
+    cells = _observation_group()
+    outputs = {
+        cell.cell_id: {
+            "fairness": build_fairness_payload(
+                cell,
+                run_metadata=_metadata(
+                    cell,
+                    duration_seconds=60.0 if cell.observation == "perfect" else 61.0,
+                ),
+                evaluation=EVALUATION,
+            )
+        }
+        for cell in cells
+    }
+    audit = audit_observation_comparison_outputs(
+        cells,
+        outputs,
+        expected_observations=list(ObservationCondition),
+    )
+    assert audit.valid_groups == 0
+    assert audit.invalid_groups == 1
+    assert "duration_seconds" in next(iter(audit.invalid_reasons.values()))[0]
 
 
 def test_truncated_fairness_payload_is_invalid_evidence() -> None:
@@ -419,3 +491,63 @@ async def test_cross_shard_summary_exposes_invalid_fairness_group(tmp_path) -> N
     assert valid_summary.invalid_baseline_groups == 0
     assert valid_summary.scientific_valid_cells == 2
     assert valid_summary.scientific_benchmark_pass == 2
+
+
+@pytest.mark.anyio
+async def test_summary_records_valid_observation_group_ids(tmp_path) -> None:
+    class Resolver:
+        @staticmethod
+        def resolve(reference: str) -> ScenarioContract:
+            return ScenarioContract(
+                reference=reference,
+                scenario_id=reference,
+                scenario_contract_hash="e" * 64,
+            )
+
+    spec = MatrixSpec.model_validate(
+        {
+            "matrix_id": "observation_summary",
+            "axes": {
+                "scenario": ["scenario-a"],
+                "seed": [42],
+                "model": ["rule_based"],
+                "topology": ["domain_multi"],
+                "governance": ["aura"],
+                "observation": ["perfect", "stale_offline"],
+                "repetition": [0],
+            },
+            "max_cells": 2,
+            "max_total_cost_usd": 0,
+            "cost_per_model_usd": {"rule_based": 0},
+        }
+    )
+    matrix = resolve_matrix(
+        spec,
+        scenario_resolver=Resolver(),
+        source_revision="test-revision",
+    )
+
+    class Executor:
+        @staticmethod
+        def validate_completed(cell, output, *, matrix_hash):
+            return True
+
+        async def execute(self, cell, *, matrix_hash):
+            evaluation = {"outcome": "pass", **EVALUATION}
+            return {
+                "evaluation": evaluation,
+                "fairness": build_fairness_payload(
+                    cell,
+                    run_metadata=_metadata(cell),
+                    evaluation=evaluation,
+                ),
+            }
+
+    summary = await MatrixRunner(Executor()).run(matrix, output_dir=tmp_path)
+    assert summary.valid_baseline_groups == 0
+    assert summary.valid_observation_groups == 1
+    assert summary.invalid_observation_groups == 0
+    assert summary.valid_observation_group_ids == [
+        observation_comparison_group_id(matrix.cells[0])
+    ]
+    assert summary.scientific_valid_cells == 2

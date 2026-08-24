@@ -131,6 +131,7 @@ from backend.engine.event_log import (
 )
 from backend.engine.provenance import (
     ExperimentRuntimeSelection,
+    ObservationCondition,
     ResearchRuntimeProfile,
     research_runtime_profile_for_axes,
 )
@@ -138,7 +139,7 @@ from backend.engine.event_types import (
     ENVIRONMENT_STATE_REFRESH,
     starts_agent_episode,
 )
-from backend.engine.observation import ObservableProjector
+from backend.engine.observation import ObservationFrame, ObservableProjector
 from backend.engine.run_manager import (
     STALE_RUN_DISCARD_EVENT_TYPE,
     STALE_RUN_DISCARD_REASON,
@@ -471,6 +472,10 @@ class AgentRuntime:
         # 「算可以并发，发必须串行」的那把闸门（见模块开头的顺序契约）。
         # 它是 S2-T9 确定性门的机制本体，S3 的编排器分发循环必须继续走它。
         self.emission_gate = SerialEmissionGate()
+        # Frame evidence has its own short critical section. It is persisted
+        # before planning, in root order, without holding the episode emission
+        # gate across controller latency.
+        self.observation_emission_gate = SerialEmissionGate()
         # 每条 episode task 记 correlation/root/agents，取消时才能落账
         # system.episode_cancelled（取消的协程自身只会收到 CancelledError）。
         self._episode_meta: dict[asyncio.Task[None], dict[str, Any]] = {}
@@ -764,6 +769,15 @@ class AgentRuntime:
             governance,
             arbiter=self.arbiter,
         )
+        observation = (
+            selection.observation
+            if selection is not None
+            else ObservationCondition.STALE_OFFLINE
+        )
+        # Observation is a run-scoped treatment independent of governance.
+        # Replacing (rather than mutating) the projector also guarantees that
+        # last-report history cannot cross conditions or runs.
+        self.observation_projector = ObservableProjector(observation)
         self.active_experiment_runtime = selection
         if self.state_manager is not None:
             active_agent_ids = {agent.agent_id for agent in self.agents}
@@ -845,6 +859,16 @@ class AgentRuntime:
             raise RuntimeError("AgentRuntime is not bound")
         return self.observation_projector.observe(self.state_manager.world)
 
+    def observation_frame(self, root_event: SimEvent) -> ObservationFrame:
+        """Capture the world and root-event channels at one perception boundary."""
+
+        if self.state_manager is None:
+            raise RuntimeError("AgentRuntime is not bound")
+        return self.observation_projector.observe_frame(
+            self.state_manager.world,
+            root_event,
+        )
+
     # --- run 身份（§2.2 "旧 run 的变更不得应用到活跃 run"）------------------
 
     def current_run_id(self) -> str | None:
@@ -909,6 +933,7 @@ class AgentRuntime:
         self.observation_projector.reset()
         # 成本预算是 per run；上一 run 的 episode 台账不能挤占下一 run 的预算。
         self.cost_guard.reset()
+        self.observation_emission_gate.reset()
         # 旧世界的 explicit_user 占用不属于新世界：不清掉的话，reset 之后第一条
         # agent 提案会输给一条根本不存在的用户命令。
         self.arbitration_gate.forget_claims()
@@ -952,6 +977,7 @@ class AgentRuntime:
         # 全部在飞 episode 已被取消并等回，此刻没有持号者：闸门归零，新 run 从 0 号重新开始。
         # （不归零的话，新 run 的第一条 episode 会去等一个永远不会被服务的旧号。）
         self.emission_gate.reset()
+        self.observation_emission_gate.reset()
 
         if not cancelled_episodes:
             return
@@ -1018,6 +1044,7 @@ class AgentRuntime:
         self._episode_meta.clear()
         self._last_environment_episode_started_at.clear()
         self.emission_gate.reset()
+        self.observation_emission_gate.reset()
 
     def _refresh_subscriptions(self) -> None:
         self._unsubscribe_handlers()
@@ -1049,8 +1076,12 @@ class AgentRuntime:
         self._subscriptions_registered = False
 
     async def _handle_root_event(self, event: SimEvent) -> None:
-        self.memory_store.remember(event)
         if not self.trigger_classifier.should_start_episode(event):
+            if self.state_manager is not None:
+                # Even a non-triggering device report may refresh the
+                # last-online cache. Store only the projected event.
+                frame = self.observation_frame(event)
+                self.memory_store.remember(frame.observed_root_event)
             return
         # 当前前端发来的 CMD_DEVICE_CONTROL 已经是最终设备命令，
         # 这里不再重复触发一轮 agent 推理，避免淹没旧协议的即时反馈。
@@ -1070,15 +1101,22 @@ class AgentRuntime:
                 self.emission_gate.release(emission_ticket)
                 raise
 
-        # §2.3：从这里往下，agent 侧看到的一律是 observable 投影。相关性判定也算 agent
-        # 的感知（它读 devices/rooms），因此与 episode 共用**同一次**投影——分两次取会
-        # 让"决定要不要跑"和"跑的时候看到的"来自两个不同时刻的观测。
-        observable = self.observable_world()
+        # §2.3：world 与 root event 是同一个感知边界。原始物理事件只能留在审计总线；
+        # memory/relevance/orchestrator/domain/single-direct 全部消费投影后的副本，避免 event.data
+        # 绕过 stale-offline 投影泄漏设备真值。
+        frame = self.observation_frame(event)
+        observed_event = frame.observed_root_event
+        self.memory_store.remember(observed_event)
+        observable = frame.observable_world
         # S3-T7：与那次投影**同一刻**的世界版本。陈旧判定的语义就是"这条决策据以推理的
         # 世界读数是在这个版本上取的"，所以它必须与 observable 在同一行取，不能在
         # episode 协程里补取——那已经隔了若干次调度。
         observed_version = self._current_world_version()
-        relevant_agents = [agent for agent in self.agents if agent.is_relevant(observable, event)]
+        relevant_agents = [
+            agent
+            for agent in self.agents
+            if agent.is_relevant(observable, observed_event)
+        ]
         if not relevant_agents:
             if emission_ticket is not None:
                 self.emission_gate.release(emission_ticket)
@@ -1090,7 +1128,7 @@ class AgentRuntime:
             # Only the compatibility refresh is high-frequency. Rich threshold
             # roots are already edge-triggered by the generator's hysteresis and
             # §15 requires each of them to produce a visible queued episode.
-            if event.event_type == ENVIRONMENT_STATE_REFRESH:
+            if observed_event.event_type == ENVIRONMENT_STATE_REFRESH:
                 existing = self._active_tasks.get(agent.agent_id)
                 if existing is not None and not existing.done():
                     continue
@@ -1114,35 +1152,38 @@ class AgentRuntime:
         # 与 agent 算得快慢无关——这是整条确定性链的起点。
         if emission_ticket is None:
             emission_ticket = self.emission_gate.take_ticket()
+        observation_emission_ticket = self.observation_emission_gate.take_ticket()
         # episode 在起点抓一次 run_id：它跑完时活跃 run 可能已经换了（reset / 场景连跑），
         # 落地前拿这份快照与当时的活跃 run 对账（§2.2）。
         episode_run_id = self.current_run_id()
         task = asyncio.create_task(
             self._run_episode(
-                event,
+                observed_event,
                 agents_to_run,
                 run_id=episode_run_id,
-                observable=observable,
+                observation_frame=frame,
+                observation_emission_ticket=observation_emission_ticket,
                 observed_version=observed_version,
                 emission_ticket=emission_ticket,
             )
         )
         self._background_tasks.add(task)
         self._episode_meta[task] = {
-            "correlation_id": event.correlation_id,
-            "root_event_id": event.event_id,
+            "correlation_id": observed_event.correlation_id,
+            "root_event_id": observed_event.event_id,
             "agent_ids": [agent.agent_id for agent in agents_to_run],
             "run_id": episode_run_id,
         }
         for agent in agents_to_run:
             self._active_tasks[agent.agent_id] = task
-            if event.event_type == ENVIRONMENT_STATE_REFRESH:
+            if observed_event.event_type == ENVIRONMENT_STATE_REFRESH:
                 self._last_environment_episode_started_at[agent.agent_id] = now
 
         def _cleanup(done_task: asyncio.Task[None], agent_ids: list[str]) -> None:
             # 放号（幂等）：协程体没来得及开始就被取消时，_run_episode 的 finally 不会执行，
             # 只有完成回调一定会跑。漏放一号 = 后续所有 episode 永久排队。
             self.emission_gate.release(emission_ticket)
+            self.observation_emission_gate.release(observation_emission_ticket)
             self._background_tasks.discard(done_task)
             self._episode_meta.pop(done_task, None)
             for agent_id in agent_ids:
@@ -1185,7 +1226,9 @@ class AgentRuntime:
         agents: list[BaseAgent],
         *,
         run_id: str | None = None,
-        observable: WorldState | None = None,
+        observation_frame: ObservationFrame | None = None,
+        observation_capture_event: SimEvent | None = None,
+        observation_emission_ticket: int | None = None,
         observed_version: int | None = None,
         emission_ticket: int | None = None,
     ) -> None:
@@ -1202,7 +1245,9 @@ class AgentRuntime:
                 root_event,
                 agents,
                 run_id=run_id,
-                observable=observable,
+                observation_frame=observation_frame,
+                observation_capture_event=observation_capture_event,
+                observation_emission_ticket=observation_emission_ticket,
                 observed_version=observed_version,
                 ticket=ticket,
             )
@@ -1210,6 +1255,10 @@ class AgentRuntime:
             # 幂等放号。协程体压根没开始就被取消时，本 finally 不会执行——那条路径由
             # _handle_root_event 的任务完成回调兜底（两处都放，漏一处就永久堵死）。
             self.emission_gate.release(ticket)
+            if observation_emission_ticket is not None:
+                self.observation_emission_gate.release(
+                    observation_emission_ticket
+                )
 
     async def _run_episode_body(
         self,
@@ -1217,17 +1266,50 @@ class AgentRuntime:
         agents: list[BaseAgent],
         *,
         run_id: str | None,
-        observable: WorldState | None,
+        observation_frame: ObservationFrame | None,
+        observation_capture_event: SimEvent | None,
+        observation_emission_ticket: int | None,
         ticket: int,
         observed_version: int | None = None,
     ) -> None:
         if self.state_manager is None or self.publish_event is None or self.conn is None:
             return
+        if self._is_stale_run(run_id):
+            await self._discard_stale_episode(
+                root_event=root_event,
+                agents=agents,
+                episode_run_id=run_id,
+                stage="before_observation_capture",
+                envelopes=[],
+            )
+            return
 
-        # §2.3：agent 拿到的是 observable 投影，不是 ground truth 快照。
-        # 调用方（_handle_root_event）已经投影过一次就复用那一份——同一条 episode 里
-        # 相关性判定与推理必须基于同一次观测。
-        snapshot = observable if observable is not None else self.observable_world()
+        # §2.3：agent 拿到的是同一份 sealed frame，不是 ground truth 快照。直接调用
+        # 本方法的测试/未来入口也必须在这里补齐 frame，不能退回裸 WorldState。
+        frame = observation_frame or self.observation_frame(root_event)
+        snapshot = frame.observable_world
+        observed_root_event = frame.observed_root_event
+        capture_event = observation_capture_event
+        if capture_event is None:
+            capture_ticket = (
+                self.observation_emission_gate.take_ticket()
+                if observation_emission_ticket is None
+                else observation_emission_ticket
+            )
+            async with self.observation_emission_gate.turn(capture_ticket):
+                if self._is_stale_run(run_id):
+                    await self._discard_stale_episode(
+                        root_event=observed_root_event,
+                        agents=agents,
+                        episode_run_id=run_id,
+                        stage="before_observation_capture",
+                        envelopes=[],
+                    )
+                    return
+                capture_event = await self._emit_observation_capture(
+                    observed_root_event,
+                    frame,
+                )
         if observed_version is None:
             # 直接调用本方法的入口（单测 / 未来的编排器）没给版本时就地取一次：
             # 与 observable 的兜底同源，陈旧判定因此没有"关掉"的旁路。
@@ -1235,46 +1317,76 @@ class AgentRuntime:
         candidates = self._ordered_agents(agents)
 
         if self.emit_perception_before_plan:
-            # This phase is intentionally serialized from the persisted
-            # perception boundary onward. Releasing and reacquiring the ticket
-            # would let another episode splice events into this causal chain.
+            # after_perception_before_plan is the one experimental boundary
+            # that intentionally holds the episode ticket across planning: its
+            # phase controller must inject synchronously after the visible
+            # reasoning perception and before planner code runs.
             async with self.emission_gate.turn(ticket):
                 if self._is_stale_run(run_id):
+                    await self._discard_stale_episode(
+                        root_event=observed_root_event,
+                        agents=candidates,
+                        episode_run_id=run_id,
+                        stage="before_agent_evaluation",
+                        envelopes=[],
+                    )
                     return
-                perception = await self._emit_preplan_perception(root_event, snapshot)
+                perception = await self._emit_preplan_perception(
+                    observed_root_event,
+                    frame,
+                    observation_capture_event=capture_event,
+                )
                 decision, agents, evaluated = await self._compute_episode(
-                    root_event, snapshot, candidates
+                    observed_root_event,
+                    snapshot,
+                    candidates,
                 )
                 await self._emit_episode(
-                    root_event=root_event,
+                    root_event=observed_root_event,
                     agents=agents,
                     evaluated=evaluated,
                     run_id=run_id,
                     decision=decision,
                     candidates=candidates,
-                    snapshot=snapshot,
+                    observation_frame=frame,
                     observed_version=observed_version,
                     perception_event=perception,
                 )
             return
 
-        # —— 编排（§8.1）：也是"算"的一部分，因此在闸门之外做完。——
-        # 它不写世界、不发事件，只决定"这一轮派给谁、每人干什么"。
+        # Normal episodes retain the original concurrent-compute/serial-emit
+        # contract. Their frame was already persisted above; the human-facing
+        # reasoning perception remains grouped with the rest of the episode.
         decision, agents, evaluated = await self._compute_episode(
-            root_event, snapshot, candidates
+            observed_root_event,
+            snapshot,
+            candidates,
         )
-
-        # 从这里往下是"发"：整段持号，按取号序（=根事件发布序）串行。
         async with self.emission_gate.turn(ticket):
+            if self._is_stale_run(run_id):
+                await self._discard_stale_episode(
+                    root_event=observed_root_event,
+                    agents=agents,
+                    episode_run_id=run_id,
+                    stage="after_agent_evaluation",
+                    envelopes=[item for item in evaluated if item is not None],
+                )
+                return
+            perception = await self._emit_preplan_perception(
+                observed_root_event,
+                frame,
+                observation_capture_event=capture_event,
+            )
             await self._emit_episode(
-                root_event=root_event,
+                root_event=observed_root_event,
                 agents=agents,
                 evaluated=evaluated,
                 run_id=run_id,
                 decision=decision,
                 candidates=candidates,
-                snapshot=snapshot,
+                observation_frame=frame,
                 observed_version=observed_version,
+                perception_event=perception,
             )
 
     async def _compute_episode(
@@ -1417,7 +1529,7 @@ class AgentRuntime:
         run_id: str | None,
         decision: OrchestrationDecision,
         candidates: list[BaseAgent],
-        snapshot: WorldState,
+        observation_frame: ObservationFrame,
         observed_version: int,
         perception_event: SimEvent | None = None,
     ) -> None:
@@ -1430,6 +1542,7 @@ class AgentRuntime:
         if self.state_manager is None or self.publish_event is None or self.conn is None:
             return
 
+        snapshot = observation_frame.observable_world
         envelopes: list[AgentDecisionEnvelope] = []
         # run 门（§2.2）：LLM 那一段是本 episode 最长的 await，期间 run 可能已经换掉。
         # 取消在飞任务是第一道防线，但换 run 不一定伴随取消（场景连跑、headless runner），
@@ -1494,9 +1607,7 @@ class AgentRuntime:
         # Agent diagnostics differ by topology and are not part of the
         # controller's scientific observation.  Excluding them keeps this
         # content-addressed projection treatment-neutral.
-        observable_snapshot = snapshot.model_dump(
-            mode="json", exclude={"agents"}
-        )
+        observable_snapshot = observation_frame.observable_snapshot()
         proposal_set = [proposal.model_dump(mode="json") for proposal in proposals]
         proposal_set_hash = hashlib.sha256(
             canonical_json(proposal_set).encode("utf-8")
@@ -1579,6 +1690,19 @@ class AgentRuntime:
                 "approved_command_set": approved_command_set,
                 "rejected_command_set": rejected_command_set,
                 "observable_snapshot_hash": observable_snapshot_hash,
+                "observation_frame_hash": observation_frame.frame_hash,
+                "observation_perception_event_id": (
+                    perception_event.event_id if perception_event is not None else None
+                ),
+                "observation_capture_event_id": (
+                    perception_event.data.get("observation_capture_event_id")
+                    if perception_event is not None
+                    else None
+                ),
+                "observation_condition": observation_frame.condition.value,
+                "observation_model_id": observation_frame.model_id,
+                "observation_contract_version": observation_frame.contract_version,
+                "observation_model_hash": observation_frame.model_hash,
                 "proposal_set_hash": proposal_set_hash,
                 "approved_command_set_hash": hashlib.sha256(
                     canonical_json(approved_command_set).encode("utf-8")
@@ -2249,8 +2373,13 @@ class AgentRuntime:
         return parent_id
 
     async def _emit_preplan_perception(
-        self, root_event: SimEvent, snapshot: WorldState
+        self,
+        root_event: SimEvent,
+        observation_frame: ObservationFrame,
+        *,
+        observation_capture_event: SimEvent,
     ) -> SimEvent:
+        snapshot = observation_frame.observable_world
         device_ids = sorted(snapshot.devices)
         room_ids = sorted(snapshot.rooms)
         return await self._emit_agent_event(
@@ -2272,7 +2401,34 @@ class AgentRuntime:
                 ),
                 "relevant_devices": device_ids,
                 "relevant_rooms": room_ids,
+                "observation_frame_hash": observation_frame.frame_hash,
+                "observation_capture_event_id": observation_capture_event.event_id,
             },
+        )
+
+    async def _emit_observation_capture(
+        self,
+        root_event: SimEvent,
+        observation_frame: ObservationFrame,
+    ) -> SimEvent:
+        """Persist agent-visible input before controller computation starts."""
+
+        if self.publish_event is None or self.state_manager is None:
+            raise RuntimeError("AgentRuntime is not bound")
+        return await self.publish_event(
+            SimEvent(
+                event_type="observation.frame_captured",
+                source="observation_projector",
+                timestamp=float(self.state_manager.world.simulation_tick),
+                wall_time=time.time(),
+                correlation_id=root_event.correlation_id,
+                causal_parent=root_event.event_id,
+                priority=1,
+                data={
+                    "observation_frame": observation_frame.evidence_preimage(),
+                    "observation_frame_hash": observation_frame.frame_hash,
+                },
+            )
         )
 
     async def _broadcast_pending_deltas(self, pending_deltas: list[DeltaChange]) -> None:

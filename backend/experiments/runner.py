@@ -19,8 +19,14 @@ from .artifacts import (
     write_cell_result,
     write_resolved_matrix,
 )
-from .fairness import FairnessAudit, audit_comparison_outputs, validate_comparison_plan
-from .spec import ExperimentCell, ResolvedMatrix
+from .fairness import (
+    FairnessAudit,
+    audit_comparison_outputs,
+    audit_observation_comparison_outputs,
+    validate_comparison_plan,
+    validate_observation_comparison_plan,
+)
+from .spec import RESOLVED_MATRIX_SCHEMA_VERSION, ExperimentCell, ResolvedMatrix
 
 
 class EvaluationResult(BaseModel):
@@ -63,7 +69,7 @@ class MatrixRunError(RuntimeError):
 class MatrixSummary(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    summary_schema_version: str = "1.1"
+    summary_schema_version: str = "1.2"
     matrix_id: str
     matrix_hash: str
     shard_index: int | None = Field(default=None, ge=0)
@@ -81,7 +87,14 @@ class MatrixSummary(BaseModel):
     fairness_audited: bool = False
     valid_baseline_groups: int = Field(default=0, ge=0)
     invalid_baseline_groups: int = Field(default=0, ge=0)
+    valid_controller_group_ids: list[str] = Field(default_factory=list)
     invalid_baseline_group_reasons: dict[str, list[str]] = Field(default_factory=dict)
+    valid_observation_groups: int = Field(default=0, ge=0)
+    invalid_observation_groups: int = Field(default=0, ge=0)
+    valid_observation_group_ids: list[str] = Field(default_factory=list)
+    invalid_observation_group_reasons: dict[str, list[str]] = Field(
+        default_factory=dict
+    )
     scientific_valid_cells: int = Field(default=0, ge=0)
     scientific_benchmark_pass: int = Field(default=0, ge=0)
     scientific_benchmark_fail: int = Field(default=0, ge=0)
@@ -116,6 +129,7 @@ class ValidatedMatrixResults:
     completed_outputs: dict[str, Mapping[str, Any]]
     completed_artifacts: dict[str, CellResultArtifact]
     fairness: FairnessAudit
+    observation_fairness: FairnessAudit
     completed: int
     benchmark_pass: int
     benchmark_fail: int
@@ -183,18 +197,32 @@ def _evaluation_outcome(output: Mapping[str, Any]) -> str | None:
 
 
 def _scientific_counts(
-    audit: FairnessAudit,
+    valid_cell_ids: set[str],
     completed_outputs: Mapping[str, Mapping[str, Any]],
 ) -> tuple[int, int, int]:
     """Count benchmark outcomes only inside fairness-valid comparison groups."""
 
     passed = 0
     failed = 0
-    for cell_id in audit.valid_cell_ids:
+    for cell_id in sorted(valid_cell_ids):
         outcome = _evaluation_outcome(completed_outputs[cell_id])
         passed += int(outcome == "pass")
         failed += int(outcome == "fail")
-    return len(audit.valid_cell_ids), passed, failed
+    return len(valid_cell_ids), passed, failed
+
+
+def _scientific_cell_ids(
+    matrix: ResolvedMatrix,
+    controller: FairnessAudit,
+    observation: FairnessAudit,
+    completed_outputs: Mapping[str, Mapping[str, Any]],
+) -> set[str]:
+    valid = set(completed_outputs)
+    if len(matrix.expected_runtime_profiles) > 1:
+        valid &= set(controller.valid_cell_ids)
+    if len(matrix.expected_observation_conditions) > 1:
+        valid &= set(observation.valid_cell_ids)
+    return valid
 
 
 def _validate_completed_output(
@@ -279,9 +307,18 @@ class MatrixRunner:
             executor = AuraCellExecutor(data_root=root / "runs")
         if not callable(getattr(executor, "validate_completed", None)):
             raise TypeError("cell executor must implement validate_completed")
+        if matrix.matrix_schema_version != RESOLVED_MATRIX_SCHEMA_VERSION:
+            raise ValueError(
+                f"resolved matrix {matrix.matrix_schema_version} is read-only; "
+                f"resolve again with schema {RESOLVED_MATRIX_SCHEMA_VERSION} to run"
+            )
         validate_comparison_plan(
             matrix.cells,
             expected_profiles=matrix.expected_runtime_profiles,
+        )
+        validate_observation_comparison_plan(
+            matrix.cells,
+            expected_observations=matrix.expected_observation_conditions,
         )
         write_resolved_matrix(root, matrix)
         selected = select_shard(
@@ -476,6 +513,7 @@ class MatrixRunner:
                 - condition.execution_failed
             )
         fairness: FairnessAudit | None = None
+        observation_fairness: FairnessAudit | None = None
         scientific_valid_cells = 0
         scientific_benchmark_pass = 0
         scientific_benchmark_fail = 0
@@ -485,11 +523,24 @@ class MatrixRunner:
                 completed_outputs,
                 expected_profiles=matrix.expected_runtime_profiles,
             )
+            observation_fairness = audit_observation_comparison_outputs(
+                matrix.cells,
+                completed_outputs,
+                expected_observations=matrix.expected_observation_conditions,
+            )
             (
                 scientific_valid_cells,
                 scientific_benchmark_pass,
                 scientific_benchmark_fail,
-            ) = _scientific_counts(fairness, completed_outputs)
+            ) = _scientific_counts(
+                _scientific_cell_ids(
+                    matrix,
+                    fairness,
+                    observation_fairness,
+                    completed_outputs,
+                ),
+                completed_outputs,
+            )
 
         summary = MatrixSummary(
             matrix_id=matrix.matrix_id,
@@ -511,8 +562,27 @@ class MatrixRunner:
             fairness_audited=fairness is not None,
             valid_baseline_groups=(fairness.valid_groups if fairness else 0),
             invalid_baseline_groups=(fairness.invalid_groups if fairness else 0),
+            valid_controller_group_ids=(
+                list(fairness.valid_group_ids) if fairness else []
+            ),
             invalid_baseline_group_reasons=(
                 fairness.invalid_reasons if fairness else {}
+            ),
+            valid_observation_groups=(
+                observation_fairness.valid_groups if observation_fairness else 0
+            ),
+            invalid_observation_groups=(
+                observation_fairness.invalid_groups if observation_fairness else 0
+            ),
+            valid_observation_group_ids=(
+                list(observation_fairness.valid_group_ids)
+                if observation_fairness
+                else []
+            ),
+            invalid_observation_group_reasons=(
+                observation_fairness.invalid_reasons
+                if observation_fairness
+                else {}
             ),
             scientific_valid_cells=scientific_valid_cells,
             scientific_benchmark_pass=scientific_benchmark_pass,
@@ -548,6 +618,10 @@ def collect_validated_results(
     validate_comparison_plan(
         matrix.cells,
         expected_profiles=matrix.expected_runtime_profiles,
+    )
+    validate_observation_comparison_plan(
+        matrix.cells,
+        expected_observations=matrix.expected_observation_conditions,
     )
     completed = 0
     benchmark_pass = 0
@@ -617,10 +691,16 @@ def collect_validated_results(
         completed_outputs,
         expected_profiles=matrix.expected_runtime_profiles,
     )
+    observation_fairness = audit_observation_comparison_outputs(
+        matrix.cells,
+        completed_outputs,
+        expected_observations=matrix.expected_observation_conditions,
+    )
     return ValidatedMatrixResults(
         completed_outputs=completed_outputs,
         completed_artifacts=completed_artifacts,
         fairness=fairness,
+        observation_fairness=observation_fairness,
         completed=completed,
         benchmark_pass=benchmark_pass,
         benchmark_fail=benchmark_fail,
@@ -651,7 +731,12 @@ def summarize_results(
         scientific_benchmark_pass,
         scientific_benchmark_fail,
     ) = _scientific_counts(
-        collected.fairness,
+        _scientific_cell_ids(
+            matrix,
+            collected.fairness,
+            collected.observation_fairness,
+            collected.completed_outputs,
+        ),
         collected.completed_outputs,
     )
 
@@ -676,7 +761,16 @@ def summarize_results(
         fairness_audited=True,
         valid_baseline_groups=collected.fairness.valid_groups,
         invalid_baseline_groups=collected.fairness.invalid_groups,
+        valid_controller_group_ids=list(collected.fairness.valid_group_ids),
         invalid_baseline_group_reasons=collected.fairness.invalid_reasons,
+        valid_observation_groups=collected.observation_fairness.valid_groups,
+        invalid_observation_groups=collected.observation_fairness.invalid_groups,
+        valid_observation_group_ids=list(
+            collected.observation_fairness.valid_group_ids
+        ),
+        invalid_observation_group_reasons=(
+            collected.observation_fairness.invalid_reasons
+        ),
         scientific_valid_cells=scientific_valid_cells,
         scientific_benchmark_pass=scientific_benchmark_pass,
         scientific_benchmark_fail=scientific_benchmark_fail,

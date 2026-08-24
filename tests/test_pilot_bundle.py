@@ -30,7 +30,7 @@ def test_committed_scientific_pilot_bundle_is_complete_and_pending_review() -> N
         "benchmark_id": "aurabench_dev_pilot",
         "pairs": 8,
         "seeds": 3,
-        "cells": 48,
+        "cells": 96,
         "pair_set_hash": "a4e1e42c490650dab491581b828aae07c74e9a5335e9afc84ec81b0fd6d8c7da",
         "gate_status": "pending",
     }
@@ -52,7 +52,11 @@ def test_load_validated_pilot_bundle_returns_sealed_ordered_pair_projection() ->
         manifest_path.read_bytes()
     ).hexdigest()
     assert bundle.seeds == (21001, 21002, 21003)
-    assert bundle.expected_cells == 48
+    assert bundle.expected_cells == 96
+    assert [item.value for item in bundle.observation_conditions] == [
+        "perfect",
+        "stale_offline",
+    ]
     assert [pair.group_id for pair in bundle.pairs] == sorted(
         pair.group_id for pair in bundle.pairs
     )

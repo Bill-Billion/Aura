@@ -19,6 +19,7 @@ from pydantic import (
 )
 
 from backend.engine.provenance import (
+    ObservationCondition,
     ResearchRuntimeProfile,
     research_runtime_profile_for_axes,
 )
@@ -51,7 +52,7 @@ class FairnessPayload(BaseModel):
     scenario_contract_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     seed: StrictInt = Field(ge=0)
     model: Literal["rule_based", "mocked"]
-    observation: Literal["stale_offline"]
+    observation: ObservationCondition
     repetition: StrictInt = Field(ge=0)
     source_revision: str = Field(min_length=1, max_length=512)
     sim_version: str = Field(min_length=1, max_length=512)
@@ -114,6 +115,23 @@ def comparison_group_id(cell: ExperimentCell) -> str:
     return f"group-{sha256_json(payload)[:32]}"
 
 
+def observation_comparison_group_id(cell: ExperimentCell) -> str:
+    """Stable identity shared by cells that differ only by observation."""
+
+    payload = {
+        "scenario_id": cell.scenario_id,
+        "scenario_contract_hash": cell.scenario_contract_hash,
+        "seed": cell.seed,
+        "model": cell.model,
+        "runtime_profile": runtime_profile_id(cell).value,
+        "topology": cell.topology,
+        "governance": cell.governance,
+        "repetition": cell.repetition,
+        "source_revision": cell.source_revision,
+    }
+    return f"observation-group-{sha256_json(payload)[:32]}"
+
+
 def runtime_profile_id(cell: ExperimentCell) -> ResearchRuntimeProfile:
     return research_runtime_profile_for_axes(
         topology=cell.topology,
@@ -130,6 +148,17 @@ def _expected_profile_set(
         raise ValueError("expected runtime profiles must not be empty")
     if len(expected) != len(expected_profiles):
         raise ValueError("expected runtime profiles must be unique")
+    return expected
+
+
+def _expected_observation_set(
+    expected_observations: Sequence[ObservationCondition],
+) -> set[ObservationCondition]:
+    expected = set(expected_observations)
+    if not expected:
+        raise ValueError("expected observation conditions must not be empty")
+    if len(expected) != len(expected_observations):
+        raise ValueError("expected observation conditions must be unique")
     return expected
 
 
@@ -159,6 +188,35 @@ def validate_comparison_plan(
             extra = sorted(profile.value for profile in actual - expected)
             raise ValueError(
                 f"comparison group {group_id} is unbalanced; "
+                f"missing={missing}, extra={extra}"
+            )
+
+
+def validate_observation_comparison_plan(
+    cells: Sequence[ExperimentCell],
+    *,
+    expected_observations: Sequence[ObservationCondition],
+) -> None:
+    """Reject missing, duplicate, or undeclared observations in every group."""
+
+    expected = _expected_observation_set(expected_observations)
+    if not cells:
+        raise ValueError("observation comparison plan contains no cells")
+    grouped: dict[str, list[ExperimentCell]] = defaultdict(list)
+    for cell in cells:
+        grouped[observation_comparison_group_id(cell)].append(cell)
+    for group_id, members in sorted(grouped.items()):
+        observations = [ObservationCondition(cell.observation) for cell in members]
+        if len(observations) != len(set(observations)):
+            raise ValueError(
+                f"observation comparison group {group_id} contains a duplicate condition"
+            )
+        actual = set(observations)
+        if actual != expected:
+            missing = sorted(item.value for item in expected - actual)
+            extra = sorted(item.value for item in actual - expected)
+            raise ValueError(
+                f"observation comparison group {group_id} is unbalanced; "
                 f"missing={missing}, extra={extra}"
             )
 
@@ -241,6 +299,16 @@ def _fixed_payload(payload: FairnessPayload) -> dict[str, Any]:
     return payload.model_dump(
         mode="json",
         exclude={"runtime_profile", "agent_versions"},
+    )
+
+
+def _observation_fixed_payload(payload: FairnessPayload) -> dict[str, Any]:
+    return payload.model_dump(
+        mode="json",
+        exclude={
+            "comparison_group_id",
+            "observation",
+        },
     )
 
 
@@ -335,13 +403,100 @@ def audit_comparison_outputs(
     )
 
 
+def audit_observation_comparison_outputs(
+    cells: Sequence[ExperimentCell],
+    completed_outputs: Mapping[str, Mapping[str, Any]],
+    *,
+    expected_observations: Sequence[ObservationCondition],
+) -> FairnessAudit:
+    """Audit observation pairs while holding the controller profile fixed."""
+
+    expected = _expected_observation_set(expected_observations)
+    validate_observation_comparison_plan(
+        cells,
+        expected_observations=expected_observations,
+    )
+    if len(expected) == 1:
+        return FairnessAudit(0, 0, {})
+
+    grouped: dict[str, list[ExperimentCell]] = defaultdict(list)
+    for cell in cells:
+        grouped[observation_comparison_group_id(cell)].append(cell)
+
+    valid_group_ids: list[str] = []
+    valid_cell_ids: list[str] = []
+    invalid_reasons: dict[str, list[str]] = {}
+    for group_id, members in sorted(grouped.items()):
+        reasons: list[str] = []
+        payloads: dict[ObservationCondition, FairnessPayload] = {}
+        for cell in members:
+            condition = ObservationCondition(cell.observation)
+            output = completed_outputs.get(cell.cell_id)
+            if output is None:
+                reasons.append(
+                    f"{condition.value}: missing or invalid completed evidence"
+                )
+                continue
+            fairness = output.get("fairness")
+            if not isinstance(fairness, Mapping):
+                reasons.append(f"{condition.value}: missing fairness payload")
+                continue
+            try:
+                payload = FairnessPayload.model_validate(fairness)
+            except ValidationError as exc:
+                reasons.append(
+                    f"{condition.value}: invalid fairness payload: "
+                    f"{exc.errors()[0]['msg']}"
+                )
+                continue
+            if not _payload_matches_cell(payload, cell):
+                reasons.append(
+                    f"{condition.value}: fairness payload does not match cell"
+                )
+                continue
+            payloads[condition] = payload
+
+        if len(payloads) == len(members):
+            ordered = [payloads[item] for item in sorted(payloads, key=lambda x: x.value)]
+            reference = _observation_fixed_payload(ordered[0])
+            for payload in ordered[1:]:
+                comparable = _observation_fixed_payload(payload)
+                if comparable != reference:
+                    differing = sorted(
+                        key
+                        for key in set(reference) | set(comparable)
+                        if reference.get(key) != comparable.get(key)
+                    )
+                    reasons.append(
+                        "fixed provenance mismatch: " + ", ".join(differing)
+                    )
+                    break
+
+        if reasons:
+            invalid_reasons[group_id] = reasons
+        else:
+            valid_group_ids.append(group_id)
+            valid_cell_ids.extend(cell.cell_id for cell in members)
+
+    return FairnessAudit(
+        valid_groups=len(valid_group_ids),
+        invalid_groups=len(invalid_reasons),
+        invalid_reasons=invalid_reasons,
+        valid_group_ids=tuple(sorted(valid_group_ids)),
+        valid_cell_ids=tuple(sorted(valid_cell_ids)),
+    )
+
+
 __all__ = [
     "FAIRNESS_SCHEMA_VERSION",
     "FairnessAudit",
     "FairnessPayload",
     "audit_comparison_outputs",
+    "audit_observation_comparison_outputs",
     "build_fairness_payload",
     "comparison_group_id",
+    "observation_comparison_group_id",
     "runtime_profile_id",
     "validate_comparison_plan",
+    "validate_observation_comparison_plan",
 ]

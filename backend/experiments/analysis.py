@@ -25,11 +25,13 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 
 from backend.engine.rng import MAX_JSON_SAFE_SEED
 from backend.engine.provenance import (
+    ObservationCondition,
     ResearchRuntimeProfile,
     research_runtime_profile_for_axes,
 )
 
 from .artifacts import atomic_create_bytes
+from .fairness import observation_comparison_group_id
 from .pilot_bundle import MAX_PILOT_PAIRS, load_validated_pilot_bundle
 from .runner import CompletedResultValidator, collect_validated_results
 from .spec import (
@@ -51,8 +53,9 @@ from .statistics import (
 )
 
 
-RESULTS_MANIFEST_SCHEMA_VERSION = "1.0"
-ANALYSIS_ARTIFACT_SCHEMA_VERSION = "1.0"
+RESULTS_MANIFEST_SCHEMA_VERSION = "1.1"
+LEGACY_RESULTS_MANIFEST_SCHEMA_VERSION = "1.0"
+ANALYSIS_ARTIFACT_SCHEMA_VERSION = "1.1"
 MAX_ANALYSIS_ARTIFACT_BYTES = 64 * 1024 * 1024
 MAX_ANALYSIS_PAIR_ROWS = 50_000
 MAX_BOOTSTRAP_DRAW_OPERATIONS = 2_500_000_000
@@ -276,6 +279,7 @@ def _cell_projection(
         "source_revision": cell.source_revision,
         "admission_status": "not_admitted",
         "fairness_group_id": None,
+        "observation_fairness_group_id": None,
         "result_seal": result_seal,
         "run_id": None,
         "analysis_context": None,
@@ -297,6 +301,7 @@ def _cell_projection(
     base.update(
         admission_status="admitted",
         fairness_group_id=fairness_group_id,
+        observation_fairness_group_id=observation_comparison_group_id(cell),
         run_id=run_id,
         analysis_context=_analysis_context(output),
         evaluation=_evaluation_projection(evaluation),
@@ -367,6 +372,10 @@ def build_results_manifest(
             "expected_runtime_profiles": [
                 profile.value for profile in matrix.expected_runtime_profiles
             ],
+            "expected_observation_conditions": [
+                condition.value
+                for condition in matrix.expected_observation_conditions
+            ],
         },
         "validity": {
             "completed": collected.completed,
@@ -379,6 +388,20 @@ def build_results_manifest(
             "valid_fairness_group_ids": list(collected.fairness.valid_group_ids),
             "valid_fairness_cell_ids": list(collected.fairness.valid_cell_ids),
             "invalid_fairness_groups": collected.fairness.invalid_reasons,
+            "valid_controller_group_ids": list(
+                collected.fairness.valid_group_ids
+            ),
+            "valid_controller_cell_ids": list(collected.fairness.valid_cell_ids),
+            "invalid_controller_groups": collected.fairness.invalid_reasons,
+            "valid_observation_group_ids": list(
+                collected.observation_fairness.valid_group_ids
+            ),
+            "valid_observation_cell_ids": list(
+                collected.observation_fairness.valid_cell_ids
+            ),
+            "invalid_observation_groups": (
+                collected.observation_fairness.invalid_reasons
+            ),
         },
         "cells": cells,
     }
@@ -387,6 +410,36 @@ def build_results_manifest(
 
 _CELL_ID_PATTERN = re.compile(r"^cell-[0-9a-f]{32}$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _manifest_controller_group_id(cell: Mapping[str, Any]) -> str:
+    return "group-" + sha256_json(
+        {
+            "scenario_id": cell["scenario_id"],
+            "scenario_contract_hash": cell["scenario_contract_hash"],
+            "seed": cell["seed"],
+            "model": cell["model"],
+            "observation": cell["observation"],
+            "repetition": cell["repetition"],
+            "source_revision": cell["source_revision"],
+        }
+    )[:32]
+
+
+def _manifest_observation_group_id(cell: Mapping[str, Any]) -> str:
+    return "observation-group-" + sha256_json(
+        {
+            "scenario_id": cell["scenario_id"],
+            "scenario_contract_hash": cell["scenario_contract_hash"],
+            "seed": cell["seed"],
+            "model": cell["model"],
+            "runtime_profile": cell["runtime_profile"],
+            "topology": cell["topology"],
+            "governance": cell["governance"],
+            "repetition": cell["repetition"],
+            "source_revision": cell["source_revision"],
+        }
+    )[:32]
 
 
 def _validate_manifest_evaluation(value: object, *, cell_id: str) -> None:
@@ -518,10 +571,41 @@ def _validate_manifest_cells(
     except (TypeError, ValueError) as exc:
         raise ValueError("matrix contains an unknown runtime profile") from exc
 
-    seen_keys: set[tuple[str, int, str, int, str]] = set()
+    raw_expected_observations = matrix.get("expected_observation_conditions")
+    legacy_observation_contract = raw_expected_observations is None
+    if legacy_observation_contract:
+        raw_expected_observations = sorted(
+            {
+                str(_require_mapping(item, field="cell").get("observation"))
+                for item in cells
+            }
+        )
+    if (
+        not isinstance(raw_expected_observations, list)
+        or not raw_expected_observations
+        or len(raw_expected_observations) > len(ObservationCondition)
+        or any(not isinstance(item, str) for item in raw_expected_observations)
+        or raw_expected_observations != sorted(set(raw_expected_observations))
+    ):
+        raise ValueError(
+            "matrix.expected_observation_conditions must be non-empty, unique, and sorted"
+        )
+    try:
+        typed_observations = {
+            ObservationCondition(item).value for item in raw_expected_observations
+        }
+    except (TypeError, ValueError) as exc:
+        raise ValueError("matrix contains an unknown observation condition") from exc
+    if legacy_observation_contract and typed_observations != {
+        ObservationCondition.STALE_OFFLINE.value
+    }:
+        raise ValueError("legacy results manifests are only compatible with stale_offline")
+
+    seen_keys: set[tuple[str, int, str, int, str, str]] = set()
     seen_seeds: set[int] = set()
     admitted_cell_ids: set[str] = set()
     fairness_group_by_cell: dict[str, str | None] = {}
+    observation_group_by_cell: dict[str, str | None] = {}
     admitted = 0
     outcomes: Counter[str] = Counter()
     for raw_cell in cells:
@@ -545,6 +629,9 @@ def _validate_manifest_cells(
             raise ValueError(f"cell {cell_id} has invalid runtime axes") from exc
         if profile != actual_profile:
             raise ValueError(f"cell {cell_id} profile does not match runtime axes")
+        observation = cell.get("observation")
+        if observation not in typed_observations:
+            raise ValueError(f"cell {cell_id} uses an undeclared observation condition")
         if cell.get("source_revision") != matrix.get("source_revision"):
             raise ValueError(f"cell {cell_id} source revision does not match matrix")
         for field in ("seed", "repetition"):
@@ -597,26 +684,32 @@ def _validate_manifest_cells(
                 or not re.fullmatch(r"group-[0-9a-f]{32}", fairness_group)
             ):
                 raise ValueError(f"admitted cell {cell_id} has invalid fairness group")
-            expected_fairness_group = "group-" + sha256_json(
-                {
-                    "scenario_id": scenario_id,
-                    "scenario_contract_hash": scenario_hash,
-                    "seed": cell["seed"],
-                    "model": cell["model"],
-                    "observation": cell["observation"],
-                    "repetition": cell["repetition"],
-                    "source_revision": cell["source_revision"],
-                }
-            )[:32]
+            expected_fairness_group = _manifest_controller_group_id(cell)
             if fairness_group is not None and fairness_group != expected_fairness_group:
                 raise ValueError(
                     f"admitted cell {cell_id} fairness group does not match its condition"
                 )
-            if len(expected_profiles) > 1 and fairness_group is None:
+            observation_group = cell.get("observation_fairness_group_id")
+            if observation_group is not None and (
+                not isinstance(observation_group, str)
+                or not re.fullmatch(
+                    r"observation-group-[0-9a-f]{32}", observation_group
+                )
+            ):
                 raise ValueError(
-                    f"multi-profile admitted cell {cell_id} has no fairness group"
+                    f"admitted cell {cell_id} has invalid observation fairness group"
+                )
+            expected_observation_group = _manifest_observation_group_id(cell)
+            if (
+                observation_group is not None
+                and observation_group != expected_observation_group
+            ):
+                raise ValueError(
+                    f"admitted cell {cell_id} observation fairness group "
+                    "does not match its condition"
                 )
             fairness_group_by_cell[cell_id] = fairness_group
+            observation_group_by_cell[cell_id] = observation_group
         elif status == "not_admitted":
             if any(
                 cell.get(field) is not None
@@ -626,6 +719,7 @@ def _validate_manifest_cells(
                     "analysis_context",
                     "evaluation",
                     "fairness_group_id",
+                    "observation_fairness_group_id",
                 )
             ):
                 raise ValueError(f"unadmitted cell {cell_id} contains admitted evidence")
@@ -665,8 +759,24 @@ def _validate_manifest_cells(
         or set(failed_cell_ids) & admitted_cell_ids
     ):
         raise ValueError("validity.failed_cell_ids do not match unadmitted cells")
-    valid_cell_ids = validity.get("valid_fairness_cell_ids")
-    valid_group_ids = validity.get("valid_fairness_group_ids")
+    valid_cell_ids = validity.get("valid_controller_cell_ids")
+    valid_group_ids = validity.get("valid_controller_group_ids")
+    invalid_groups = validity.get("invalid_controller_groups")
+    if valid_cell_ids is None:
+        valid_cell_ids = validity.get("valid_fairness_cell_ids")
+    if valid_group_ids is None:
+        valid_group_ids = validity.get("valid_fairness_group_ids")
+    if invalid_groups is None:
+        invalid_groups = validity.get("invalid_fairness_groups")
+    for legacy_field, current_value in (
+        ("valid_fairness_cell_ids", valid_cell_ids),
+        ("valid_fairness_group_ids", valid_group_ids),
+        ("invalid_fairness_groups", invalid_groups),
+    ):
+        if legacy_field in validity and validity[legacy_field] != current_value:
+            raise ValueError(
+                f"validity.{legacy_field} disagrees with controller fairness"
+            )
     if (
         not isinstance(valid_cell_ids, list)
         or any(not isinstance(item, str) for item in valid_cell_ids)
@@ -680,7 +790,6 @@ def _validate_manifest_cells(
         or valid_group_ids != sorted(set(valid_group_ids))
     ):
         raise ValueError("validity.valid_fairness_group_ids are invalid")
-    invalid_groups = validity.get("invalid_fairness_groups")
     if not isinstance(invalid_groups, Mapping) or any(
         not isinstance(group_id, str)
         or not isinstance(reasons, list)
@@ -690,10 +799,18 @@ def _validate_manifest_cells(
         raise ValueError("validity.invalid_fairness_groups are invalid")
     if set(invalid_groups) & set(valid_group_ids):
         raise ValueError("fairness groups cannot be both valid and invalid")
+    planned_controller_groups = {
+        _manifest_controller_group_id(_require_mapping(cell, field="cell"))
+        for cell in cells
+    }
     if len(expected_profiles) == 1:
-        if valid_cell_ids or valid_group_ids:
+        if valid_cell_ids or valid_group_ids or invalid_groups:
             raise ValueError("single-profile manifests must not claim fairness groups")
     else:
+        if set(valid_group_ids) | set(invalid_groups) != planned_controller_groups:
+            raise ValueError(
+                "controller fairness inventory does not cover every planned group"
+            )
         if any(
             fairness_group_by_cell[item] not in valid_group_ids
             for item in valid_cell_ids
@@ -729,6 +846,91 @@ def _validate_manifest_cells(
             if len(fixed_conditions) != 1:
                 raise ValueError("fairness group changes a fixed comparison condition")
 
+    observation_cell_ids = validity.get("valid_observation_cell_ids", [])
+    observation_group_ids = validity.get("valid_observation_group_ids", [])
+    invalid_observation_groups = validity.get("invalid_observation_groups", {})
+    if len(typed_observations) > 1 and legacy_observation_contract:
+        raise ValueError("multi-observation manifest lacks an observation contract")
+    if (
+        not isinstance(observation_cell_ids, list)
+        or any(not isinstance(item, str) for item in observation_cell_ids)
+        or observation_cell_ids != sorted(set(observation_cell_ids))
+        or not set(observation_cell_ids).issubset(admitted_cell_ids)
+    ):
+        raise ValueError("validity.valid_observation_cell_ids are invalid")
+    if (
+        not isinstance(observation_group_ids, list)
+        or any(not isinstance(item, str) for item in observation_group_ids)
+        or observation_group_ids != sorted(set(observation_group_ids))
+    ):
+        raise ValueError("validity.valid_observation_group_ids are invalid")
+    if not isinstance(invalid_observation_groups, Mapping) or any(
+        not isinstance(group_id, str)
+        or not isinstance(reasons, list)
+        or any(not isinstance(reason, str) for reason in reasons)
+        for group_id, reasons in invalid_observation_groups.items()
+    ):
+        raise ValueError("validity.invalid_observation_groups are invalid")
+    if set(invalid_observation_groups) & set(observation_group_ids):
+        raise ValueError("observation groups cannot be both valid and invalid")
+    planned_observation_groups = {
+        _manifest_observation_group_id(_require_mapping(cell, field="cell"))
+        for cell in cells
+    }
+    if len(typed_observations) == 1:
+        if observation_cell_ids or observation_group_ids or invalid_observation_groups:
+            raise ValueError(
+                "single-observation manifests must not claim observation groups"
+            )
+    else:
+        if (
+            set(observation_group_ids) | set(invalid_observation_groups)
+            != planned_observation_groups
+        ):
+            raise ValueError(
+                "observation fairness inventory does not cover every planned group"
+            )
+        if any(
+            observation_group_by_cell[item] not in observation_group_ids
+            for item in observation_cell_ids
+        ):
+            raise ValueError("observation cell/group inventories do not match")
+        cells_for_observation_groups = {
+            cell_id
+            for cell_id, group_id in observation_group_by_cell.items()
+            if group_id in observation_group_ids
+        }
+        if cells_for_observation_groups != set(observation_cell_ids):
+            raise ValueError("observation groups include unlisted admitted cells")
+        for group_id in observation_group_ids:
+            members = [
+                cell
+                for cell in cells
+                if observation_group_by_cell.get(str(cell["cell_id"])) == group_id
+            ]
+            if {str(cell["observation"]) for cell in members} != typed_observations:
+                raise ValueError(
+                    "observation group does not contain every declared condition"
+                )
+            fixed_conditions = {
+                (
+                    str(cell["scenario_id"]),
+                    str(cell["scenario_contract_hash"]),
+                    int(cell["seed"]),
+                    str(cell["model"]),
+                    str(cell["runtime_profile"]),
+                    str(cell["topology"]),
+                    str(cell["governance"]),
+                    int(cell["repetition"]),
+                    str(cell["source_revision"]),
+                )
+                for cell in members
+            }
+            if len(fixed_conditions) != 1:
+                raise ValueError(
+                    "observation group changes a fixed comparison condition"
+                )
+
 
 def _validate_results_manifest(raw: object) -> dict[str, Any]:
     artifact = _require_mapping(raw, field="results manifest")
@@ -736,7 +938,11 @@ def _validate_results_manifest(raw: object) -> dict[str, Any]:
     seal = _require_mapping(artifact.get("seal"), field="seal")
     if set(artifact) != {"manifest", "seal"}:
         raise ValueError("results manifest artifact has unexpected fields")
-    if manifest.get("results_manifest_schema_version") != RESULTS_MANIFEST_SCHEMA_VERSION:
+    results_schema_version = manifest.get("results_manifest_schema_version")
+    if results_schema_version not in {
+        LEGACY_RESULTS_MANIFEST_SCHEMA_VERSION,
+        RESULTS_MANIFEST_SCHEMA_VERSION,
+    }:
         raise ValueError("unsupported results manifest schema version")
     if seal.get("algorithm") != "sha256" or seal.get("sha256") != sha256_json(manifest):
         raise ValueError("results manifest seal does not match its contents")
@@ -755,6 +961,12 @@ def _validate_results_manifest(raw: object) -> dict[str, Any]:
         raise ValueError("results manifest cell_id values must be strings")
     if cell_ids != sorted(cell_ids) or len(cell_ids) != len(set(cell_ids)):
         raise ValueError("results manifest cells must have unique sorted IDs")
+    if results_schema_version == LEGACY_RESULTS_MANIFEST_SCHEMA_VERSION:
+        matrix = _require_mapping(manifest.get("matrix"), field="matrix")
+        if "expected_observation_conditions" in matrix:
+            raise ValueError(
+                "results manifest 1.0 must not contain observation comparison fields"
+            )
     _validate_manifest_cells(manifest, cells)
     return dict(artifact)
 
@@ -778,13 +990,14 @@ def write_results_manifest(path: Path | str, artifact: Mapping[str, Any]) -> Pat
     )
 
 
-def _cell_key(cell: Mapping[str, Any]) -> tuple[str, int, str, int, str]:
+def _cell_key(cell: Mapping[str, Any]) -> tuple[str, int, str, int, str, str]:
     return (
         str(cell["scenario_id"]),
         int(cell["seed"]),
         str(cell["model"]),
         int(cell["repetition"]),
         str(cell["runtime_profile"]),
+        str(cell["observation"]),
     )
 
 
@@ -850,9 +1063,10 @@ def _apply_fairness_gate(
 def _make_pair_row(
     *,
     row_id: str,
-    comparison_type: Literal["counterfactual", "system"],
+    comparison_type: Literal["counterfactual", "system", "observation"],
     comparison_id: str,
     model: str,
+    observation: str,
     treatment_label: str,
     reference_label: str,
     unit: Mapping[str, Any],
@@ -883,6 +1097,7 @@ def _make_pair_row(
         "comparison_type": comparison_type,
         "comparison_id": comparison_id,
         "model": model,
+        "observation": observation,
         "treatment_label": treatment_label,
         "reference_label": reference_label,
         "unit": dict(unit),
@@ -920,14 +1135,19 @@ def _counterfactual_rows(manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
                     str(cell["model"]),
                     int(cell["repetition"]),
                     str(cell["runtime_profile"]),
+                    str(cell["observation"]),
                 )
                 for cell in cells
                 if cell["scenario_id"] in {static_id, dynamic_id}
             }
         )
-        for seed, model, repetition, profile in contexts:
-            treatment = by_key.get((dynamic_id, seed, model, repetition, profile))
-            reference = by_key.get((static_id, seed, model, repetition, profile))
+        for seed, model, repetition, profile, observation in contexts:
+            treatment = by_key.get(
+                (dynamic_id, seed, model, repetition, profile, observation)
+            )
+            reference = by_key.get(
+                (static_id, seed, model, repetition, profile, observation)
+            )
             treatment = _apply_fairness_gate(
                 treatment,
                 required=fairness_required,
@@ -946,6 +1166,7 @@ def _counterfactual_rows(manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
                     "model": model,
                     "repetition": repetition,
                     "profile": profile,
+                    "observation": observation,
                 }
             )[:32]
             rows.append(
@@ -954,6 +1175,7 @@ def _counterfactual_rows(manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
                     comparison_type="counterfactual",
                     comparison_id=profile,
                     model=model,
+                    observation=observation,
                     treatment_label="dynamic",
                     reference_label="static",
                     unit={
@@ -961,6 +1183,7 @@ def _counterfactual_rows(manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
                         "seed": seed,
                         "repetition": repetition,
                         "runtime_profile": profile,
+                        "observation": observation,
                     },
                     treatment=treatment,
                     reference=reference,
@@ -994,18 +1217,28 @@ def _system_rows(manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
                 int(cell["seed"]),
                 str(cell["model"]),
                 int(cell["repetition"]),
+                str(cell["observation"]),
             )
             for cell in cells
         }
     )
     rows: list[dict[str, Any]] = []
     baselines = sorted(set(expected) - {ResearchRuntimeProfile.AURA.value})
-    for scenario_id, seed, model, repetition in contexts:
+    for scenario_id, seed, model, repetition, observation in contexts:
         aura = by_key.get(
-            (scenario_id, seed, model, repetition, ResearchRuntimeProfile.AURA.value)
+            (
+                scenario_id,
+                seed,
+                model,
+                repetition,
+                ResearchRuntimeProfile.AURA.value,
+                observation,
+            )
         )
         for baseline in baselines:
-            reference = by_key.get((scenario_id, seed, model, repetition, baseline))
+            reference = by_key.get(
+                (scenario_id, seed, model, repetition, baseline, observation)
+            )
             treatment = _apply_fairness_gate(
                 aura,
                 required=True,
@@ -1024,6 +1257,7 @@ def _system_rows(manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
                     "model": model,
                     "repetition": repetition,
                     "baseline": baseline,
+                    "observation": observation,
                 }
             )[:32]
             rows.append(
@@ -1032,6 +1266,7 @@ def _system_rows(manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
                     comparison_type="system",
                     comparison_id=baseline,
                     model=model,
+                    observation=observation,
                     treatment_label=ResearchRuntimeProfile.AURA.value,
                     reference_label=baseline,
                     unit={
@@ -1039,6 +1274,7 @@ def _system_rows(manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
                         "seed": seed,
                         "repetition": repetition,
                         "baseline_profile": baseline,
+                        "observation": observation,
                     },
                     treatment=treatment,
                     reference=reference,
@@ -1051,8 +1287,113 @@ def _system_rows(manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
+def _observation_rows(manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
+    matrix = _require_mapping(manifest.get("matrix"), field="matrix")
+    expected = matrix.get(
+        "expected_observation_conditions",
+        [ObservationCondition.STALE_OFFLINE.value],
+    )
+    if not isinstance(expected, list) or any(not isinstance(item, str) for item in expected):
+        raise ValueError("matrix.expected_observation_conditions must be a string list")
+    required = {
+        ObservationCondition.PERFECT.value,
+        ObservationCondition.STALE_OFFLINE.value,
+    }
+    if set(expected) != required:
+        return []
+    validity = _require_mapping(manifest.get("validity"), field="validity")
+    valid_cell_ids = set(validity.get("valid_observation_cell_ids", []))
+    cells = [
+        _require_mapping(item, field="cell")
+        for item in manifest.get("cells", [])
+    ]
+    by_key = {_cell_key(cell): cell for cell in cells}
+    contexts = sorted(
+        {
+            (
+                str(cell["scenario_id"]),
+                int(cell["seed"]),
+                str(cell["model"]),
+                int(cell["repetition"]),
+                str(cell["runtime_profile"]),
+            )
+            for cell in cells
+        }
+    )
+    rows: list[dict[str, Any]] = []
+    for scenario_id, seed, model, repetition, profile in contexts:
+        treatment = by_key.get(
+            (
+                scenario_id,
+                seed,
+                model,
+                repetition,
+                profile,
+                ObservationCondition.STALE_OFFLINE.value,
+            )
+        )
+        reference = by_key.get(
+            (
+                scenario_id,
+                seed,
+                model,
+                repetition,
+                profile,
+                ObservationCondition.PERFECT.value,
+            )
+        )
+        treatment = _apply_fairness_gate(
+            treatment,
+            required=True,
+            valid_cell_ids=valid_cell_ids,
+        )
+        reference = _apply_fairness_gate(
+            reference,
+            required=True,
+            valid_cell_ids=valid_cell_ids,
+        )
+        row_id = sha256_json(
+            {
+                "type": "observation",
+                "scenario_id": scenario_id,
+                "seed": seed,
+                "model": model,
+                "repetition": repetition,
+                "profile": profile,
+            }
+        )[:32]
+        rows.append(
+            _make_pair_row(
+                row_id=f"pair-{row_id}",
+                comparison_type="observation",
+                comparison_id=profile,
+                model=model,
+                observation="stale_offline_minus_perfect",
+                treatment_label=ObservationCondition.STALE_OFFLINE.value,
+                reference_label=ObservationCondition.PERFECT.value,
+                unit={
+                    "scenario_id": scenario_id,
+                    "seed": seed,
+                    "repetition": repetition,
+                    "runtime_profile": profile,
+                },
+                treatment=treatment,
+                reference=reference,
+            )
+        )
+        if len(rows) > MAX_ANALYSIS_PAIR_ROWS:
+            raise ValueError(
+                f"observation analysis exceeds {MAX_ANALYSIS_PAIR_ROWS} rows"
+            )
+    return rows
+
+
 def build_pair_rows(manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
-    rows = _counterfactual_rows(manifest) + _system_rows(manifest)
+    rows = (
+        _counterfactual_rows(manifest)
+        + _system_rows(manifest)
+        + _observation_rows(manifest)
+    )
     if len(rows) > MAX_ANALYSIS_PAIR_ROWS:
         raise ValueError(f"analysis exceeds {MAX_ANALYSIS_PAIR_ROWS} pair rows")
     return sorted(rows, key=lambda row: row["row_id"])
@@ -1085,7 +1426,9 @@ def _aggregate_rows(
             "analysis bootstrap workload exceeds "
             f"{MAX_BOOTSTRAP_DRAW_OPERATIONS} draw operations"
         )
-    grouped: dict[tuple[str, str, str, str], list[Mapping[str, Any]]] = defaultdict(list)
+    grouped: dict[tuple[str, str, str, str, str], list[Mapping[str, Any]]] = (
+        defaultdict(list)
+    )
     for row in pair_rows:
         metrics = _require_mapping(row.get("metrics"), field="row.metrics")
         for metric in sorted(metrics):
@@ -1094,6 +1437,7 @@ def _aggregate_rows(
                     str(row["comparison_type"]),
                     str(row["comparison_id"]),
                     str(row["model"]),
+                    str(row["observation"]),
                     metric,
                 )
             ].append(row)
@@ -1101,7 +1445,7 @@ def _aggregate_rows(
     aggregates: list[dict[str, Any]] = []
     bootstrap_audit: list[dict[str, Any]] = []
     for key in sorted(grouped):
-        comparison_type, comparison_id, model, metric = key
+        comparison_type, comparison_id, model, observation, metric = key
         rows = sorted(grouped[key], key=lambda row: str(row["row_id"]))
         valid: list[tuple[str, bool | float, bool | float]] = []
         treatment_binary_values: list[bool] = []
@@ -1133,9 +1477,14 @@ def _aggregate_rows(
             "comparison_type": comparison_type,
             "comparison_id": comparison_id,
             "model": model,
+            "observation": observation,
             "metric": metric,
             "kind": kind,
-            "effect_direction": "treatment_minus_reference",
+            "effect_direction": (
+                "stale_offline_minus_perfect"
+                if comparison_type == "observation"
+                else "treatment_minus_reference"
+            ),
             "paired_estimand": (
                 "complete_pair_among_final_state_success_in_both_arms"
                 if metric == "final_state_blind_spot"
@@ -1224,11 +1573,30 @@ def _aggregate_rows(
 def _apply_holm(aggregates: list[dict[str, Any]], *, alpha: Decimal) -> None:
     """Adjust complete Aura-vs-baseline families; never shrink missing families."""
 
-    families: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    families: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for record in aggregates:
         if record["comparison_type"] == "system":
-            families[(record["model"], record["metric"])].append(record)
-    for (model, metric), records in sorted(families.items()):
+            families[
+                (
+                    "system",
+                    record["model"],
+                    record["observation"],
+                    record["metric"],
+                )
+            ].append(record)
+        elif record["comparison_type"] == "observation":
+            families[
+                (
+                    "observation",
+                    record["model"],
+                    record["observation"],
+                    record["metric"],
+                )
+            ].append(record)
+    for (comparison_type, model, observation, metric), records in sorted(
+        families.items()
+    ):
+        family_id = f"{comparison_type}:{model}:{observation}:{metric}"
         planned_ids = sorted(record["analysis_id"] for record in records)
         observed: list[HypothesisPValue] = []
         for record in records:
@@ -1248,7 +1616,7 @@ def _apply_holm(aggregates: list[dict[str, Any]], *, alpha: Decimal) -> None:
             for record in records:
                 record["holm_adjustment"] = {
                     "status": "incomplete",
-                    "family_id": f"system:{model}:{metric}",
+                    "family_id": family_id,
                     "planned_hypothesis_ids": planned_ids,
                     "observed_hypothesis_ids": sorted(
                         item.hypothesis_id for item in observed
@@ -1256,7 +1624,7 @@ def _apply_holm(aggregates: list[dict[str, Any]], *, alpha: Decimal) -> None:
                 }
             continue
         result = holm_adjust(
-            family_id=f"system:{model}:{metric}",
+            family_id=family_id,
             planned_hypothesis_ids=planned_ids,
             observed=observed,
             alpha=alpha,
@@ -1309,6 +1677,7 @@ _TABLE_FIELDS = (
     "comparison_type",
     "comparison_id",
     "model",
+    "observation",
     "metric",
     "kind",
     "effect_direction",
@@ -1395,6 +1764,7 @@ def _table_bytes(
                 "comparison_type": _csv_text(record["comparison_type"]),
                 "comparison_id": _csv_text(record["comparison_id"]),
                 "model": _csv_text(record["model"]),
+                "observation": _csv_text(record["observation"]),
                 "metric": _csv_text(record["metric"]),
                 "kind": _csv_text(record["kind"]),
                 "effect_direction": _csv_text(record["effect_direction"]),
@@ -1458,6 +1828,7 @@ def render_analysis_bundle(
                         "comparison_type",
                         "comparison_id",
                         "model",
+                        "observation",
                         "metric",
                         "kind",
                         "n",
@@ -1484,6 +1855,11 @@ def render_analysis_bundle(
         (
             "table-ablation.csv",
             _table_bytes(aggregates, comparison_type="system"),
+            "text/csv",
+        ),
+        (
+            "table-observation.csv",
+            _table_bytes(aggregates, comparison_type="observation"),
             "text/csv",
         ),
         ("figure-data/effect-estimates.json", figure_bytes, "application/json"),

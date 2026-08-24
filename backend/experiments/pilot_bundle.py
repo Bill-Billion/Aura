@@ -7,10 +7,14 @@ import json
 import os
 import stat
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from backend.engine.provenance import (
+    SUPPORTED_OBSERVATION_CONDITIONS,
+    ObservationCondition,
+)
 from backend.scenarios.counterfactual import validate_counterfactual_pairs
 from backend.scenarios.fingerprint import scenario_contract_fingerprint
 from backend.scenarios.spec_v2 import ScenarioSpecV2, unsupported_perturbations
@@ -20,6 +24,9 @@ from .spec import sha256_json
 
 MAX_PILOT_ARTIFACT_BYTES = 4 * 1024 * 1024
 MAX_PILOT_PAIRS = 64
+_OBSERVATION_MODEL_CONDITIONS = {
+    "current_projector_v1": frozenset(SUPPORTED_OBSERVATION_CONDITIONS),
+}
 
 
 class _StrictModel(BaseModel):
@@ -59,16 +66,37 @@ class PilotReviewReference(_StrictModel):
 
 
 class PilotManifest(_StrictModel):
-    pilot_manifest_schema_version: Literal["1.0"] = "1.0"
+    pilot_manifest_schema_version: Literal["1.0", "1.1"] = "1.1"
     benchmark_id: str = Field(min_length=1)
     matrix: MatrixReference
     seeds: list[int] = Field(min_length=1, max_length=256)
     expected_cells: int = Field(gt=0)
+    observation_conditions: tuple[ObservationCondition, ...] = Field(
+        default=(ObservationCondition.STALE_OFFLINE,),
+        min_length=1,
+    )
     pair_set_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     pairs: list[PilotPairReference] = Field(
         min_length=1, max_length=MAX_PILOT_PAIRS
     )
     human_review: PilotReviewReference
+
+    @model_validator(mode="before")
+    @classmethod
+    def _versioned_observation_contract(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        version = value.get("pilot_manifest_schema_version", "1.1")
+        has_observations = "observation_conditions" in value
+        if version == "1.0" and has_observations:
+            raise ValueError(
+                "pilot manifest 1.0 must not contain observation_conditions"
+            )
+        if version == "1.1" and not has_observations:
+            raise ValueError(
+                "pilot manifest 1.1 requires observation_conditions"
+            )
+        return value
 
     @field_validator("seeds")
     @classmethod
@@ -86,6 +114,15 @@ class PilotManifest(_StrictModel):
         if len(group_ids) != len(set(group_ids)):
             raise ValueError("pilot pair group_ids must be unique")
         return sorted(values, key=lambda item: item.group_id)
+
+    @field_validator("observation_conditions")
+    @classmethod
+    def _unique_observations(
+        cls, values: tuple[ObservationCondition, ...]
+    ) -> tuple[ObservationCondition, ...]:
+        if len(values) != len(set(values)):
+            raise ValueError("pilot observation conditions must be unique")
+        return tuple(sorted(values, key=lambda item: item.value))
 
 
 class ValidatedPilotPair(_FrozenStrictModel):
@@ -105,6 +142,7 @@ class ValidatedPilotBundle(_FrozenStrictModel):
     manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     seeds: tuple[int, ...] = Field(min_length=1, max_length=256)
     expected_cells: int = Field(gt=0)
+    observation_conditions: tuple[ObservationCondition, ...] = Field(min_length=1)
     pairs: tuple[ValidatedPilotPair, ...] = Field(
         min_length=1, max_length=MAX_PILOT_PAIRS
     )
@@ -255,6 +293,9 @@ def load_validated_pilot_bundle(
         raise ValueError("matrix seed axis does not match pilot manifest")
     if len(matrix.combinations()) != manifest.expected_cells:
         raise ValueError("resolved matrix cell count does not match pilot manifest")
+    declared_observations = tuple(matrix.declared_observation_conditions())
+    if declared_observations != manifest.observation_conditions:
+        raise ValueError("matrix observation axis does not match pilot manifest")
 
     resolver = FileOrLibraryScenarioResolver(base_dir=root)
     specs: list[ScenarioSpecV2] = []
@@ -285,6 +326,21 @@ def load_validated_pilot_bundle(
                 raise ValueError(f"scenario group drift for {scenario_reference.reference}")
             if spec.counterfactual.variant != variant:
                 raise ValueError(f"scenario variant drift for {scenario_reference.reference}")
+            model_conditions = _OBSERVATION_MODEL_CONDITIONS.get(
+                spec.observation_model.id,
+                frozenset(),
+            )
+            unsupported_observations = sorted(
+                condition.value
+                for condition in declared_observations
+                if condition not in model_conditions
+            )
+            if unsupported_observations:
+                raise ValueError(
+                    f"scenario observation model {spec.observation_model.id!r} "
+                    "does not support declared conditions: "
+                    + ", ".join(unsupported_observations)
+                )
             specs.append(spec)
 
     if manifest_references != set(matrix.axes.scenario):
@@ -320,6 +376,7 @@ def load_validated_pilot_bundle(
         manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
         seeds=tuple(manifest.seeds),
         expected_cells=manifest.expected_cells,
+        observation_conditions=declared_observations,
         pairs=tuple(
             ValidatedPilotPair(
                 group_id=pair.group_id,

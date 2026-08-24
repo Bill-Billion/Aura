@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
 from unittest.mock import AsyncMock
@@ -29,9 +30,13 @@ from backend.config.device_registry import build_default_devices, build_default_
 from backend.engine.event_bus import EventBus, SimEvent
 from backend.engine.observation import (
     OBSERVATION_STALE_KEY,
+    OBSERVATION_UNAVAILABLE_KEY,
     ObservableProjector,
     build_observable_view,
+    observation_model_metadata,
 )
+from backend.engine.provenance import ObservationCondition
+from backend.engine.run_manager import canonical_json
 from backend.engine.simulation import SimulationEngine
 from backend.engine.state import Location3D, UserState, WorldState
 from backend.engine.state_manager import StateManager
@@ -71,6 +76,17 @@ def test_no_noise_observable_equals_ground_truth():
     observable = build_observable_view(world)
 
     assert observable.model_dump() == world.model_dump()
+
+
+def test_perfect_condition_is_identity_even_for_an_offline_device():
+    world = _make_world()
+    camera = world.devices["camera_entry_01"]
+    camera.state.extra.update(online=False, secret_physical_value="oracle-only")
+
+    observable = ObservableProjector(ObservationCondition.PERFECT).observe(world)
+
+    assert observable.model_dump() == world.model_dump()
+    assert OBSERVATION_STALE_KEY not in observable.devices[camera.id].state.extra
 
 
 def test_observable_view_is_a_copy_not_the_world():
@@ -154,20 +170,22 @@ def test_stale_observation_stays_stale_until_the_device_recovers():
     assert "light_living_01" not in projector.stale_device_ids
 
 
-def test_device_offline_before_any_report_is_marked_stale_without_inventing_readings():
-    """一上来就离线的设备没有"最后一次读数"，只能标陈旧，不能编造历史。"""
+def test_device_offline_before_any_report_is_unavailable_without_ground_truth_leak():
+    """一上来就离线的设备不能把物理初值冒充成历史报告。"""
 
     world = _make_world()
     world.devices["camera_entry_01"].state.extra["online"] = False
-    ground_truth_extra = dict(world.devices["camera_entry_01"].state.extra)
+    world.devices["camera_entry_01"].state.extra["secret_physical_value"] = (
+        "oracle-only"
+    )
 
     observable = ObservableProjector().observe(world)
     reported = observable.devices["camera_entry_01"].state
 
     assert reported.extra[OBSERVATION_STALE_KEY] is True
-    assert {k: v for k, v in reported.extra.items() if k != OBSERVATION_STALE_KEY} == (
-        ground_truth_extra
-    )
+    assert reported.extra[OBSERVATION_UNAVAILABLE_KEY] is True
+    assert "secret_physical_value" not in reported.extra
+    assert reported.last_changed_by == "observation_unavailable"
 
 
 def test_projector_reset_drops_the_previous_world_cache():
@@ -185,7 +203,97 @@ def test_projector_reset_drops_the_previous_world_cache():
     fresh.devices["light_living_01"].state.extra["brightness"] = 7
     observable = projector.observe(fresh)
 
-    assert observable.devices["light_living_01"].state.extra["brightness"] == 7
+    reported = observable.devices["light_living_01"].state
+    assert OBSERVATION_UNAVAILABLE_KEY in reported.extra
+    assert "brightness" not in reported.extra
+
+
+def test_frame_rebuilds_device_state_event_and_commits_exact_observation():
+    world = _make_world()
+    projector = ObservableProjector()
+    light = world.devices["light_living_01"]
+    light.state.extra["brightness"] = 80
+    projector.observe(world)
+    light.state.extra.update(online=False, brightness=5)
+    root = SimEvent(
+        event_type="environment.state_refresh",
+        source="device_report",
+        timestamp=2.0,
+        sim_time_s=20.0,
+        data={
+            "device_id": light.id,
+            "property": "extra.brightness",
+            "value": 5,
+            "significant_change_reasons": ["device_report"],
+        },
+    )
+
+    frame = projector.observe_frame(world, root)
+
+    assert frame.observed_root_event.data["value"] == 80
+    assert frame.evidence_preimage()["observed_root_event"]["data"]["value"] == 80
+    assert light.id in frame.evidence_preimage()["stale_device_ids"]
+    assert frame.frame_hash == hashlib.sha256(
+        canonical_json(frame.evidence_preimage()).encode("utf-8")
+    ).hexdigest()
+
+
+def test_perfect_and_online_events_preserve_transition_values():
+    world = _make_world()
+    light = world.devices["light_living_01"]
+    light.state.extra["brightness"] = 80
+    root = SimEvent(
+        event_type="device.state_changed",
+        source="device_report",
+        timestamp=2.0,
+        data={
+            "device_id": light.id,
+            "property": "extra.brightness",
+            "old_value": 20,
+            "new_value": 80,
+        },
+    )
+
+    perfect = ObservableProjector("perfect").observe_frame(world, root)
+    stale_online = ObservableProjector("stale_offline").observe_frame(world, root)
+
+    assert perfect.observed_root_event.data == root.data
+    assert stale_online.observed_root_event.data == root.data
+    assert perfect.observed_root_event is not root
+    assert stale_online.observed_root_event is not root
+
+
+def test_unavailable_device_value_is_removed_from_root_event_channel():
+    world = _make_world()
+    camera = world.devices["camera_entry_01"]
+    camera.state.extra.update(online=False, secret_physical_value="oracle-only")
+    frame = ObservableProjector().observe_frame(
+        world,
+        SimEvent(
+            event_type="device.offline",
+            source="device_report",
+            timestamp=0,
+            data={
+                "device_id": camera.id,
+                "property": "extra.secret_physical_value",
+                "value": "oracle-only",
+                "online": False,
+            },
+        ),
+    )
+
+    assert "value" not in frame.observed_root_event.data
+    assert "oracle-only" not in canonical_json(frame.evidence_preimage())
+    assert camera.id in frame.unavailable_device_ids
+
+
+def test_observation_model_hash_binds_condition_and_contract():
+    perfect = observation_model_metadata("perfect")
+    stale = observation_model_metadata("stale_offline")
+
+    assert perfect["model_id"] == "current_projector_v1"
+    assert stale["model_id"] == "current_projector_v1"
+    assert perfect["model_hash"] != stale["model_hash"]
 
 
 # --------------------------------------------------- ground truth 标签不可见
@@ -345,6 +453,71 @@ async def test_agent_episode_reads_the_observable_view_not_ground_truth():
 
 
 @pytest.mark.anyio
+async def test_runtime_projects_root_event_and_persists_frame_before_planning():
+    provider = _CapturingProvider()
+    engine = _make_engine(provider)
+    runtime = engine.agent_runtime
+    original_compute = runtime._compute_episode
+    event_types_at_compute: list[list[str]] = []
+
+    async def tracked_compute(*args: object, **kwargs: object):
+        event_types_at_compute.append(
+            [event.event_type for event in engine.event_bus.get_history()]
+        )
+        return await original_compute(*args, **kwargs)  # type: ignore[arg-type]
+
+    runtime._compute_episode = tracked_compute  # type: ignore[method-assign]
+    light = engine.state_manager.world.devices["light_living_01"]
+    light.state.extra["brightness"] = 80
+    runtime.observable_world()
+    light.state.extra.update(online=False, brightness=5)
+    root = SimEvent(
+        event_type="device.offline",
+        source="device_report",
+        timestamp=1.0,
+        sim_time_s=10.0,
+        data={
+            "device_id": light.id,
+            "property": "extra.brightness",
+            "value": 5,
+            "online": False,
+        },
+    )
+
+    await engine._publish_sim_event(root)
+    await _drain_episodes(engine)
+
+    remembered = runtime.memory_store.get_correlation_history(root.correlation_id)
+    observed_root = next(item for item in remembered if item.event_id == root.event_id)
+    assert observed_root.data["value"] == 80
+    assert root.data["value"] == 5
+    history = [
+        item
+        for item in engine.event_bus.get_history()
+        if item.correlation_id == root.correlation_id
+    ]
+    capture = next(
+        item for item in history if item.event_type == "observation.frame_captured"
+    )
+    perception = next(
+        item for item in history if item.event_type == "reasoning.perception_snapshot"
+    )
+    assert root.seq is not None and capture.seq is not None
+    assert perception.seq is not None
+    assert root.seq < capture.seq < perception.seq
+    assert event_types_at_compute
+    assert all(
+        "observation.frame_captured" in event_types
+        for event_types in event_types_at_compute
+    )
+    assert (
+        capture.data["observation_frame_hash"]
+        == perception.data["observation_frame_hash"]
+    )
+    await engine.close()
+
+
+@pytest.mark.anyio
 async def test_runtime_observation_cache_is_dropped_when_the_world_is_swapped():
     provider = _CapturingProvider()
     engine = _make_engine(provider)
@@ -358,7 +531,9 @@ async def test_runtime_observation_cache_is_dropped_when_the_world_is_swapped():
     runtime.update_state_manager(new_manager)
 
     observable = runtime.observable_world()
-    assert observable.devices["light_living_01"].state.extra["brightness"] == 7
+    reported = observable.devices["light_living_01"].state
+    assert "brightness" not in reported.extra
+    assert reported.extra[OBSERVATION_UNAVAILABLE_KEY] is True
     await engine.close()
 
 
@@ -377,5 +552,7 @@ async def test_engine_reset_drops_observation_history():
     await engine.reset(new_state_manager=new_manager)
 
     observable = engine.agent_runtime.observable_world()
-    assert observable.devices["light_living_01"].state.extra["brightness"] == 3
+    reported = observable.devices["light_living_01"].state
+    assert "brightness" not in reported.extra
+    assert reported.extra[OBSERVATION_UNAVAILABLE_KEY] is True
     await engine.close()

@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Independent observation treatments**: AuraBench 现在把 `perfect / stale_offline` 与 Agent topology/governance 解耦；每个 episode 在规划前封存同一份 world/root-event 观察帧及内容 hash，首次离线设备显式标为 unavailable 而不复制物理真值，96-cell pilot 通过独立观察配对、公平性和统计分析契约比较两种条件。
 - **AuraBench runtime baselines**: 新增 `single_direct / no_arbiter / flat_priority / aura` 四种 fail-closed 研究配置；运行时会真实切换 Agent topology 与 proposal resolver，仍共用同一 CommandExecutor、设备校验和 evaluator，并在全矩阵汇总时拒绝缺边或固定 provenance 漂移的比较组。
 - **S3 multi-agent orchestration**: 加入 `HomeOrchestratorAgent`、Security / Energy / Scene 域 Agent、结构化任务分解、统一仲裁门、能源约束否决、显式用户覆盖与 stale-decision 丢弃证据。
 - **Per-run LLM policies**: canonical run 现在可显式选择 `rule_based / llm_mocked / llm_recorded / llm_live` baseline；服务端单独记录实际 `llm_mode`，recorded 支持受控首次录制与契约一致的原始来源回放，客户端不能提交 key、provider URL 或文件路径。

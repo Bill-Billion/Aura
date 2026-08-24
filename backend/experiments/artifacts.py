@@ -15,7 +15,13 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .spec import ExperimentCell, ResolvedMatrix, canonical_json, sha256_json
+from .spec import (
+    RESOLVED_MATRIX_SCHEMA_VERSION,
+    ExperimentCell,
+    ResolvedMatrix,
+    canonical_json,
+    sha256_json,
+)
 
 RESOLVED_MATRIX_FILENAME = "resolved-matrix.json"
 RESULT_FILENAME = "result.json"
@@ -419,6 +425,11 @@ def cell_result_path(root: Path | str, cell_id: str) -> Path:
 
 
 def write_resolved_matrix(root: Path | str, matrix: ResolvedMatrix) -> Path:
+    if matrix.matrix_schema_version != RESOLVED_MATRIX_SCHEMA_VERSION:
+        raise ValueError(
+            f"resolved matrix {matrix.matrix_schema_version} is read-only; "
+            f"only schema {RESOLVED_MATRIX_SCHEMA_VERSION} may be written"
+        )
     path = resolved_matrix_path(root)
     try:
         return atomic_create_json(

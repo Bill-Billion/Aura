@@ -2,7 +2,7 @@ matrix_schema_version: "1.0"
 matrix_id: aurabench_dev_pilot
 
 # Eight counterfactual pairs crossed with three frozen seeds. The remaining
-# axes stay fixed so this pilot measures scenario dynamics, not system variants.
+# controller axes stay fixed; observation is the independent treatment.
 axes:
   scenario:
     - episodes/comfort_smoke_preemption_static.yaml
@@ -25,11 +25,11 @@ axes:
   model: [rule_based]
   topology: [domain_multi]
   governance: [aura]
-  observation: [stale_offline]
+  observation: [perfect, stale_offline]
   repetition: [0]
 
 exclude: []
-max_cells: 48
+max_cells: 96
 max_total_cost_usd: 0.0
 cost_per_model_usd:
   rule_based: 0.0
