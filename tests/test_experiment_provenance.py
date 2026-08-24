@@ -110,3 +110,25 @@ async def test_runner_default_has_no_experiment_provenance() -> None:
     finally:
         await runner.engine.close()
     assert result.run_metadata.experiment is None
+
+
+@pytest.mark.anyio
+async def test_engine_reset_revalidates_experiment_provenance_at_core_boundary() -> None:
+    scenario = load_library([PILOT_DIR])["read_then_leave_001_static"]
+    runner = ScenarioRunner(scenario)
+    selection = runner.engine.agent_runtime.prepare_baseline_policy(
+        BaselinePolicy.RULE_BASED
+    )
+    previous_run = runner.engine.run_manager.current
+    try:
+        with pytest.raises(ValueError, match="activated runtime condition"):
+            await runner.engine.reset(
+                new_state_manager=runner.state_manager,
+                scenario=scenario,
+                seed=scenario.seed,
+                policy_selection=selection,
+                experiment=_provenance(),
+            )
+        assert runner.engine.run_manager.current is previous_run
+    finally:
+        await runner.engine.close()

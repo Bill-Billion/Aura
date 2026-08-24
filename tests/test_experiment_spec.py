@@ -229,3 +229,18 @@ def test_resolved_scenario_reference_is_portable_across_working_directories(
         resolved.cells[0]
     )
     assert loaded.id == resolved.cells[0].scenario_id
+
+
+def test_scenario_resolver_rejects_paths_outside_configured_roots(tmp_path) -> None:
+    from backend.experiments.resolve import FileOrLibraryScenarioResolver
+
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    outside = tmp_path / "outside.yaml"
+    outside.write_text("scenario_schema_version: '1.0'\n", encoding="utf-8")
+    link = allowed / "escape.yaml"
+    link.symlink_to(outside)
+
+    resolver = FileOrLibraryScenarioResolver(base_dir=allowed)
+    with pytest.raises(ValueError, match="outside the configured roots"):
+        resolver.resolve_spec("escape.yaml")

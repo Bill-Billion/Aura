@@ -18,6 +18,12 @@ from typing import Annotated, Any, Literal, TypeAlias
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 TRACE_SPEC_LANGUAGE_VERSION = "1.0"
+MAX_SELECTOR_CONDITIONS = 64
+MAX_CONDITION_LIST_VALUES = 256
+MAX_EVENT_JOINS = 64
+MAX_FIELD_PATH_LENGTH = 256
+MAX_FIELD_PATH_SEGMENTS = 16
+MAX_TRACE_PROPERTIES = 128
 
 _FIELD_PATH_RE = re.compile(
     r"^(?:event_id|event_type|source|timestamp|sim_time_s|correlation_id|"
@@ -26,6 +32,23 @@ _FIELD_PATH_RE = re.compile(
 
 ScalarValue: TypeAlias = str | int | float | bool | None
 ConditionValue: TypeAlias = ScalarValue | list[ScalarValue]
+
+
+def _validate_field_path(value: str) -> str:
+    if len(value) > MAX_FIELD_PATH_LENGTH:
+        raise ValueError(
+            f"event field path cannot exceed {MAX_FIELD_PATH_LENGTH} characters"
+        )
+    if len(value.split(".")) > MAX_FIELD_PATH_SEGMENTS:
+        raise ValueError(
+            f"event field path cannot exceed {MAX_FIELD_PATH_SEGMENTS} segments"
+        )
+    if not _FIELD_PATH_RE.fullmatch(value):
+        raise ValueError(
+            "event field path must be a supported envelope field "
+            "or data.<field> path"
+        )
+    return value
 
 
 class _StrictModel(BaseModel):
@@ -78,12 +101,7 @@ class EventFieldCondition(_StrictModel):
     @field_validator("path")
     @classmethod
     def _valid_path(cls, value: str) -> str:
-        if not _FIELD_PATH_RE.fullmatch(value):
-            raise ValueError(
-                "event field path must be a supported envelope field "
-                "or data.<field> path"
-            )
-        return value
+        return _validate_field_path(value)
 
     @model_validator(mode="after")
     def _value_matches_comparator(self) -> "EventFieldCondition":
@@ -91,6 +109,10 @@ class EventFieldCondition(_StrictModel):
             raise ValueError("exists comparator requires a boolean value")
         if self.comparator in {"in", "not_in"} and not isinstance(self.value, list):
             raise ValueError(f"{self.comparator} comparator requires a list value")
+        if isinstance(self.value, list) and len(self.value) > MAX_CONDITION_LIST_VALUES:
+            raise ValueError(
+                f"condition list cannot exceed {MAX_CONDITION_LIST_VALUES} values"
+            )
         if self.comparator in {"lt", "lte", "gt", "gte"}:
             if isinstance(self.value, bool) or not isinstance(self.value, (int, float)):
                 raise ValueError(
@@ -109,7 +131,9 @@ class EventSelector(_StrictModel):
     op: Literal["event"] = "event"
     event_type: str | None = Field(default=None, min_length=1)
     source: str | None = Field(default=None, min_length=1)
-    where: list[EventFieldCondition] = Field(default_factory=list)
+    where: list[EventFieldCondition] = Field(
+        default_factory=list, max_length=MAX_SELECTOR_CONDITIONS
+    )
 
     @model_validator(mode="after")
     def _not_wildcard_without_constraints(self) -> "EventSelector":
@@ -122,7 +146,7 @@ class EventSelector(_StrictModel):
 
 class AlwaysOperator(_StrictModel):
     op: Literal["always"] = "always"
-    operand: "TraceExpression"
+    operand: EventSelector
     window: TimeWindow | None = None
 
 
@@ -147,12 +171,7 @@ class EventFieldJoin(_StrictModel):
     @field_validator("trigger_path", "consequent_path")
     @classmethod
     def _valid_path(cls, value: str) -> str:
-        if not _FIELD_PATH_RE.fullmatch(value):
-            raise ValueError(
-                "event join path must be a supported envelope field "
-                "or data.<field> path"
-            )
-        return value
+        return _validate_field_path(value)
 
 
 class AfterOperator(_StrictModel):
@@ -161,13 +180,15 @@ class AfterOperator(_StrictModel):
     consequent: "TraceExpression"
     window: TimeWindow | None = None
     relation: Literal["any", "same_correlation", "causal_descendant"] = "any"
-    join_on: list[EventFieldJoin] = Field(default_factory=list)
+    join_on: list[EventFieldJoin] = Field(
+        default_factory=list, max_length=MAX_EVENT_JOINS
+    )
 
 
 class UntilOperator(_StrictModel):
     op: Literal["until"] = "until"
-    condition: "TraceExpression"
-    terminal: "TraceExpression"
+    condition: EventSelector
+    terminal: EventSelector
     window: TimeWindow | None = None
 
 
@@ -230,7 +251,9 @@ TraceProperty.model_rebuild(_types_namespace=_TRACE_TYPES)
 
 class TraceSpec(_StrictModel):
     language_version: Literal[TRACE_SPEC_LANGUAGE_VERSION] = TRACE_SPEC_LANGUAGE_VERSION
-    properties: list[TraceProperty] = Field(min_length=1)
+    properties: list[TraceProperty] = Field(
+        min_length=1, max_length=MAX_TRACE_PROPERTIES
+    )
 
     @field_validator("properties")
     @classmethod
@@ -261,6 +284,12 @@ def trace_spec_fingerprint(spec: TraceSpec) -> str:
 
 __all__ = [
     "TRACE_SPEC_LANGUAGE_VERSION",
+    "MAX_CONDITION_LIST_VALUES",
+    "MAX_EVENT_JOINS",
+    "MAX_FIELD_PATH_LENGTH",
+    "MAX_FIELD_PATH_SEGMENTS",
+    "MAX_SELECTOR_CONDITIONS",
+    "MAX_TRACE_PROPERTIES",
     "AfterOperator",
     "AlwaysOperator",
     "CountOperator",

@@ -3,8 +3,10 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from backend.engine.event_bus import SimEvent
+import backend.evaluation.temporal as temporal_module
 from backend.evaluation.temporal import VerificationStatus, verify_trace
 import backend.evaluation.trace_index as trace_index_module
 from backend.evaluation.trace_index import TraceIndex, TraceValidationError
@@ -212,6 +214,229 @@ def test_strong_until_requires_terminal_and_condition_before_it() -> None:
     _, prop = _status(expression, violated)
     assert prop.status == VerificationStatus.FAIL
     assert prop.counterexample_event_ids == ("e1", "e2")
+
+
+def test_pointwise_operators_reject_nested_temporal_operands() -> None:
+    with pytest.raises(ValidationError):
+        _spec(
+            {
+                "op": "always",
+                "operand": {
+                    "op": "eventually",
+                    "window": {"end_seconds": 1},
+                    "operand": {"op": "event", "event_type": "safe"},
+                },
+            }
+        )
+    with pytest.raises(ValidationError):
+        _spec(
+            {
+                "op": "until",
+                "condition": {"op": "event", "event_type": "running"},
+                "terminal": {
+                    "op": "eventually",
+                    "window": {"end_seconds": 1},
+                    "operand": {"op": "event", "event_type": "done"},
+                },
+            }
+        )
+
+
+def test_verification_work_budget_returns_unevaluable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(temporal_module, "MAX_VERIFICATION_WORK", 1)
+    result = verify_trace(
+        _spec({"op": "event", "event_type": "sample"}),
+        [_event(0, "sample"), _event(1, "sample")],
+    )
+    assert result.hard_status == VerificationStatus.UNEVALUABLE
+    assert result.properties[0].details["work_limit"] == 1
+
+    predicate = {
+        "op": "event",
+        "where": [
+            {
+                "path": "data.value",
+                "comparator": "in",
+                "value": [1, 2, 3],
+            }
+        ],
+    }
+    monkeypatch.setattr(temporal_module, "MAX_VERIFICATION_WORK", 4)
+    result = verify_trace(
+        _spec(predicate),
+        [_event(0, "sample", data={"value": 1})],
+    )
+    assert result.hard_status == VerificationStatus.UNEVALUABLE
+
+    result = verify_trace(
+        _spec({"op": "count", "selector": predicate, "threshold": 1}),
+        [_event(0, "sample", data={"value": 1})],
+    )
+    assert result.hard_status == VerificationStatus.UNEVALUABLE
+
+    monkeypatch.setattr(temporal_module, "MAX_VERIFICATION_WORK", 20)
+    contains = {
+        "op": "event",
+        "where": [
+            {
+                "path": "data.value",
+                "comparator": "contains",
+                "value": "needle",
+            }
+        ],
+    }
+    result = verify_trace(
+        _spec(contains),
+        [_event(0, "sample", data={"value": "x" * 100 + "needle"})],
+    )
+    assert result.hard_status == VerificationStatus.UNEVALUABLE
+
+
+def test_property_work_budgets_are_order_independent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(temporal_module, "MAX_VERIFICATION_WORK", 34)
+    cheap = {
+        "id": "cheap_property",
+        "category": "safety",
+        "expression": {"op": "event", "event_type": "x"},
+    }
+    expensive = {
+        "id": "expensive_property",
+        "category": "safety",
+        "expression": {
+            "op": "event",
+            "where": [
+                {
+                    "path": "data.value",
+                    "comparator": "in",
+                    "value": list(range(10)),
+                }
+            ],
+        },
+    }
+    events = [_event(0, "x", data={"value": 1})]
+
+    def statuses(properties):
+        spec = TraceSpec.model_validate({"properties": properties})
+        return {
+            item.property_id: item.status for item in verify_trace(spec, events).properties
+        }
+
+    forward = statuses([cheap, expensive])
+    assert forward == statuses([expensive, cheap])
+    assert forward == {
+        "cheap_property": VerificationStatus.PASS,
+        "expensive_property": VerificationStatus.UNEVALUABLE,
+    }
+
+
+def test_relation_identifier_comparisons_consume_work_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(temporal_module, "MAX_VERIFICATION_WORK", 100)
+    expression = {
+        "op": "after",
+        "trigger": {"op": "event", "event_type": "request"},
+        "relation": "same_correlation",
+        "consequent": {"op": "event", "event_type": "done"},
+    }
+    prefix = "x" * 10_000
+    events = [
+        _event(0, "request", correlation_id=prefix + "a"),
+        _event(1, "done", correlation_id=prefix + "b"),
+    ]
+
+    result = verify_trace(_spec(expression), events)
+
+    assert result.hard_status == VerificationStatus.UNEVALUABLE
+
+
+def test_causal_chain_rendering_consumes_work_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(temporal_module, "MAX_VERIFICATION_WORK", 270)
+    events = [
+        _event(
+            seq,
+            "sample",
+            causal_parent=f"e{seq - 1}" if seq else None,
+            data={"leaf": seq == 19},
+        )
+        for seq in range(20)
+    ]
+    expression = {
+        "op": "event",
+        "where": [
+            {"path": "data.leaf", "comparator": "eq", "value": True}
+        ],
+    }
+
+    result = verify_trace(_spec(expression), events)
+
+    assert result.hard_status == VerificationStatus.UNEVALUABLE
+
+
+def test_trace_spec_bounds_predicate_and_join_lists() -> None:
+    condition = {"path": "data.value", "comparator": "eq", "value": 1}
+    with pytest.raises(ValidationError):
+        _spec({"op": "event", "where": [condition] * 65})
+    with pytest.raises(ValidationError):
+        _spec(
+            {
+                "op": "event",
+                "where": [
+                    {
+                        "path": "data.value",
+                        "comparator": "in",
+                        "value": list(range(257)),
+                    }
+                ],
+            }
+        )
+    with pytest.raises(ValidationError):
+        _spec(
+            {
+                "op": "after",
+                "trigger": {"op": "event", "event_type": "request"},
+                "consequent": {"op": "event", "event_type": "done"},
+                "join_on": [
+                    {
+                        "trigger_path": "data.device_id",
+                        "consequent_path": "data.device_id",
+                    }
+                ]
+                * 65,
+            }
+        )
+    with pytest.raises(ValidationError):
+        _spec(
+            {
+                "op": "event",
+                "where": [
+                    {
+                        "path": "data." + "x" * 252,
+                        "comparator": "eq",
+                        "value": 1,
+                    }
+                ],
+            }
+        )
+    with pytest.raises(ValidationError):
+        _spec(
+            {
+                "op": "event",
+                "where": [
+                    {
+                        "path": "data." + ".".join(["x"] * 16),
+                        "comparator": "eq",
+                        "value": 1,
+                    }
+                ],
+            }
+        )
 
 
 @pytest.mark.parametrize(

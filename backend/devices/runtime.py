@@ -236,6 +236,7 @@ class DeviceRuntime:
         *,
         reason: str = "safety_interrupt",
         tick: int | None = None,
+        sim_time_s: float | None = None,
         predicate: Callable[[DeviceOperation], bool] | None = None,
     ) -> list[DeviceOperation]:
         if self.driver is None:
@@ -251,7 +252,7 @@ class DeviceRuntime:
                 failure_code="policy_denied",
                 detail=reason,
                 tick=tick,
-                sim_time_s=None,
+                sim_time_s=sim_time_s,
             )
             self.operations.pop(operation.operation_id, None)
             interrupted.append(operation)

@@ -22,7 +22,7 @@ from backend.devices.latency import (
 )
 from backend.engine.event_bus import EventBus, SimEvent, WorldEvent
 from backend.engine.event_log import RunArtifactRecorder, attach_run_artifacts
-from backend.engine.provenance import ExperimentProvenance
+from backend.engine.provenance import ExperimentProvenance, ExperimentRuntimeSelection
 from backend.engine.event_types import (
     ENGINE_ERROR_EVENT_TYPE,
     ENVIRONMENT_STATE_REFRESH,
@@ -494,6 +494,20 @@ class SimulationEngine:
             # calls or replay state into later anonymous 3D interactions.
             policy_selection = self.agent_runtime.prepare_baseline_policy(None)
 
+        if experiment is not None:
+            if policy_selection.baseline_policy is BaselinePolicy.RULE_BASED:
+                experiment_model = "rule_based"
+            elif policy_selection.baseline_policy is BaselinePolicy.LLM_MOCKED:
+                experiment_model = "mocked"
+            else:
+                raise ValueError(
+                    "experiment provenance only supports rule_based or mocked runtime"
+                )
+            ExperimentRuntimeSelection(
+                model=experiment_model,
+                baseline_policy=policy_selection.baseline_policy,
+            ).validate_provenance(experiment)
+
         if spec is not None:
             # Construct the complete generation graph before pausing the old run
             # or swapping worlds.  Nested stochastic config used to be an
@@ -774,7 +788,9 @@ class SimulationEngine:
 
     async def _handle_timer_tick_body(self, event: SimEvent) -> None:
         world = self.state_manager.world
-        self._pending_deltas = []
+        # before_tick may have produced exact-time device/resident deltas.  The
+        # previous tick already flushed its batch, so retain these new deltas
+        # and send them atomically with the current tick's state update.
 
         timer_tick = int(event.data["tick"])
         simulated_dt = float(event.data["simulated_dt"])
@@ -1072,6 +1088,7 @@ class SimulationEngine:
         await self.command_executor.interrupt_device_operations(
             reason=f"safety interrupt: {event.event_type}",
             tick=self.state_manager.world.simulation_tick,
+            sim_time_s=event.sim_time_s,
         )
 
     _RESIDENT_STATE_EVENT_TYPES: tuple[str, ...] = (

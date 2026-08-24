@@ -306,6 +306,11 @@ class ScenarioRunner:
             # through both phases so the in-memory trace cannot lose late evidence.
             await engine.pause()
             await self._wait_for_idle_or_raise(phase="final_drain")
+            await engine.command_executor.cancel_pending(
+                "scenario_horizon_reached",
+                tick=engine.timer.current_tick,
+            )
+            engine.command_executor.device_runtime.reset()
             self._raise_if_engine_died()
 
             metadata = engine.run_manager.current

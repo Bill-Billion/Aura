@@ -41,6 +41,15 @@ from backend.scenarios.spec_v2 import (
 )
 
 
+class _RecordingConnectionManager(ConnectionManager):
+    def __init__(self) -> None:
+        super().__init__()
+        self.messages = []
+
+    async def broadcast(self, message) -> None:  # type: ignore[override]
+        self.messages.append(message)
+
+
 def _world(*, online: bool = True) -> WorldState:
     world = WorldState()
     world.rooms = {"living_room": RoomState(id="living_room", light_level=300.0)}
@@ -282,6 +291,31 @@ async def test_large_time_jump_processes_each_due_item_at_its_own_time() -> None
 
 
 @pytest.mark.anyio
+async def test_delayed_validation_failure_keeps_occurrence_sim_time() -> None:
+    executor, state, events, sim_time, _ = _executor(
+        DeviceRuntimeProfile(start_delay_s=2)
+    )
+    record = await executor.submit(_command())
+    state.world.devices["light"].state.extra["online"] = False
+
+    sim_time[0] = 10
+    await executor.advance_device_runtime(10, tick=2)
+
+    assert record.status is CommandStatus.FAILED
+    failed_lifecycle = next(
+        event
+        for event in events
+        if event.event_type == LIFECYCLE_EVENT_TYPE
+        and event.data["to_status"] == "failed"
+    )
+    command_failed = next(
+        event for event in events if event.event_type == COMMAND_FAILED_EVENT_TYPE
+    )
+    assert failed_lifecycle.sim_time_s == 2
+    assert command_failed.sim_time_s == 2
+
+
+@pytest.mark.anyio
 async def test_supersede_safety_interrupt_and_old_run_discard() -> None:
     profile = DeviceRuntimeProfile(start_delay_s=5)
     executor, state, _, sim_time, run_id = _executor(profile)
@@ -308,7 +342,8 @@ async def test_supersede_safety_interrupt_and_old_run_discard() -> None:
 async def test_due_device_failure_is_visible_in_world_and_event_log() -> None:
     bus = EventBus()
     state = StateManager(_world())
-    engine = SimulationEngine(bus, state, ConnectionManager())
+    connection = _RecordingConnectionManager()
+    engine = SimulationEngine(bus, state, connection)
     try:
         engine.command_executor.device_runtime.inject_device_failure(
             "light", at_sim_time_s=0
@@ -318,6 +353,12 @@ async def test_due_device_failure_is_visible_in_world_and_event_log() -> None:
         failure = next(e for e in bus.get_history() if e.event_type == "device.offline")
         assert failure.data["device_id"] == "light"
         assert failure.source == "failure_injector"
+        assert any(
+            delta["path"] == "devices[light].state.extra.online"
+            for message in connection.messages
+            if message.type == "STATE_DELTA"
+            for delta in message.payload["deltas"]
+        )
     finally:
         await engine.close()
 
@@ -340,10 +381,24 @@ async def test_safety_root_event_interrupts_executing_operation() -> None:
                 event_type="safety.smoke_detected",
                 source="test",
                 timestamp=0.0,
+                sim_time_s=5.0,
                 data={},
             )
         )
         assert record.status is CommandStatus.CANCELLED
         assert record.detail == "safety interrupt: safety.smoke_detected"
+        cancelled = next(
+            event
+            for event in bus.get_history()
+            if event.event_type == LIFECYCLE_EVENT_TYPE
+            and event.data["to_status"] == "cancelled"
+        )
+        failed = next(
+            event
+            for event in bus.get_history()
+            if event.event_type == COMMAND_FAILED_EVENT_TYPE
+        )
+        assert cancelled.sim_time_s == 5
+        assert failed.sim_time_s == 5
     finally:
         await engine.close()

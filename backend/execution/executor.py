@@ -375,9 +375,17 @@ class CommandExecutor:
         )
 
     async def interrupt_device_operations(
-        self, *, reason: str = "safety_interrupt", tick: int | None = None
+        self,
+        *,
+        reason: str = "safety_interrupt",
+        tick: int | None = None,
+        sim_time_s: float | None = None,
     ) -> list[DeviceOperation]:
-        return await self.device_runtime.interrupt(reason=reason, tick=tick)
+        return await self.device_runtime.interrupt(
+            reason=reason,
+            tick=tick,
+            sim_time_s=sim_time_s,
+        )
 
     # ------------------------------------------------------------------
     # 公共入口
@@ -703,6 +711,7 @@ class CommandExecutor:
                 failure_code=failure.code.value,
                 detail=failure.message,
                 tick=tick,
+                sim_time_s=sim_time_s,
             )
             return False
 
@@ -721,6 +730,7 @@ class CommandExecutor:
                     (),
                     tick,
                     publish=publish,
+                    sim_time_s=sim_time_s,
                 )
                 return False
 
@@ -734,6 +744,7 @@ class CommandExecutor:
                 tick,
                 publish=publish,
                 pre_existing=True,
+                sim_time_s=sim_time_s,
             )
             if record.is_terminal:
                 return False
@@ -760,6 +771,7 @@ class CommandExecutor:
                 failure_code=CommandErrorCode.UNKNOWN_DEVICE.value,
                 detail=str(exc),
                 tick=tick,
+                sim_time_s=sim_time_s,
             )
             return False
 
@@ -802,6 +814,7 @@ class CommandExecutor:
                 reverted,
                 tick,
                 publish=publish,
+                sim_time_s=sim_time_s,
             )
             return False
 
@@ -1055,6 +1068,7 @@ class CommandExecutor:
         tick: int | None,
         *,
         publish: PublishEvent | None = None,
+        sim_time_s: float | None = None,
     ) -> None:
         """不变式违规的统一收口：命令 failed + 结构化违规事件 + 同码 device.command_failed。"""
 
@@ -1063,9 +1077,16 @@ class CommandExecutor:
             failure=INVARIANT_VIOLATION_ERROR_CODE,
             detail=violation.message,
             tick=tick,
+            sim_time_s=sim_time_s,
         )
         await self._emit_invariant_violation(
-            command, violation, causal_parent, reverted_paths, tick, publish=publish
+            command,
+            violation,
+            causal_parent,
+            reverted_paths,
+            tick,
+            publish=publish,
+            sim_time_s=sim_time_s,
         )
         await self._emit_command_failed(
             command,
@@ -1074,6 +1095,7 @@ class CommandExecutor:
             causal_parent=causal_parent,
             tick=tick,
             publish=publish,
+            sim_time_s=sim_time_s,
         )
         self._deregister(record)
 
@@ -1087,6 +1109,7 @@ class CommandExecutor:
         *,
         publish: PublishEvent | None = None,
         pre_existing: bool = False,
+        sim_time_s: float | None = None,
     ) -> SimEvent:
         event = SimEvent(
             event_type=INVARIANT_VIOLATION_EVENT_TYPE,
@@ -1096,6 +1119,7 @@ class CommandExecutor:
             causal_parent=causal_parent,
             # 系统级故障恒取最高优先级，保证在可观测性面板里不被普通事件淹没。
             priority=3,
+            sim_time_s=sim_time_s,
             data={
                 "invariant": violation.invariant,
                 "message": violation.message,

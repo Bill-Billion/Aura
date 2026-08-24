@@ -7,7 +7,7 @@ events share a simulated timestamp.  Bounds are closed on both ends.
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -39,6 +39,13 @@ class VerificationStatus(str, Enum):
     PASS = "pass"
     FAIL = "fail"
     UNEVALUABLE = "unevaluable"
+
+
+MAX_VERIFICATION_WORK = 1_000_000
+
+
+class _WorkBudgetExceeded(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -142,7 +149,43 @@ def _within_window(
     )
 
 
-def _condition_matches(condition: EventFieldCondition, actual: Any) -> bool:
+def _charge_comparison(
+    spend: Callable[[int], None], left: Any, right: Any
+) -> None:
+    """Charge before comparing bounded JSON-like values."""
+
+    stack = [left, right]
+    seen: set[int] = set()
+    while stack:
+        value = stack.pop()
+        spend(1)
+        if isinstance(value, str):
+            spend(len(value))
+        elif isinstance(value, bytes):
+            spend(len(value))
+        elif isinstance(value, Mapping):
+            identity = id(value)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            stack.extend(value.keys())
+            stack.extend(value.values())
+        elif isinstance(value, (list, tuple)):
+            identity = id(value)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            stack.extend(value)
+
+
+def _condition_matches(
+    condition: EventFieldCondition,
+    actual: Any,
+    *,
+    spend: Callable[[int], None] | None = None,
+) -> bool:
+    if spend is not None:
+        spend(1)
     comparator = condition.comparator
     expected = condition.value
     if comparator == "exists":
@@ -150,11 +193,18 @@ def _condition_matches(condition: EventFieldCondition, actual: Any) -> bool:
     if actual is MISSING:
         return False
     if comparator == "eq":
+        if spend is not None:
+            _charge_comparison(spend, actual, expected)
         return strict_equal(actual, expected)
     if comparator == "ne":
+        if spend is not None:
+            _charge_comparison(spend, actual, expected)
         return not strict_equal(actual, expected)
     if comparator in {"in", "not_in"}:
         assert isinstance(expected, list)
+        if spend is not None:
+            for item in expected:
+                _charge_comparison(spend, actual, item)
         contained = any(strict_equal(actual, item) for item in expected)
         return contained if comparator == "in" else not contained
     if comparator in {"lt", "lte", "gt", "gte"}:
@@ -173,38 +223,78 @@ def _condition_matches(condition: EventFieldCondition, actual: Any) -> bool:
         }[comparator]
     if comparator == "contains":
         if isinstance(actual, str):
+            if spend is not None:
+                expected_length = len(expected) if isinstance(expected, str) else 1
+                spend(len(actual) + expected_length)
             return isinstance(expected, str) and expected in actual
         if isinstance(actual, (list, tuple)):
+            if spend is not None:
+                for item in actual:
+                    _charge_comparison(spend, item, expected)
             return any(strict_equal(item, expected) for item in actual)
         return False
     raise AssertionError(f"unsupported comparator {comparator!r}")
 
 
-def _selector_matches(selector: EventSelector, event: TraceEvent) -> bool:
-    if selector.event_type is not None and event.event_type != selector.event_type:
-        return False
-    if selector.source is not None and event.source != selector.source:
-        return False
-    return all(
-        _condition_matches(condition, event.field(condition.path))
-        for condition in selector.where
-    )
+def _selector_matches(
+    selector: EventSelector,
+    event: TraceEvent,
+    *,
+    spend: Callable[[int], None] | None = None,
+) -> bool:
+    if selector.event_type is not None:
+        if spend is not None:
+            _charge_comparison(spend, event.event_type, selector.event_type)
+        if event.event_type != selector.event_type:
+            return False
+    if selector.source is not None:
+        if spend is not None:
+            _charge_comparison(spend, event.source, selector.source)
+        if event.source != selector.source:
+            return False
+    for condition in selector.where:
+        if spend is not None:
+            spend(len(condition.path))
+        if not _condition_matches(
+            condition,
+            event.field(condition.path),
+            spend=spend,
+        ):
+            return False
+    return True
 
 
 class _Verifier:
-    def __init__(self, index: TraceIndex) -> None:
+    def __init__(self, index: TraceIndex, *, work_limit: int) -> None:
         self.index = index
+        self.work_limit = work_limit
+        self._remaining_work = work_limit
+
+    def _spend(self, amount: int) -> None:
+        self._remaining_work -= amount
+        if self._remaining_work < 0:
+            raise _WorkBudgetExceeded(
+                f"TraceSpec verification exceeded {self.work_limit} work units"
+            )
 
     def evaluate_property(self, prop: TraceProperty) -> PropertyVerification:
-        outcome = self._evaluate(
-            prop.expression,
-            self.index.events,
-            anchor_time_s=0.0,
-        )
-        primary = outcome.counterexample or outcome.witness
-        causal_chain = outcome.causal_chain
-        if not causal_chain and primary:
-            causal_chain = self.index.causal_chain(primary[0].event_id)
+        try:
+            outcome = self._evaluate(
+                prop.expression,
+                self.index.events,
+                anchor_time_s=0.0,
+            )
+            primary = outcome.counterexample or outcome.witness
+            causal_chain = outcome.causal_chain
+            if not causal_chain and primary:
+                causal_chain = self._causal_chain(primary[0].event_id)
+        except _WorkBudgetExceeded as exc:
+            outcome = _Outcome(
+                VerificationStatus.UNEVALUABLE,
+                str(exc),
+                details={"work_limit": self.work_limit},
+            )
+            causal_chain = ()
         return PropertyVerification(
             property_id=prop.id,
             category=prop.category,
@@ -232,9 +322,12 @@ class _Verifier:
         *,
         anchor_time_s: float,
     ) -> _Outcome:
+        self._spend(len(events))
         if isinstance(expression, EventSelector):
             matches = tuple(
-                event for event in events if _selector_matches(expression, event)
+                event
+                for event in events
+                if _selector_matches(expression, event, spend=self._spend)
             )
             if matches:
                 return _Outcome(
@@ -319,7 +412,9 @@ class _Verifier:
 
         if isinstance(expression, AfterOperator):
             triggers = tuple(
-                event for event in events if _selector_matches(expression.trigger, event)
+                event
+                for event in events
+                if _selector_matches(expression.trigger, event, spend=self._spend)
             )
             if not triggers:
                 return _Outcome(
@@ -331,6 +426,7 @@ class _Verifier:
             all_chains: list[TraceEvent] = []
             unevaluable: _Outcome | None = None
             for trigger in triggers:
+                self._spend(len(events))
                 candidates = tuple(event for event in events if event.seq > trigger.seq)
                 candidates = _within_window(
                     candidates, expression.window, trigger.sim_time_s
@@ -428,7 +524,11 @@ class _Verifier:
         if isinstance(expression, CountOperator):
             scoped = _within_window(events, expression.window, anchor_time_s)
             matches = tuple(
-                event for event in scoped if _selector_matches(expression.selector, event)
+                event
+                for event in scoped
+                if _selector_matches(
+                    expression.selector, event, spend=self._spend
+                )
             )
             actual = len(matches)
             threshold = expression.threshold
@@ -473,25 +573,44 @@ class _Verifier:
     ) -> tuple[TraceEvent, ...]:
         related: list[TraceEvent] = []
         for candidate in candidates:
+            self._spend(1)
             if (
                 expression.relation == "same_correlation"
-                and (
-                    trigger.correlation_id is None
-                    or candidate.correlation_id != trigger.correlation_id
-                )
+                and trigger.correlation_id is None
             ):
                 continue
-            if expression.relation == "causal_descendant" and not self.index.is_descendant(
-                candidate, trigger.event_id
-            ):
-                continue
-            if not all(
-                strict_equal(
-                    trigger.field(join.trigger_path),
-                    candidate.field(join.consequent_path),
+            if expression.relation == "same_correlation":
+                _charge_comparison(
+                    self._spend,
+                    candidate.correlation_id,
+                    trigger.correlation_id,
                 )
-                for join in expression.join_on
-            ):
+                if candidate.correlation_id != trigger.correlation_id:
+                    continue
+            if expression.relation == "causal_descendant":
+                parent_id = candidate.causal_parent
+                matched_ancestor = False
+                while parent_id is not None:
+                    _charge_comparison(
+                        self._spend, parent_id, trigger.event_id
+                    )
+                    if parent_id == trigger.event_id:
+                        matched_ancestor = True
+                        break
+                    self._spend(1)
+                    parent_id = self.index.by_id[parent_id].causal_parent
+                if not matched_ancestor:
+                    continue
+            joined = True
+            for join in expression.join_on:
+                self._spend(len(join.trigger_path) + len(join.consequent_path))
+                left = trigger.field(join.trigger_path)
+                right = candidate.field(join.consequent_path)
+                _charge_comparison(self._spend, left, right)
+                if not strict_equal(left, right):
+                    joined = False
+                    break
+            if not joined:
                 continue
             related.append(candidate)
         return tuple(related)
@@ -499,11 +618,22 @@ class _Verifier:
     def _chain_from_ancestor(
         self, ancestor: TraceEvent, descendant: TraceEvent
     ) -> tuple[TraceEvent, ...]:
-        chain = self.index.causal_chain(descendant.event_id)
+        chain = self._causal_chain(descendant.event_id)
         for index, event in enumerate(chain):
             if event.event_id == ancestor.event_id:
                 return chain[index:]
         return ()
+
+    def _causal_chain(self, event_id: str) -> tuple[TraceEvent, ...]:
+        reverse_chain: list[TraceEvent] = []
+        current_id: str | None = event_id
+        while current_id is not None:
+            self._spend(1 + len(current_id))
+            event = self.index.by_id[current_id]
+            reverse_chain.append(event)
+            current_id = event.causal_parent
+        reverse_chain.reverse()
+        return tuple(reverse_chain)
 
     @staticmethod
     def _minimal_count_witness(
@@ -596,14 +726,18 @@ def verify_trace(trace_spec: TraceSpec, events: list[Any]) -> TraceVerification:
         )
 
     try:
-        verifier = _Verifier(TraceIndex(events))
+        index = TraceIndex(events)
     except (TraceValidationError, RecursionError) as exc:
         return _unevaluable_spec(
             trace_spec, f"invalid canonical trace: {exc}"
         )
 
+    work_per_property = max(
+        1, MAX_VERIFICATION_WORK // len(trace_spec.properties)
+    )
     properties = tuple(
-        verifier.evaluate_property(prop) for prop in trace_spec.properties
+        _Verifier(index, work_limit=work_per_property).evaluate_property(prop)
+        for prop in trace_spec.properties
     )
     return TraceVerification(
         hard_status=_aggregate_hard_status(properties),

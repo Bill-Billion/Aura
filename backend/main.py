@@ -500,9 +500,13 @@ async def _finalize_scenario_run(run_id: str, duration_seconds: float) -> None:
                 return
             await engine.pause()
             settled = await engine.agent_runtime.wait_for_idle(timeout=30.0)
+            cleanup_reason = (
+                "run_duration_elapsed" if end_reason == "completed" else end_reason
+            )
             if not settled:
-                await engine.agent_runtime.cancel_active_episodes("run_duration_elapsed")
-                await engine.command_executor.cancel_pending("run_duration_elapsed")
+                await engine.agent_runtime.cancel_active_episodes(cleanup_reason)
+            await engine.command_executor.cancel_pending(cleanup_reason)
+            engine.command_executor.device_runtime.reset()
             if engine.run_id != run_id:
                 return
             metadata = engine.run_manager.end_run(end_reason)
@@ -594,6 +598,8 @@ async def _finalize_scenario_run(run_id: str, duration_seconds: float) -> None:
                                 cleanup=name,
                                 error=str(cleanup_exc),
                             )
+
+                    engine.command_executor.device_runtime.reset()
 
                     current = engine.run_manager.current
                     metadata: RunMetadata | None = None

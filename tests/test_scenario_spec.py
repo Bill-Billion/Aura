@@ -15,6 +15,7 @@ import pytest
 import structlog
 from pydantic import ValidationError
 
+import backend.scenarios.loader as loader_module
 from backend.engine.rng import MAX_JSON_SAFE_SEED
 from backend.models.versioning import (
     LEGACY_SCENARIO_SCHEMA_VERSION,
@@ -26,6 +27,7 @@ from backend.models.versioning import (
 from backend.scenarios.loader import (
     DEFAULT_LIBRARY_DIRS,
     ScenarioLoadError,
+    ScenarioLoadErrorCode,
     load_library,
     load_scenario_file,
 )
@@ -95,6 +97,63 @@ success_criteria:
   max_command_failures: 0
   allow_fallback: true
 """
+
+
+def test_loader_rejects_scenario_files_above_size_cap(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "oversized.yaml"
+    path.write_text("id: oversized\n", encoding="utf-8")
+    monkeypatch.setattr(loader_module, "MAX_SCENARIO_YAML_BYTES", 4)
+
+    with pytest.raises(ScenarioLoadError) as excinfo:
+        load_scenario_file(path)
+
+    assert excinfo.value.code is ScenarioLoadErrorCode.INVALID_YAML
+    assert "4 字节上限" in str(excinfo.value)
+
+
+def test_bounded_loader_rejects_symlinked_path_components(tmp_path) -> None:
+    root = tmp_path / "root"
+    actual = root / "actual"
+    actual.mkdir(parents=True)
+    path = write_scenario(actual, "scenario", SPEC_5_2_EXAMPLE)
+    (root / "linked").symlink_to(actual, target_is_directory=True)
+
+    with pytest.raises(ScenarioLoadError) as excinfo:
+        load_scenario_file(
+            root / "linked" / path.name,
+            allowed_roots=(root,),
+        )
+
+    assert excinfo.value.code is ScenarioLoadErrorCode.INVALID_YAML
+
+
+def test_bounded_loader_rejects_symlinked_configured_root(tmp_path) -> None:
+    actual = tmp_path / "actual"
+    actual.mkdir()
+    path = write_scenario(actual, "scenario", SPEC_5_2_EXAMPLE)
+    linked_root = tmp_path / "linked-root"
+    linked_root.symlink_to(actual, target_is_directory=True)
+
+    with pytest.raises(ScenarioLoadError) as excinfo:
+        load_scenario_file(
+            linked_root / path.name,
+            allowed_roots=(linked_root,),
+        )
+
+    assert excinfo.value.code is ScenarioLoadErrorCode.INVALID_YAML
+
+
+def test_loader_wraps_excessively_deep_yaml(tmp_path) -> None:
+    path = tmp_path / "deep.yaml"
+    body = "\n".join(f"{'  ' * depth}level_{depth}:" for depth in range(1200))
+    path.write_text(body, encoding="utf-8")
+
+    with pytest.raises(ScenarioLoadError) as excinfo:
+        load_scenario_file(path, check_registry=False)
+
+    assert excinfo.value.code is ScenarioLoadErrorCode.INVALID_YAML
 
 # §5.3 八个 ground truth 标签（规格原文示例）
 SPEC_5_3_GROUND_TRUTH = """

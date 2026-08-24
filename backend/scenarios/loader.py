@@ -13,6 +13,8 @@
 from __future__ import annotations
 
 import copy
+import os
+import stat
 from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -38,6 +40,7 @@ from backend.scenarios.spec_v2 import ScenarioSpecV2
 DEFAULT_LIBRARY_DIRS: tuple[Path, ...] = (Path(__file__).resolve().parent / "library",)
 
 _YAML_SUFFIXES = (".yaml", ".yml")
+MAX_SCENARIO_YAML_BYTES = 4 * 1024 * 1024
 
 
 class ScenarioLoadErrorCode(str, Enum):
@@ -251,7 +254,94 @@ def parse_scenario_mapping(
     return spec
 
 
-def load_scenario_file(path: Path | str, *, check_registry: bool = True) -> ScenarioSpec:
+def _read_scenario_bytes(
+    path: Path,
+    *,
+    allowed_roots: Sequence[Path | str] | None = None,
+) -> bytes:
+    """Read one bounded regular file, optionally without following any symlink."""
+
+    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
+    file_fd: int | None = None
+    directory_fd: int | None = None
+    try:
+        if allowed_roots is None:
+            file_fd = os.open(path, flags)
+        else:
+            absolute = Path(os.path.abspath(path))
+            selected: tuple[Path, Path] | None = None
+            for root in allowed_roots:
+                root_path = Path(os.path.abspath(root))
+                try:
+                    relative = absolute.relative_to(root_path)
+                except ValueError:
+                    continue
+                if relative.parts:
+                    selected = root_path, relative
+                    break
+            if selected is None:
+                raise ValueError(
+                    f"scenario path {absolute} is outside the configured roots"
+                )
+
+            root_path, relative = selected
+            directory_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+            for component in root_path.parts[1:]:
+                next_fd = os.open(
+                    component,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=directory_fd,
+                )
+                os.close(directory_fd)
+                directory_fd = next_fd
+            for component in relative.parts[:-1]:
+                next_fd = os.open(
+                    component,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=directory_fd,
+                )
+                os.close(directory_fd)
+                directory_fd = next_fd
+            file_fd = os.open(relative.name, flags, dir_fd=directory_fd)
+
+        metadata = os.fstat(file_fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError("scenario path is not a regular file")
+        if metadata.st_size > MAX_SCENARIO_YAML_BYTES:
+            raise ScenarioLoadError(
+                ScenarioLoadErrorCode.INVALID_YAML,
+                f"场景文件超过 {MAX_SCENARIO_YAML_BYTES} 字节上限",
+                path=path,
+            )
+        chunks: list[bytes] = []
+        remaining = MAX_SCENARIO_YAML_BYTES + 1
+        while remaining:
+            chunk = os.read(file_fd, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        if len(data) > MAX_SCENARIO_YAML_BYTES:
+            raise ScenarioLoadError(
+                ScenarioLoadErrorCode.INVALID_YAML,
+                f"场景文件超过 {MAX_SCENARIO_YAML_BYTES} 字节上限",
+                path=path,
+            )
+        return data
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
+def load_scenario_file(
+    path: Path | str,
+    *,
+    check_registry: bool = True,
+    allowed_roots: Sequence[Path | str] | None = None,
+) -> ScenarioSpec:
     """加载单个场景 YAML 文件。
 
     ``check_registry=False`` 供合成/失败注入场景使用（S4 的 failures/ 可能刻意引用
@@ -263,8 +353,10 @@ def load_scenario_file(path: Path | str, *, check_registry: bool = True) -> Scen
             ScenarioLoadErrorCode.FILE_NOT_FOUND, "场景文件不存在", path=path
         )
     try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except yaml.YAMLError as exc:
+        raw = yaml.safe_load(
+            _read_scenario_bytes(path, allowed_roots=allowed_roots).decode("utf-8")
+        )
+    except (OSError, RecursionError, UnicodeDecodeError, yaml.YAMLError) as exc:
         raise ScenarioLoadError(
             ScenarioLoadErrorCode.INVALID_YAML,
             f"YAML 解析失败：{exc}",
@@ -274,7 +366,14 @@ def load_scenario_file(path: Path | str, *, check_registry: bool = True) -> Scen
         raise ScenarioLoadError(
             ScenarioLoadErrorCode.NOT_A_MAPPING, "场景文件为空", path=path
         )
-    return parse_scenario_mapping(raw, path=path, check_registry=check_registry)
+    try:
+        return parse_scenario_mapping(raw, path=path, check_registry=check_registry)
+    except RecursionError as exc:
+        raise ScenarioLoadError(
+            ScenarioLoadErrorCode.INVALID_YAML,
+            "场景结构嵌套过深",
+            path=path,
+        ) from exc
 
 
 def iter_scenario_files(dirs: Iterable[Path | str] | None = None) -> list[Path]:

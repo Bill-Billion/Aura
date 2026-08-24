@@ -41,7 +41,15 @@ class FileOrLibraryScenarioResolver:
         if not direct_path.is_absolute():
             direct_path = self.base_dir / direct_path
         if direct_path.is_file():
-            return load_scenario_file(direct_path)
+            resolved = direct_path.resolve()
+            allowed_roots = (self.base_dir.resolve(),) + tuple(
+                path.resolve() for path in self.scenario_dirs
+            )
+            if not any(resolved.is_relative_to(root) for root in allowed_roots):
+                raise ValueError(
+                    f"scenario path {resolved} is outside the configured roots"
+                )
+            return load_scenario_file(resolved, allowed_roots=allowed_roots)
 
         spec = get_scenario(
             reference,
