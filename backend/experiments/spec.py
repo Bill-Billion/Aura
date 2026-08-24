@@ -22,9 +22,14 @@ from pydantic import (
     model_validator,
 )
 
+from backend.engine.provenance import (
+    ResearchRuntimeProfile,
+    research_runtime_profile_for_axes,
+)
 from backend.engine.rng import MAX_JSON_SAFE_SEED
 
 MATRIX_SCHEMA_VERSION = "1.0"
+RESOLVED_MATRIX_SCHEMA_VERSION = "1.1"
 CELL_ID_PREFIX = "cell-"
 MAX_MATRIX_AXIS_VALUES = 256
 MAX_MATRIX_CELLS = 10_000
@@ -271,6 +276,31 @@ class MatrixSpec(_StrictModel):
             )
         return cells
 
+    def declared_runtime_profiles(self) -> list[ResearchRuntimeProfile]:
+        """Return implemented profiles declared by the raw axes.
+
+        Exclusions intentionally do not participate: they may remove individual
+        cells, but must not silently redefine the comparison authored by the
+        matrix axes.
+        """
+
+        profiles: set[ResearchRuntimeProfile] = set()
+        for topology, governance, observation in product(
+            self.axes.topology,
+            self.axes.governance,
+            self.axes.observation,
+        ):
+            try:
+                profile = research_runtime_profile_for_axes(
+                    topology=topology,
+                    governance=governance,
+                    observation=observation,
+                )
+            except ValueError:
+                continue
+            profiles.add(profile)
+        return sorted(profiles, key=lambda profile: profile.value)
+
     def contract_hash(self) -> str:
         return sha256_json(self.model_dump(mode="json"))
 
@@ -361,10 +391,14 @@ class ExperimentCell(_StrictModel):
 class ResolvedMatrix(_StrictModel):
     """Stable, sorted execution manifest persisted before any cell runs."""
 
-    matrix_schema_version: Literal["1.0"] = MATRIX_SCHEMA_VERSION
+    matrix_schema_version: Literal["1.1"] = RESOLVED_MATRIX_SCHEMA_VERSION
     matrix_id: str = Field(pattern=r"^[a-z][a-z0-9_-]{2,95}$")
     source_revision: str = Field(min_length=1, max_length=MAX_MATRIX_STRING_LENGTH)
     spec_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_runtime_profiles: list[ResearchRuntimeProfile] = Field(
+        min_length=1,
+        max_length=len(ResearchRuntimeProfile),
+    )
     total_estimated_cost_usd: float = Field(ge=0.0)
     cells: list[ExperimentCell] = Field(max_length=MAX_MATRIX_CELLS)
     matrix_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -379,10 +413,11 @@ class ResolvedMatrix(_StrictModel):
     ) -> "ResolvedMatrix":
         ordered = sorted(cells, key=lambda cell: cell.cell_id)
         payload = {
-            "matrix_schema_version": MATRIX_SCHEMA_VERSION,
+            "matrix_schema_version": RESOLVED_MATRIX_SCHEMA_VERSION,
             "matrix_id": spec.matrix_id,
             "source_revision": source_revision,
             "spec_hash": spec.contract_hash(),
+            "expected_runtime_profiles": spec.declared_runtime_profiles(),
             "total_estimated_cost_usd": sum(
                 cell.estimated_cost_usd for cell in ordered
             ),
@@ -392,6 +427,11 @@ class ResolvedMatrix(_StrictModel):
 
     @model_validator(mode="after")
     def _validate_order_and_hash(self) -> "ResolvedMatrix":
+        profile_values = [profile.value for profile in self.expected_runtime_profiles]
+        if profile_values != sorted(profile_values):
+            raise ValueError("expected runtime profiles must be sorted")
+        if len(profile_values) != len(set(profile_values)):
+            raise ValueError("expected runtime profiles must be unique")
         ids = [cell.cell_id for cell in self.cells]
         if ids != sorted(ids):
             raise ValueError("resolved cells must be sorted by cell_id")
@@ -425,6 +465,7 @@ __all__ = [
     "MAX_MATRIX_CELLS",
     "MAX_MATRIX_STRING_LENGTH",
     "MATRIX_SCHEMA_VERSION",
+    "RESOLVED_MATRIX_SCHEMA_VERSION",
     "ExactExclusion",
     "ExperimentCell",
     "MatrixAxes",

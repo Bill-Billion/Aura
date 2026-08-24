@@ -194,6 +194,7 @@ class ScenarioRunner:
             raise ValueError("runtime experiment condition requires provenance")
         self.baseline_policy = baseline_policy
         self.experiment = experiment
+        self.experiment_runtime = experiment_runtime
         self._collected: list[SimEvent] = []
 
         self.state_manager, self.initial_state_application = self._build_world(spec)
@@ -267,6 +268,7 @@ class ScenarioRunner:
             duration_seconds=duration,
             policy_selection=policy_selection,
             experiment=self.experiment,
+            experiment_runtime=self.experiment_runtime,
         )
         engine.mode = scenario_world_mode(self.spec.mode)
 

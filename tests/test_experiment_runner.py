@@ -106,6 +106,7 @@ async def test_runner_is_serial_ordered_and_resumes_only_valid_completed_results
     assert executor.calls == [cell.cell_id for cell in matrix.cells]
     assert first.completed == 4
     assert first.skipped == 0
+    assert first.fairness_audited is True
 
     second = await MatrixRunner(executor).run(matrix, output_dir=tmp_path)
     assert len(executor.calls) == 4
@@ -161,12 +162,13 @@ async def test_each_shard_writes_an_independent_summary(tmp_path) -> None:
     matrix = resolved_matrix()
     executor = RecordingExecutor()
     for index in range(2):
-        await MatrixRunner(executor).run(
+        shard_summary = await MatrixRunner(executor).run(
             matrix,
             output_dir=tmp_path,
             shard_index=index,
             shard_count=2,
         )
+        assert shard_summary.fairness_audited is False
         assert (tmp_path / "shards" / f"{index:04d}-of-0002" / "summary.json").is_file()
     summary = summarize_results(
         matrix,
@@ -175,6 +177,7 @@ async def test_each_shard_writes_an_independent_summary(tmp_path) -> None:
     )
     assert summary.completed == len(matrix.cells)
     assert summary.pending == 0
+    assert summary.fairness_audited is True
 
 
 class FailingExecutor(AcceptingValidator):
@@ -384,7 +387,14 @@ async def test_aura_adapter_returns_evaluation_error_as_evidence(
 
         @staticmethod
         def to_dict():
-            return {"outcome": "error", "failure_reasons": ["injected"]}
+            return {
+                "report_schema_version": "1.0",
+                "outcome": "error",
+                "failure_reasons": ["injected"],
+                "provenance": {
+                    "evaluator_source_revision": matrix.source_revision,
+                },
+            }
 
     monkeypatch.setattr(adapters, "evaluate_run", lambda *args, **kwargs: ErrorReport())
     result = await AuraCellExecutor(data_root=tmp_path / "runs").execute(

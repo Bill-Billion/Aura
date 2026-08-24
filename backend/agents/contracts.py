@@ -462,7 +462,7 @@ NON_ACTION_OUTCOMES: frozenset[ProposalOutcome] = frozenset(
 _ASSUMPTION_PATH_RE = re.compile(
     r"^(?:"
     r"users\[[^\]]+\]\.(?:activity|location\.room)|"
-    r"rooms\[[^\]]+\]\.occupancy|"
+    r"rooms\[[^\]]+\]\.(?:occupancy|temperature|light_level)|"
     r"devices\[[^\]]+\]\.state\.(?:power|extra\.[A-Za-z0-9_-]+)|"
     r"environment\.(?:time_of_day|weather|outdoor_temp|outdoor_humidity)"
     r")$"

@@ -450,6 +450,7 @@ class SimulationEngine:
         policy_selection: RuntimePolicySelection | None = None,
         duration_seconds: float | None = None,
         experiment: ExperimentProvenance | None = None,
+        experiment_runtime: ExperimentRuntimeSelection | None = None,
     ) -> None:
         """重置世界并开一个**新 run**（§11）。
 
@@ -495,6 +496,10 @@ class SimulationEngine:
             policy_selection = self.agent_runtime.prepare_baseline_policy(None)
 
         if experiment is not None:
+            if experiment_runtime is None:
+                raise ValueError(
+                    "experiment provenance requires an activated runtime condition"
+                )
             if policy_selection.baseline_policy is BaselinePolicy.RULE_BASED:
                 experiment_model = "rule_based"
             elif policy_selection.baseline_policy is BaselinePolicy.LLM_MOCKED:
@@ -503,10 +508,13 @@ class SimulationEngine:
                 raise ValueError(
                     "experiment provenance only supports rule_based or mocked runtime"
                 )
-            ExperimentRuntimeSelection(
-                model=experiment_model,
-                baseline_policy=policy_selection.baseline_policy,
-            ).validate_provenance(experiment)
+            if experiment_runtime.model != experiment_model:
+                raise ValueError("runtime model does not match the selected baseline policy")
+            if experiment_runtime.baseline_policy is not policy_selection.baseline_policy:
+                raise ValueError("runtime baseline policy does not match the selected policy")
+            experiment_runtime.validate_provenance(experiment)
+        elif experiment_runtime is not None:
+            raise ValueError("runtime experiment condition requires provenance")
 
         if spec is not None:
             # Construct the complete generation graph before pausing the old run
@@ -576,6 +584,11 @@ class SimulationEngine:
             else legacy_runtime_profile
         )
         self.agent_runtime.update_state_manager(self.state_manager)
+        if (
+            experiment_runtime is not None
+            or self.agent_runtime.active_experiment_runtime is not None
+        ):
+            self.agent_runtime.activate_experiment_runtime(experiment_runtime)
         self.agent_runtime.reset()
         self._sync_world_timing_state(reset_mode=True)
         self._sync_agent_diagnostics()

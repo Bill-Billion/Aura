@@ -5,6 +5,7 @@ from copy import deepcopy
 import pytest
 from pydantic import ValidationError
 
+from backend.engine.provenance import ResearchRuntimeProfile
 from backend.experiments.resolve import load_and_resolve_matrix, resolve_matrix
 from backend.experiments.spec import (
     MAX_MATRIX_STRING_LENGTH,
@@ -139,6 +140,8 @@ def test_resolution_is_order_independent_and_ids_cover_provenance() -> None:
         source_revision="sha256:revision-a",
     )
     assert first == second
+    assert first.matrix_schema_version == "1.1"
+    assert first.expected_runtime_profiles == [ResearchRuntimeProfile.AURA]
     assert [cell.cell_id for cell in first.cells] == sorted(
         cell.cell_id for cell in first.cells
     )
@@ -152,6 +155,19 @@ def test_resolution_is_order_independent_and_ids_cover_provenance() -> None:
         cell.cell_id for cell in changed.cells
     )
     assert first.matrix_hash != changed.matrix_hash
+
+
+def test_declared_profiles_come_from_raw_axes_and_ignore_illegal_cross_products() -> None:
+    raw = matrix_mapping()
+    raw["axes"]["topology"] = ["single", "domain_multi"]
+    raw["axes"]["governance"] = ["none", "aura"]
+    raw["max_cells"] = 32
+    spec = MatrixSpec.model_validate(raw)
+    assert spec.declared_runtime_profiles() == [
+        ResearchRuntimeProfile.AURA,
+        ResearchRuntimeProfile.NO_ARBITER,
+        ResearchRuntimeProfile.SINGLE_DIRECT,
+    ]
 
 
 def test_resolved_matrix_rejects_cross_field_provenance_drift() -> None:
@@ -203,6 +219,7 @@ def test_pilot_matrix_resolves_to_exactly_forty_eight_cells() -> None:
     assert {cell.topology for cell in resolved.cells} == {"domain_multi"}
     assert {cell.governance for cell in resolved.cells} == {"aura"}
     assert {cell.observation for cell in resolved.cells} == {"stale_offline"}
+    assert resolved.expected_runtime_profiles == [ResearchRuntimeProfile.AURA]
 
 
 def test_resolved_scenario_reference_is_portable_across_working_directories(
