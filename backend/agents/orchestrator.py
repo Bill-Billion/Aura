@@ -387,6 +387,7 @@ class OrchestrationDecision(BaseModel):
     model: str = "rule_based"
     latency_ms: int = 0
     explanation: str = ""
+    provider_failure_reason: str | None = None
     tasks_by_agent_id: dict[str, DomainTask] = Field(default_factory=dict)
 
     @property
@@ -440,6 +441,7 @@ class OrchestrationDecision(BaseModel):
             "outcome": self.outcome.value,
             "requires_confirmation": self.plan.requires_confirmation,
             "fallback_reason": self.plan.fallback_reason,
+            "provider_failure_reason": self.provider_failure_reason,
             "llm_mode": self.llm_mode,
             "provider": self.provider,
             "model": self.model,
@@ -602,6 +604,22 @@ class HomeOrchestratorAgent:
             )
 
         latency_ms = int((time.monotonic() - started_at) * 1000)
+        if decision.provider_failure_reason:
+            return self._assemble(
+                context=context,
+                bindings=bindings,
+                rule=rule,
+                intent=decision.intent,
+                confidence=0.0,
+                priority=rule.priority,
+                confidence_source=ConfidenceSource.LLM,
+                explanation=decision.explanation,
+                llm_mode=mode.value,
+                provider=str(getattr(llm_provider, "provider_name", "llm")),
+                model=str(getattr(llm_provider, "model", "")),
+                latency_ms=latency_ms,
+                provider_failure_reason=decision.provider_failure_reason,
+            )
         llm_domain = _domain_from_text(decision.intent, decision.explanation)
         domain_priority = DOMAIN_PRIORITY.get(llm_domain or "", PriorityLevel.MAINTENANCE)
         # fail closed：模型只能升档，不能把 safety/security/explicit_user 降下来。
@@ -677,6 +695,7 @@ class HomeOrchestratorAgent:
         provider: str = "rule_based",
         model: str = "rule_based",
         latency_ms: int = 0,
+        provider_failure_reason: str | None = None,
     ) -> OrchestrationDecision:
         min_confidence = resolve_min_confidence(context.policy)
         space = _search_space_for(context)
@@ -690,6 +709,7 @@ class HomeOrchestratorAgent:
             "model": model,
             "latency_ms": latency_ms,
             "explanation": explanation,
+            "provider_failure_reason": provider_failure_reason,
         }
 
         def _noop(outcome: ProposalOutcome, reason: str, **plan_kwargs: Any) -> OrchestrationDecision:

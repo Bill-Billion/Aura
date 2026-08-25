@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -58,8 +59,16 @@ AGENT_DECISION_SCHEMA: dict[str, Any] = {
                 "additionalProperties": False,
                 "required": ["device_id", "property", "value", "reason"],
                 "properties": {
-                    "device_id": {"type": "string", "maxLength": MAX_DEVICE_ID_CHARS},
-                    "property": {"type": "string", "maxLength": MAX_PROPERTY_CHARS},
+                    "device_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_DEVICE_ID_CHARS,
+                    },
+                    "property": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_PROPERTY_CHARS,
+                    },
                     "value": {},
                     "reason": {"type": "string", "maxLength": MAX_COMMAND_REASON_CHARS},
                 },
@@ -69,16 +78,27 @@ AGENT_DECISION_SCHEMA: dict[str, Any] = {
         "needs_coordination": {"type": "boolean"},
     },
 }
+AGENT_DECISION_SCHEMA_SHA256 = hashlib.sha256(
+    json.dumps(
+        AGENT_DECISION_SCHEMA,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+).hexdigest()
+_STRICT_DECISION_KEYS = frozenset(AGENT_DECISION_SCHEMA["required"])
+_STRICT_COMMAND_KEYS = frozenset({"device_id", "property", "value", "reason"})
 
 JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL)
 ANTHROPIC_OUTPUT_INSTRUCTION = (
-    "Return one JSON object only. "
-    "The object must use exactly these top-level keys: "
+    "Call the submit_agent_decision tool exactly once. "
+    "Its input must use exactly these top-level keys: "
     "intent, confidence, task_steps, proposed_commands, explanation, needs_coordination. "
     "Each proposed_commands item must include device_id, property, value, reason. "
     "Keep the JSON compact and only include commands that are necessary right now. "
-    "Do not wrap the JSON in markdown."
+    "Do not answer with prose."
 )
+ANTHROPIC_DECISION_TOOL = "submit_agent_decision"
 
 
 class LLMProviderError(RuntimeError):
@@ -128,6 +148,46 @@ class LLMProvider(ABC):
                 default=None,
             )
             self.__dict__["_last_usage_context"] = context
+        context.set(value)
+
+    @property
+    def last_decision_transport(self) -> str | None:
+        """Structured-response transport used by the current task's call."""
+
+        context = self.__dict__.get("_last_decision_transport_context")
+        if context is None:
+            return None
+        return context.get()
+
+    @last_decision_transport.setter
+    def last_decision_transport(self, value: str | None) -> None:
+        context = self.__dict__.get("_last_decision_transport_context")
+        if context is None:
+            context = ContextVar(
+                f"llm_last_decision_transport_{type(self).__name__}_{id(self)}",
+                default=None,
+            )
+            self.__dict__["_last_decision_transport_context"] = context
+        context.set(value)
+
+    @property
+    def last_response_model(self) -> str | None:
+        """Actual model identifier reported by the current task's response."""
+
+        context = self.__dict__.get("_last_response_model_context")
+        if context is None:
+            return None
+        return context.get()
+
+    @last_response_model.setter
+    def last_response_model(self, value: str | None) -> None:
+        context = self.__dict__.get("_last_response_model_context")
+        if context is None:
+            context = ContextVar(
+                f"llm_last_response_model_{type(self).__name__}_{id(self)}",
+                default=None,
+            )
+            self.__dict__["_last_response_model_context"] = context
         context.set(value)
 
     @abstractmethod
@@ -253,7 +313,7 @@ class OpenAIResponsesProvider(LLMProvider):
             raise LLMProviderError("invalid_output", "Responses API 返回空文本")
 
         try:
-            return parse_agent_decision_text(text)
+            return parse_agent_decision_text_strict(text)
         except ValueError as exc:
             raise build_invalid_output_error(str(exc), text=text, provider_name=self.provider_name) from exc
 
@@ -277,11 +337,12 @@ class AnthropicCompatibleProvider(LLMProvider):
         self,
         *,
         api_key: str | None,
-        model: str = "MiniMax-M2.7",
+        model: str = "MiniMax-M3",
         timeout_ms: int = 12000,
         max_tokens: int = 1200,
         base_url: str = "https://api.minimaxi.com/anthropic",
         anthropic_version: str = "2023-06-01",
+        strict_output: bool = False,
         transport: httpx.AsyncBaseTransport | httpx.BaseTransport | None = None,
     ) -> None:
         if max_tokens <= 0:
@@ -292,11 +353,15 @@ class AnthropicCompatibleProvider(LLMProvider):
         self.max_tokens = max_tokens
         self.base_url = base_url.rstrip("/")
         self.anthropic_version = anthropic_version
+        self.strict_output = bool(strict_output)
+        self.decision_schema_sha256 = AGENT_DECISION_SCHEMA_SHA256
         self.transport = transport
         self.last_usage: Any = None
+        self.last_decision_transport: str | None = None
+        self.last_response_model: str | None = None
 
     @classmethod
-    def from_env(cls) -> "AnthropicCompatibleProvider":
+    def from_env(cls, *, strict_output: bool = False) -> "AnthropicCompatibleProvider":
         api_key = (
             os.getenv("ANTHROPIC_COMPAT_API_KEY")
             or os.getenv("ANTHROPIC_API_KEY")
@@ -304,16 +369,19 @@ class AnthropicCompatibleProvider(LLMProvider):
         )
         return cls(
             api_key=api_key,
-            model=os.getenv("ANTHROPIC_MODEL", os.getenv("ANTHROPIC_COMPAT_MODEL", "MiniMax-M2.7")),
+            model=os.getenv("ANTHROPIC_MODEL", os.getenv("ANTHROPIC_COMPAT_MODEL", "MiniMax-M3")),
             timeout_ms=int(os.getenv("LLM_TIMEOUT_MS", "12000")),
             max_tokens=int(os.getenv("ANTHROPIC_MAX_TOKENS", "1200")),
             base_url=os.getenv("ANTHROPIC_BASE_URL", os.getenv("ANTHROPIC_COMPAT_BASE_URL", "https://api.minimaxi.com/anthropic")),
             anthropic_version=os.getenv("ANTHROPIC_VERSION", "2023-06-01"),
+            strict_output=strict_output,
         )
 
     async def generate_decision(self, request: LLMDecisionRequest) -> AgentLLMDecision:
         # Clear before every attempt so timeout/HTTP errors cannot reuse old usage.
         self.last_usage = None
+        self.last_decision_transport = None
+        self.last_response_model = None
         if not self.api_key:
             raise LLMProviderError("provider_error", "ANTHROPIC_COMPAT_API_KEY 未配置")
 
@@ -335,6 +403,18 @@ class AnthropicCompatibleProvider(LLMProvider):
                     ],
                 }
             ],
+            "tools": [
+                {
+                    "name": ANTHROPIC_DECISION_TOOL,
+                    "description": "Submit the bounded smart-home decision.",
+                    "input_schema": AGENT_DECISION_SCHEMA,
+                }
+            ],
+            # MiniMax's Anthropic-compatible API currently documents only
+            # auto/none.  With one tool and the system instruction above, tool
+            # input is the preferred structured path; the text parser below is
+            # retained for compatible providers that still answer in JSON text.
+            "tool_choice": {"type": "auto"},
         }
         headers = {
             "x-api-key": self.api_key,
@@ -362,14 +442,71 @@ class AnthropicCompatibleProvider(LLMProvider):
 
         response_payload = response.json()
         self.last_usage = response_payload.get("usage")
+        response_model = response_payload.get("model")
+        self.last_response_model = (
+            response_model if isinstance(response_model, str) else None
+        )
+        if self.strict_output and self.last_response_model != self.model:
+            raise LLMProviderError(
+                "provider_error",
+                "strict research response model does not match the frozen model: "
+                f"expected={self.model!r} actual={self.last_response_model!r}",
+            )
+        tool_calls = [
+            item
+            for item in response_payload.get("content", [])
+            if isinstance(item, dict) and item.get("type") == "tool_use"
+        ]
+        if self.strict_output and tool_calls:
+            self.last_decision_transport = "tool_use"
+            if (
+                len(tool_calls) != 1
+                or tool_calls[0].get("name") != ANTHROPIC_DECISION_TOOL
+                or not isinstance(tool_calls[0].get("input"), dict)
+            ):
+                raise build_invalid_output_error(
+                    "strict research response must contain exactly one decision tool call",
+                    text=json.dumps(tool_calls, ensure_ascii=False),
+                    provider_name=self.provider_name,
+                )
+            tool_input = dict(tool_calls[0]["input"])
+        else:
+            tool_input = self._extract_tool_input(response_payload)
+        if tool_input is not None:
+            self.last_decision_transport = "tool_use"
+            try:
+                decision = (
+                    parse_agent_decision_payload_strict(tool_input)
+                    if self.strict_output
+                    else AgentLLMDecision.model_validate(
+                        _normalize_agent_decision_payload(tool_input)
+                    )
+                )
+            except ValueError as exc:
+                raise build_invalid_output_error(
+                    str(exc),
+                    text=json.dumps(tool_input, ensure_ascii=False),
+                    provider_name=self.provider_name,
+                ) from exc
+            return decision
         text = self._extract_text(response_payload)
         if not text:
-            raise LLMProviderError("invalid_output", "Anthropic-compatible API 返回空文本")
+            self.last_decision_transport = "empty"
+            raise LLMProviderError(
+                "invalid_output",
+                "Anthropic-compatible API 未返回决策 tool_use 或文本",
+            )
+        self.last_decision_transport = "text_json"
 
         try:
-            return parse_agent_decision_text(text)
+            decision = (
+                parse_agent_decision_text_strict(text)
+                if self.strict_output
+                else parse_agent_decision_text(text)
+            )
         except ValueError as exc:
             raise build_invalid_output_error(str(exc), text=text, provider_name=self.provider_name) from exc
+        return decision
 
     def _messages_path(self) -> str:
         # 兼容 base_url 既可能是 .../anthropic，也可能已经带了 /v1。
@@ -384,7 +521,7 @@ class AnthropicCompatibleProvider(LLMProvider):
         if "minimax" in normalized_base or normalized_model.startswith("minimax"):
             # 设计意图：MiniMax 在 Anthropic 兼容路径下首字节波动明显，
             # 给它一个略高于默认值的超时下限，避免实机联调时频繁假性 timeout。
-            return max(timeout_ms, 15000)
+            return max(timeout_ms, 45000)
         return timeout_ms
 
     @staticmethod
@@ -398,6 +535,21 @@ class AnthropicCompatibleProvider(LLMProvider):
             if item.get("type") == "text" and isinstance(item.get("text"), str):
                 text_chunks.append(item["text"])
         return "\n".join(text_chunks).strip()
+
+    @staticmethod
+    def _extract_tool_input(payload: dict[str, Any]) -> dict[str, Any] | None:
+        contents = payload.get("content")
+        if not isinstance(contents, list):
+            return None
+        for item in contents:
+            if (
+                isinstance(item, dict)
+                and item.get("type") == "tool_use"
+                and item.get("name") == ANTHROPIC_DECISION_TOOL
+                and isinstance(item.get("input"), dict)
+            ):
+                return dict(item["input"])
+        return None
 
 
 def parse_agent_decision_text(text: str) -> AgentLLMDecision:
@@ -414,6 +566,38 @@ def parse_agent_decision_text(text: str) -> AgentLLMDecision:
     return AgentLLMDecision.model_validate(_normalize_agent_decision_payload(raw_payload))
 
 
+def parse_agent_decision_text_strict(text: str) -> AgentLLMDecision:
+    """Parse an exact research response without compatibility repair."""
+
+    try:
+        payload = json.loads(text.strip())
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ValueError("模型返回的不是完整合法 JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("模型决策必须是 JSON object")
+    return parse_agent_decision_payload_strict(payload)
+
+
+def parse_agent_decision_payload_strict(
+    payload: dict[str, Any],
+) -> AgentLLMDecision:
+    """Validate the frozen decision schema without dropping or inventing data."""
+
+    if set(payload) != _STRICT_DECISION_KEYS:
+        raise ValueError("模型决策字段与冻结 schema 不完全一致")
+    commands = payload.get("proposed_commands")
+    if not isinstance(commands, list):
+        raise ValueError("proposed_commands 必须是数组")
+    for command in commands:
+        if not isinstance(command, dict) or set(command) != _STRICT_COMMAND_KEYS:
+            raise ValueError("命令字段与冻结 schema 不完全一致")
+        if not str(command.get("device_id", "")).strip() or not str(
+            command.get("property", "")
+        ).strip():
+            raise ValueError("命令 device_id/property 不能为空")
+    return AgentLLMDecision.model_validate(payload, strict=True)
+
+
 def _strip_json_fence(text: str) -> str:
     cleaned = text.strip()
     match = JSON_FENCE_RE.match(cleaned)
@@ -424,8 +608,37 @@ def _strip_json_fence(text: str) -> str:
 
 def _normalize_agent_decision_payload(payload: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(payload)
+    # This field is evidence produced by Aura's strict research wrapper, never
+    # something a model may assert about its own response.
+    normalized.pop("provider_failure_reason", None)
     if "proposed_commands" not in normalized and isinstance(normalized.get("commands"), list):
         normalized["proposed_commands"] = normalized["commands"]
+
+    commands = normalized.get("proposed_commands")
+    if not isinstance(commands, list):
+        normalized["proposed_commands"] = []
+    else:
+        valid_commands: list[dict[str, Any]] = []
+        for command in commands:
+            if not isinstance(command, dict):
+                continue
+            device_id = command.get("device_id")
+            property_name = command.get("property")
+            if (
+                not isinstance(device_id, str)
+                or not device_id.strip()
+                or not isinstance(property_name, str)
+                or not property_name.strip()
+                or "value" not in command
+            ):
+                continue
+            cleaned_command = dict(command)
+            cleaned_command["device_id"] = device_id.strip()
+            cleaned_command["property"] = property_name.strip()
+            if not isinstance(cleaned_command.get("reason"), str):
+                cleaned_command["reason"] = ""
+            valid_commands.append(cleaned_command)
+        normalized["proposed_commands"] = valid_commands
 
     explanation = normalized.get("explanation")
     if not isinstance(explanation, str) or not explanation.strip():
@@ -470,6 +683,9 @@ def _normalize_agent_decision_payload(payload: dict[str, Any]) -> dict[str, Any]
         else:
             normalized["intent"] = "no device changes needed"
 
+    if not isinstance(normalized.get("explanation"), str) or not normalized["explanation"].strip():
+        normalized["explanation"] = normalized["intent"]
+
     return normalized
 
 
@@ -490,6 +706,7 @@ def build_invalid_output_error(
     log.warning(
         "llm_invalid_output",
         provider=provider_name,
+        validation_error=message,
         preview=preview,
     )
     return LLMProviderError(

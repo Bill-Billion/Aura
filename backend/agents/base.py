@@ -509,10 +509,15 @@ class BaseAgent(ABC):
                 )
             )
             latency_ms = int((time.monotonic() - started_at) * 1000)
+            provider_failure_reason = llm_decision.provider_failure_reason
             return AgentDecisionEnvelope(
                 agent_id=self.agent_id,
                 agent_name=self.name,
-                mode="llm",
+                mode=(
+                    "provider_failure_noop"
+                    if provider_failure_reason
+                    else "llm"
+                ),
                 trigger_event_type=root_event.event_type,
                 intent=llm_decision.intent,
                 confidence=llm_decision.confidence,
@@ -520,9 +525,10 @@ class BaseAgent(ABC):
                 needs_coordination=llm_decision.needs_coordination,
                 priority=self.determine_priority(world_state, root_event),
                 task_steps=llm_decision.task_steps,
-                candidate_commands=self._filter_commands(
-                    llm_decision,
-                    allowed_commands,
+                candidate_commands=(
+                    []
+                    if provider_failure_reason
+                    else self._filter_commands(llm_decision, allowed_commands)
                 ),
                 root_event_id=root_event.event_id,
                 root_event_timestamp=root_event.timestamp,
@@ -532,6 +538,8 @@ class BaseAgent(ABC):
                 world_summary=world_summary,
                 relevant_devices=[device.id for device in relevant_devices],
                 relevant_rooms=relevant_rooms,
+                provider_failure_reason=provider_failure_reason,
+                failed_step=("intent_generation" if provider_failure_reason else None),
             )
         except LLMProviderError as exc:
             return self._build_fallback_envelope(

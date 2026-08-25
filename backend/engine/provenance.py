@@ -12,6 +12,19 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from backend.models.schemas import BaselinePolicy
 
 
+ExperimentModel = Literal["rule_based", "mocked", "live", "recorded", "replay"]
+
+_BASELINE_BY_EXPERIMENT_MODEL: Mapping[str, BaselinePolicy] = MappingProxyType(
+    {
+        "rule_based": BaselinePolicy.RULE_BASED,
+        "mocked": BaselinePolicy.LLM_MOCKED,
+        "live": BaselinePolicy.LLM_LIVE,
+        "recorded": BaselinePolicy.LLM_RECORDED,
+        "replay": BaselinePolicy.LLM_RECORDED,
+    }
+)
+
+
 class ResearchRuntimeProfile(str, Enum):
     """The four runtime conditions that have an implemented research meaning."""
 
@@ -115,7 +128,7 @@ class ExperimentProvenance(BaseModel):
     matrix_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     cell_id: str = Field(pattern=r"^cell-[0-9a-f]{16,64}$")
     runtime_profile: ResearchRuntimeProfile = ResearchRuntimeProfile.AURA
-    model: Literal["rule_based", "mocked"]
+    model: ExperimentModel
     topology: Literal["single", "domain_multi"]
     governance: Literal["none", "flat_priority", "aura"]
     observation: ObservationCondition
@@ -141,7 +154,7 @@ class ExperimentRuntimeSelection(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     runtime_profile: ResearchRuntimeProfile = ResearchRuntimeProfile.AURA
-    model: Literal["rule_based", "mocked"]
+    model: ExperimentModel
     topology: Literal["single", "domain_multi"] = "domain_multi"
     governance: Literal["none", "flat_priority", "aura"] = "aura"
     observation: ObservationCondition = ObservationCondition.STALE_OFFLINE
@@ -158,11 +171,7 @@ class ExperimentRuntimeSelection(BaseModel):
             raise ValueError(
                 "runtime_profile does not match topology/governance/observation"
             )
-        expected = (
-            BaselinePolicy.RULE_BASED
-            if self.model == "rule_based"
-            else BaselinePolicy.LLM_MOCKED
-        )
+        expected = _BASELINE_BY_EXPERIMENT_MODEL[self.model]
         if self.baseline_policy is not expected:
             raise ValueError("runtime model does not match baseline policy")
         return self
@@ -172,7 +181,7 @@ class ExperimentRuntimeSelection(BaseModel):
         cls,
         profile: ResearchRuntimeProfile,
         *,
-        model: Literal["rule_based", "mocked"],
+        model: ExperimentModel,
         baseline_policy: BaselinePolicy,
         observation: ObservationCondition | Literal["perfect", "stale_offline"] = (
             ObservationCondition.STALE_OFFLINE
@@ -214,6 +223,7 @@ __all__ = [
     "SUPPORTED_OBSERVATION_CONDITIONS",
     "ExperimentProvenance",
     "ExperimentRuntimeSelection",
+    "ExperimentModel",
     "ObservationCondition",
     "ResearchRuntimeProfile",
     "research_runtime_profile_for_axes",

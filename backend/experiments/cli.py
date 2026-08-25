@@ -18,6 +18,15 @@ from .pilot_freeze import (
     write_pilot_freeze,
     write_pilot_run_inventory,
 )
+from .llm_substudy import (
+    LLMSubstudyRunner,
+    preflight_llm_substudy,
+    read_resolved_llm_substudy,
+    resolve_llm_substudy,
+    summarize_llm_substudy,
+    validate_preflight_receipt,
+    write_resolved_llm_substudy,
+)
 from .resolve import load_and_resolve_matrix
 from .runner import MatrixRunner, summarize_results
 
@@ -93,6 +102,36 @@ def _parser() -> argparse.ArgumentParser:
     validate_freeze.add_argument("freeze", type=Path)
     validate_freeze.add_argument("--result-root", type=Path, required=True)
     validate_freeze.add_argument("--require-approved", action="store_true")
+
+    resolve_llm = commands.add_parser(
+        "resolve-llm-substudy",
+        help="freeze the Option B MiniMax-M3 substudy",
+    )
+    resolve_llm.add_argument("manifest", type=Path)
+    resolve_llm.add_argument("--output", type=Path, required=True)
+
+    preflight_llm = commands.add_parser(
+        "preflight-llm-substudy",
+        help="make one sealed provider/model access check",
+    )
+    preflight_llm.add_argument("resolved_substudy", type=Path)
+    preflight_llm.add_argument("--output", type=Path, required=True)
+
+    run_llm = commands.add_parser(
+        "run-llm-substudy",
+        help="run the frozen live/capture/replay substudy serially",
+    )
+    run_llm.add_argument("resolved_substudy", type=Path)
+    run_llm.add_argument("--output", type=Path, required=True)
+    run_llm.add_argument("--no-resume", action="store_true")
+    run_llm.add_argument("--continue-on-error", action="store_true")
+
+    summarize_llm = commands.add_parser(
+        "summarize-llm-substudy",
+        help="revalidate all 168 slots and seal the scientific gate",
+    )
+    summarize_llm.add_argument("resolved_substudy", type=Path)
+    summarize_llm.add_argument("--output", type=Path, required=True)
     return parser
 
 
@@ -109,6 +148,15 @@ async def _run_command(args: argparse.Namespace) -> dict[str, object]:
         retry_results=args.retry_results,
     )
     return summary.model_dump(mode="json")
+
+
+async def _run_llm_substudy_command(args: argparse.Namespace) -> dict[str, object]:
+    study = read_resolved_llm_substudy(args.resolved_substudy)
+    validate_preflight_receipt(study, output_dir=args.output)
+    return await LLMSubstudyRunner(study, output_dir=args.output).run(
+        resume=not args.no_resume,
+        continue_on_error=args.continue_on_error,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -204,6 +252,27 @@ def main(argv: Sequence[str] | None = None) -> int:
                 output=args.output,
             )
             payload = {"path": str(path)}
+        elif args.command == "resolve-llm-substudy":
+            study = resolve_llm_substudy(args.manifest)
+            path = write_resolved_llm_substudy(args.output, study)
+            payload = {
+                "study_hash": study.study_hash,
+                "instances": len(study.instances),
+                "slots": len(study.slots),
+                "path": str(path),
+            }
+        elif args.command == "preflight-llm-substudy":
+            study = read_resolved_llm_substudy(args.resolved_substudy)
+            path = _asyncio_run(
+                preflight_llm_substudy(study, output_dir=args.output)
+            )
+            payload = {"study_hash": study.study_hash, "path": str(path)}
+        elif args.command == "run-llm-substudy":
+            payload = _asyncio_run(_run_llm_substudy_command(args))
+        elif args.command == "summarize-llm-substudy":
+            study = read_resolved_llm_substudy(args.resolved_substudy)
+            path = summarize_llm_substudy(study, output_dir=args.output)
+            payload = {"study_hash": study.study_hash, "path": str(path)}
         else:
             payload = validate_pilot_freeze(
                 args.freeze,

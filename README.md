@@ -54,7 +54,7 @@ cat > .env.local <<'ENV_EOF'
 LLM_PROVIDER=anthropic_compatible
 ANTHROPIC_BASE_URL=https://api.minimaxi.com/anthropic
 ANTHROPIC_API_KEY=your_key_here
-ANTHROPIC_MODEL=MiniMax-M2.7
+ANTHROPIC_MODEL=MiniMax-M3
 ANTHROPIC_MAX_TOKENS=1200
 # OpenAI Responses 路径使用同一硬上限：
 # OPENAI_MAX_OUTPUT_TOKENS=1200
@@ -89,6 +89,34 @@ python3.12 -m venv backend/.venv
 backend/.venv/bin/pip install -r backend/requirements.txt
 backend/.venv/bin/python -m uvicorn backend.main:app --reload --port 8000
 ```
+
+### MiniMax-M3 research substudy
+
+PR21 的 Option B 研究使用 8 个动态场景 × 3 个 seed，并为每个实例运行
+`3 live + 1 recorded capture + 3 offline replay`，共 168 个 run。先按上方示例在
+服务端配置 `MiniMax-M3`，再依次执行：
+
+```bash
+python -m backend.experiments resolve-llm-substudy \
+  benchmarks/aurabench-m3-substudy/manifest.yaml --output output/aurabench-m3
+python -m backend.experiments preflight-llm-substudy \
+  output/aurabench-m3/resolved-substudy.json --output output/aurabench-m3
+python -m backend.experiments run-llm-substudy \
+  output/aurabench-m3/resolved-substudy.json --output output/aurabench-m3
+python -m backend.experiments summarize-llm-substudy \
+  output/aurabench-m3/resolved-substudy.json --output output/aurabench-m3
+```
+
+API key 只从服务端环境读取，不进入清单、预检回执或结果工件。当前研究使用 token plan，
+因此美元成本仅作复核指标，不作为停机条件；失败或中断后重复 `run-llm-substudy` 会从已
+验证的 admitted slot 继续。无效/失败 slot 为 create-only，不能在同一 output root 覆盖重抽。
+模型返回非法结构化输出时，PR21 strict runner 会记录可见的零动作模型失败，不调用规则
+fallback；这类失败计入结果而不是被选择性排除。该子研究还把
+`https://api.minimaxi.com/anthropic` 冻结为唯一 endpoint；预检后更改 endpoint 会被拒绝，
+API key 与家居轨迹不会被发送到其他 Anthropic-compatible 服务。协议版本、输出上限、
+超时和 decision schema hash 也会冻结；token plan 使用只记账不拦截的成本策略，最终结果
+必须引用通过验证的 sealed preflight。provider 回包中的实际模型也会逐次核对并留证，
+因此“请求了 M3”不会被误写成“证明运行了 M3”。
 
 ### Frontend
 

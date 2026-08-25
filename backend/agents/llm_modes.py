@@ -56,9 +56,9 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Literal, Mapping, Sequence
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from backend.agents.contracts import ProposalAssumption
 from backend.agents.llm import (
@@ -81,6 +81,7 @@ from backend.agents.llm_pricing import (
 )
 from backend.agents.types import AgentCommandProposal, AgentLLMDecision, LLMDecisionRequest
 from backend.core.logging import log
+from backend.core.safe_io import read_bounded_regular_file
 from backend.engine.event_bus import SimEvent
 from backend.engine.event_log import (
     LLM_RECORDINGS_FILENAME,
@@ -168,12 +169,15 @@ _TRUTHY: frozenset[str] = frozenset({"1", "true", "yes", "on"})
 RECORDINGS_PATH_ENV = "LLM_RECORDINGS_PATH"
 RECORDING_WRITE_REASON = "recording_write_failed"
 RECORDING_MANIFEST_SCHEMA = "aura.llm-recording-manifest/1"
+MAX_LLM_RECORDING_BYTES = 64 * 1024 * 1024
+MAX_LLM_RECORDING_MANIFEST_BYTES = 1024 * 1024
 
 # recorded 模式拿不到 run_id（runtime 还没绑 RunManager，且没给 LLM_RECORDINGS_PATH）时
 # 的降级标签。刻意不静默改用 live：那等于研究者以为自己在录，实际什么都没留下。
 RECORDING_UNAVAILABLE_REASON = "recording_unavailable"
 
-RECORDING_SCHEMA = "aura.llm_recording.v1"
+RECORDING_SCHEMA = "aura.llm_recording.v2"
+_LEGACY_RECORDING_SCHEMA = "aura.llm_recording.v1"
 RECORDING_MISS_REASON = "recording_miss"
 RECORDING_CORRUPT_REASON = "recording_corrupt"
 MOCK_FIXTURE_MISS_REASON = "mock_fixture_miss"
@@ -369,8 +373,28 @@ class LLMRecording(BaseModel):
     root_event_type: str = ""
     provider: str = ""
     model: str = ""
+    response_model: str = ""
+    request_ordinal: int | None = Field(default=None, ge=0)
+    started_request_count: int | None = Field(default=None, ge=1)
     request: dict[str, Any] = Field(default_factory=dict)
     decision: AgentLLMDecision
+
+    @model_validator(mode="after")
+    def validate_replay_schedule(self) -> "LLMRecording":
+        schedule = (self.request_ordinal, self.started_request_count)
+        if self.schema_version == _LEGACY_RECORDING_SCHEMA:
+            if any(value is not None for value in schedule):
+                raise ValueError("v1 recording cannot declare v2 replay schedule fields")
+            return self
+        if self.schema_version != RECORDING_SCHEMA:
+            raise ValueError(f"unsupported LLM recording schema: {self.schema_version}")
+        if any(value is None for value in schedule):
+            raise ValueError("v2 recording requires request_ordinal and started_request_count")
+        assert self.request_ordinal is not None
+        assert self.started_request_count is not None
+        if self.started_request_count <= self.request_ordinal:
+            raise ValueError("started_request_count must include the recorded request")
+        return self
 
     @classmethod
     def decision_from_payload(cls, payload: Mapping[str, Any]) -> AgentLLMDecision:
@@ -406,16 +430,33 @@ def recording_manifest_path(path: Path | str) -> Path:
     return Path(path).with_name(LLM_RECORDINGS_MANIFEST_FILENAME)
 
 
-def validate_recording_artifact(path: Path | str) -> LLMRecordingManifest:
+def validate_recording_artifact(
+    path: Path | str,
+    *,
+    require_replay_schedule: bool = False,
+) -> LLMRecordingManifest:
     """Validate manifest counts, digest, and every JSONL recording entry."""
 
     recording_path = Path(path)
     manifest_path = recording_manifest_path(recording_path)
     try:
-        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest_raw = read_bounded_regular_file(
+            manifest_path,
+            max_bytes=MAX_LLM_RECORDING_MANIFEST_BYTES,
+        )
+        payload = json.loads(manifest_raw.decode("utf-8"))
         manifest = LLMRecordingManifest.model_validate(payload)
-        raw = recording_path.read_bytes()
-    except (OSError, json.JSONDecodeError, ValidationError) as exc:
+        raw = read_bounded_regular_file(
+            recording_path,
+            max_bytes=MAX_LLM_RECORDING_BYTES,
+        )
+    except (
+        OSError,
+        UnicodeDecodeError,
+        ValueError,
+        json.JSONDecodeError,
+        ValidationError,
+    ) as exc:
         raise LLMProviderError(
             RECORDING_CORRUPT_REASON,
             f"录制 manifest 不存在或损坏：{manifest_path}: {exc}",
@@ -435,6 +476,11 @@ def validate_recording_artifact(path: Path | str) -> LLMRecordingManifest:
             RECORDING_CORRUPT_REASON,
             "录制工件不完整：请求数、成功数、行数或内容摘要不一致",
         )
+    sequence = [record for _, record in _load_recording_sequence(recording_path)]
+    _validate_recording_schedule(
+        sequence,
+        require_replay_schedule=require_replay_schedule,
+    )
     load_recordings(recording_path)
     return manifest
 
@@ -448,14 +494,49 @@ def load_recordings(path: Path | str) -> dict[str, LLMRecording]:
     """
 
     file_path = Path(path)
-    if not file_path.exists():
+    recordings: dict[str, LLMRecording] = {}
+    for line_no, record in _load_recording_sequence(file_path):
+        existing = recordings.get(record.request_key)
+        if existing is None:
+            recordings[record.request_key] = record
+        elif existing.decision != record.decision:
+            raise LLMProviderError(
+                RECORDING_CORRUPT_REASON,
+                f"{file_path}:{line_no} 的 request_key {record.request_key[:12]}… "
+                "对应多个不同决策，无法确定性回放",
+            )
+    return recordings
+
+
+def _load_recording_sequence(path: Path | str) -> list[tuple[int, LLMRecording]]:
+    """Load validated records without discarding provider completion order."""
+
+    file_path = Path(path)
+    try:
+        encoded = read_bounded_regular_file(
+            file_path,
+            max_bytes=MAX_LLM_RECORDING_BYTES,
+        )
+    except FileNotFoundError as exc:
         raise LLMProviderError(
             RECORDING_MISS_REASON,
             f"LLM 录制文件不存在：{file_path}",
-        )
+        ) from exc
+    except (OSError, ValueError) as exc:
+        raise LLMProviderError(
+            RECORDING_CORRUPT_REASON,
+            f"LLM 录制文件不可安全读取：{file_path}: {exc}",
+        ) from exc
+    try:
+        text = encoded.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise LLMProviderError(
+            RECORDING_CORRUPT_REASON,
+            f"LLM 录制文件不是 UTF-8：{file_path}: {exc}",
+        ) from exc
 
-    recordings: dict[str, LLMRecording] = {}
-    for line_no, raw_line in enumerate(file_path.read_text(encoding="utf-8").splitlines(), start=1):
+    sequence: list[tuple[int, LLMRecording]] = []
+    for line_no, raw_line in enumerate(text.splitlines(), start=1):
         line = raw_line.strip()
         if not line:
             continue
@@ -479,17 +560,50 @@ def load_recordings(path: Path | str) -> dict[str, LLMRecording]:
                 f"{file_path}:{line_no} 的 request 与 request_key 不符"
                 f"（记录 {record.request_key[:12]}…，实算 {recomputed[:12]}…）",
             )
+        sequence.append((line_no, record))
+    return sequence
 
-        existing = recordings.get(record.request_key)
-        if existing is None:
-            recordings[record.request_key] = record
-        elif existing.decision != record.decision:
+
+def _validate_recording_schedule(
+    sequence: Sequence[LLMRecording],
+    *,
+    require_replay_schedule: bool = False,
+) -> bool:
+    """Validate the request-start watermark used to reproduce async interleaving."""
+
+    scheduled = [record.request_ordinal is not None for record in sequence]
+    if not scheduled or not any(scheduled):
+        if require_replay_schedule:
             raise LLMProviderError(
                 RECORDING_CORRUPT_REASON,
-                f"{file_path}:{line_no} 的 request_key {record.request_key[:12]}… "
-                "对应多个不同决策，无法确定性回放",
+                "录制缺少并发请求进入水位，不能证明 capture/replay 事件等价",
             )
-    return recordings
+        return False
+    if not all(scheduled):
+        raise LLMProviderError(
+            RECORDING_CORRUPT_REASON,
+            "录制混用了有、无并发请求进入水位的条目",
+        )
+
+    total = len(sequence)
+    ordinals = [record.request_ordinal for record in sequence]
+    if sorted(ordinals) != list(range(total)):
+        raise LLMProviderError(
+            RECORDING_CORRUPT_REASON,
+            "录制的 request_ordinal 不是从 0 开始的连续唯一序列",
+        )
+    started_counts = [record.started_request_count for record in sequence]
+    if any(count is None or count > total for count in started_counts):
+        raise LLMProviderError(
+            RECORDING_CORRUPT_REASON,
+            "录制的 started_request_count 超出请求总数",
+        )
+    if started_counts != sorted(started_counts):
+        raise LLMProviderError(
+            RECORDING_CORRUPT_REASON,
+            "录制完成顺序中的 started_request_count 发生倒退",
+        )
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -617,7 +731,32 @@ class RecordingLLMProvider(LLMProvider):
     def timeout_ms(self) -> Any:
         return getattr(self.inner, "timeout_ms", None)
 
+    @property
+    def base_url(self) -> Any:
+        return getattr(self.inner, "base_url", None)
+
+    @property
+    def anthropic_version(self) -> Any:
+        return getattr(self.inner, "anthropic_version", None)
+
+    @property
+    def max_tokens(self) -> Any:
+        return getattr(self.inner, "max_tokens", None)
+
+    @property
+    def strict_output(self) -> Any:
+        return getattr(self.inner, "strict_output", None)
+
+    @property
+    def decision_schema_sha256(self) -> Any:
+        return getattr(self.inner, "decision_schema_sha256", None)
+
+    @property
+    def last_response_model(self) -> Any:
+        return getattr(self.inner, "last_response_model", None)
+
     async def generate_decision(self, request: LLMDecisionRequest) -> AgentLLMDecision:
+        request_ordinal = self.requested
         self.requested += 1
         try:
             # Mark the artifact incomplete before making a live request.  If the
@@ -630,7 +769,12 @@ class RecordingLLMProvider(LLMProvider):
             raise
         try:
             decision = await self.inner.generate_decision(request)
-            self._append(request, decision)
+            self._append(
+                request,
+                decision,
+                request_ordinal=request_ordinal,
+                started_request_count=self.requested,
+            )
             self.written += 1
             self._write_manifest()
         except asyncio.CancelledError as exc:
@@ -680,7 +824,14 @@ class RecordingLLMProvider(LLMProvider):
         if self.integrity_error_handler is not None:
             self.integrity_error_handler(message)
 
-    def _append(self, request: LLMDecisionRequest, decision: AgentLLMDecision) -> None:
+    def _append(
+        self,
+        request: LLMDecisionRequest,
+        decision: AgentLLMDecision,
+        *,
+        request_ordinal: int,
+        started_request_count: int,
+    ) -> None:
         payload = canonical_request_payload(request)
         key = hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
         record = LLMRecording(
@@ -690,6 +841,11 @@ class RecordingLLMProvider(LLMProvider):
             root_event_type=request.root_event_type,
             provider=str(getattr(self.inner, "provider_name", "unknown")),
             model=self.model,
+            response_model=str(
+                getattr(self.inner, "last_response_model", "") or ""
+            ),
+            request_ordinal=request_ordinal,
+            started_request_count=started_request_count,
             request=payload,
             decision=decision,
         )
@@ -767,16 +923,36 @@ class ReplayLLMProvider(LLMProvider):
         *,
         path: Path | str | None = None,
         model: str = "",
+        completion_sequence: Sequence[LLMRecording] | None = None,
     ) -> None:
         self.recordings = dict(recordings)
         self.recordings_path = Path(path) if path is not None else None
+        self._completion_sequence = list(completion_sequence or ())
+        self._has_replay_schedule = _validate_recording_schedule(
+            self._completion_sequence,
+        )
+        self._records_by_request_ordinal = {
+            record.request_ordinal: record
+            for record in self._completion_sequence
+            if record.request_ordinal is not None
+        }
+        self._arrival_count = 0
+        self._completion_index = 0
+        self._completion_condition = asyncio.Condition()
         self.hits = 0
         self.misses = 0
         self.model = model or self._infer_model()
 
     @classmethod
     def from_file(cls, path: Path | str) -> "ReplayLLMProvider":
-        return cls(load_recordings(path), path=path)
+        sequence = [record for _, record in _load_recording_sequence(path)]
+        # Keep the existing same-key/same-decision integrity check.
+        recordings = load_recordings(path)
+        return cls(
+            recordings,
+            path=path,
+            completion_sequence=sequence,
+        )
 
     def _infer_model(self) -> str:
         models = sorted({record.model for record in self.recordings.values() if record.model})
@@ -784,6 +960,10 @@ class ReplayLLMProvider(LLMProvider):
 
     async def generate_decision(self, request: LLMDecisionRequest) -> AgentLLMDecision:
         key = request_key(request)
+        if self._completion_sequence:
+            if self._has_replay_schedule:
+                return await self._generate_with_recorded_schedule(request, key)
+            return await self._generate_in_recorded_completion_order(request, key)
         record = self.recordings.get(key)
         if record is None:
             self.misses += 1
@@ -796,6 +976,99 @@ class ReplayLLMProvider(LLMProvider):
             )
         self.hits += 1
         return record.decision.model_copy(deep=True)
+
+    async def _generate_with_recorded_schedule(
+        self,
+        request: LLMDecisionRequest,
+        key: str,
+    ) -> AgentLLMDecision:
+        async with self._completion_condition:
+            request_ordinal = self._arrival_count
+            expected_arrival = self._records_by_request_ordinal.get(request_ordinal)
+            if expected_arrival is None or expected_arrival.request_key != key:
+                self.misses += 1
+                expected_key = (
+                    expected_arrival.request_key if expected_arrival is not None else "<exhausted>"
+                )
+                raise LLMProviderError(
+                    RECORDING_MISS_REASON,
+                    (
+                        "录制请求进入顺序无法匹配这条请求："
+                        f"ordinal={request_ordinal} agent={request.agent_id} "
+                        f"event={request.root_event_type} key={key[:12]}… "
+                        f"expected={expected_key[:12]}…"
+                    ),
+                )
+            self._arrival_count += 1
+            self._completion_condition.notify_all()
+
+            while self._completion_index < len(self._completion_sequence):
+                expected_completion = self._completion_sequence[self._completion_index]
+                if (
+                    expected_completion.request_ordinal == request_ordinal
+                    and expected_completion.started_request_count is not None
+                    and self._arrival_count >= expected_completion.started_request_count
+                ):
+                    self._completion_index += 1
+                    self.hits += 1
+                    self._completion_condition.notify_all()
+                    return expected_completion.decision.model_copy(deep=True)
+                # A matched request can only wait for another recorded request
+                # to enter or complete.  The outer episode owns cancellation;
+                # wall-clock speed must not decide evidence validity.
+                await self._completion_condition.wait()
+
+        self.misses += 1
+        expected = (
+            self._completion_sequence[self._completion_index]
+            if self._completion_index < len(self._completion_sequence)
+            else None
+        )
+        raise LLMProviderError(
+            RECORDING_MISS_REASON,
+            (
+                "录制并发水位或完成顺序无法匹配这条请求："
+                f"ordinal={request_ordinal} agent={request.agent_id} "
+                f"event={request.root_event_type} arrivals={self._arrival_count} "
+                f"expected_ordinal={getattr(expected, 'request_ordinal', '<exhausted>')} "
+                f"expected_started={getattr(expected, 'started_request_count', '<exhausted>')}"
+            ),
+        )
+
+    async def _generate_in_recorded_completion_order(
+        self,
+        request: LLMDecisionRequest,
+        key: str,
+    ) -> AgentLLMDecision:
+        async with self._completion_condition:
+            while self._completion_index < len(self._completion_sequence):
+                expected = self._completion_sequence[self._completion_index]
+                if expected.request_key == key:
+                    self._completion_index += 1
+                    self.hits += 1
+                    self._completion_condition.notify_all()
+                    return expected.decision.model_copy(deep=True)
+                if not any(
+                    record.request_key == key
+                    for record in self._completion_sequence[self._completion_index + 1 :]
+                ):
+                    break
+                await self._completion_condition.wait()
+
+        self.misses += 1
+        expected_key = (
+            self._completion_sequence[self._completion_index].request_key
+            if self._completion_index < len(self._completion_sequence)
+            else "<exhausted>"
+        )
+        raise LLMProviderError(
+            RECORDING_MISS_REASON,
+            (
+                "录制完成顺序无法匹配这条请求："
+                f"agent={request.agent_id} event={request.root_event_type} "
+                f"key={key[:12]}… expected={expected_key[:12]}…"
+            ),
+        )
 
 
 def build_provider_for_mode(
@@ -956,6 +1229,36 @@ class RunScopedRecordedProvider(LLMProvider):
     def timeout_ms(self) -> Any:
         inner = self.resolve()
         return getattr(inner, "timeout_ms", None)
+
+    @property
+    def base_url(self) -> Any:
+        inner = self.resolve()
+        return getattr(inner, "base_url", None)
+
+    @property
+    def anthropic_version(self) -> Any:
+        inner = self.resolve()
+        return getattr(inner, "anthropic_version", None)
+
+    @property
+    def max_tokens(self) -> Any:
+        inner = self.resolve()
+        return getattr(inner, "max_tokens", None)
+
+    @property
+    def strict_output(self) -> Any:
+        inner = self.resolve()
+        return getattr(inner, "strict_output", None)
+
+    @property
+    def decision_schema_sha256(self) -> Any:
+        inner = self.resolve()
+        return getattr(inner, "decision_schema_sha256", None)
+
+    @property
+    def last_response_model(self) -> Any:
+        inner = self.resolve()
+        return getattr(inner, "last_response_model", None)
 
     @property
     def recordings_path(self) -> Any:
@@ -1331,6 +1634,7 @@ class EpisodeCost(BaseModel):
 
     correlation_id: str = ""
     budget_usd: float = DEFAULT_EPISODE_BUDGET_USD
+    budget_policy: Literal["enforced", "telemetry_only"] = "enforced"
     calls: int = 0
     billable_calls: int = 0
     blocked_calls: int = 0
@@ -1339,6 +1643,7 @@ class EpisodeCost(BaseModel):
     cost_usd: float = 0.0
     cost_by_model: dict[str, float] = Field(default_factory=dict)
     usage_sources: dict[str, int] = Field(default_factory=dict)
+    response_models: dict[str, int] = Field(default_factory=dict)
     first_blocked_agent_id: str | None = None
     first_blocked_at_call: int | None = None
 
@@ -1378,12 +1683,14 @@ class EpisodeCostGuard:
         pricing: PricingTable | None = None,
         env: Mapping[str, str] | None = None,
         default_max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+        enforce_budget: bool = True,
     ) -> None:
         self.budget_usd = (
             float(budget_usd) if budget_usd is not None else resolve_episode_budget_usd(env)
         )
         self._pricing = pricing
         self.default_max_output_tokens = default_max_output_tokens
+        self.enforce_budget = bool(enforce_budget)
         self._episodes: dict[str, EpisodeCost] = {}
         # Worst-case cost already admitted but not yet settled.  check + reserve
         # is synchronous (no await), so concurrent domain-agent tasks sharing
@@ -1402,7 +1709,11 @@ class EpisodeCostGuard:
         key = correlation_id or ""
         entry = self._episodes.get(key)
         if entry is None:
-            entry = EpisodeCost(correlation_id=key, budget_usd=self.budget_usd)
+            entry = EpisodeCost(
+                correlation_id=key,
+                budget_usd=self.budget_usd,
+                budget_policy=("enforced" if self.enforce_budget else "telemetry_only"),
+            )
             self._episodes[key] = entry
         return entry
 
@@ -1437,7 +1748,7 @@ class EpisodeCostGuard:
         key = correlation_id or ""
         reserved = self._reserved_usd.get(key, 0.0)
         projected = round(episode.cost_usd + reserved + worst_case, COST_DIGITS)
-        if projected < self.budget_usd:
+        if not self.enforce_budget or projected < self.budget_usd:
             self._reserved_usd[key] = round(reserved + worst_case, COST_DIGITS)
             return worst_case
 
@@ -1477,6 +1788,7 @@ class EpisodeCostGuard:
         provider: str | None = None,
         billable: bool = True,
         reserved_usd: float | None = None,
+        response_model: str | None = None,
     ) -> EpisodeCost:
         """Settle one call; release its preflight reservation before recording."""
 
@@ -1497,6 +1809,10 @@ class EpisodeCostGuard:
         episode.usage_sources[usage.source.value] = (
             episode.usage_sources.get(usage.source.value, 0) + 1
         )
+        if response_model:
+            episode.response_models[response_model] = (
+                episode.response_models.get(response_model, 0) + 1
+            )
         if not billable:
             return episode
 
@@ -1542,10 +1858,26 @@ class EpisodeCostGuard:
             "output_tokens": sum(int(item["output_tokens"]) for item in episodes),
             "cost_usd": round(sum(float(item["cost_usd"]) for item in episodes), COST_DIGITS),
             "budget_exceeded_episodes": sum(1 for item in episodes if item["budget_exceeded"]),
+            "response_models": {
+                model: sum(
+                    int(item.get("response_models", {}).get(model, 0))
+                    for item in episodes
+                )
+                for model in sorted(
+                    {
+                        model
+                        for item in episodes
+                        for model in item.get("response_models", {})
+                    }
+                )
+            },
         }
         return {
-            "schema": "aura.llm_cost.v1",
+            "schema": "aura.llm_cost.v2",
             "budget_usd": self.budget_usd,
+            "budget_policy": (
+                "enforced" if self.enforce_budget else "telemetry_only"
+            ),
             "budget_env": EPISODE_BUDGET_ENV,
             "totals": totals,
             "episodes": episodes,
@@ -1635,6 +1967,30 @@ class BudgetGuardedLLMProvider(LLMProvider):
     @property
     def timeout_ms(self) -> Any:
         return getattr(self.inner, "timeout_ms", None)
+
+    @property
+    def base_url(self) -> Any:
+        return getattr(self.inner, "base_url", None)
+
+    @property
+    def anthropic_version(self) -> Any:
+        return getattr(self.inner, "anthropic_version", None)
+
+    @property
+    def max_tokens(self) -> Any:
+        return getattr(self.inner, "max_tokens", None)
+
+    @property
+    def strict_output(self) -> Any:
+        return getattr(self.inner, "strict_output", None)
+
+    @property
+    def decision_schema_sha256(self) -> Any:
+        return getattr(self.inner, "decision_schema_sha256", None)
+
+    @property
+    def last_response_model(self) -> Any:
+        return getattr(self.inner, "last_response_model", None)
 
     @property
     def recordings_path(self) -> Any:
@@ -1770,6 +2126,7 @@ class BudgetGuardedLLMProvider(LLMProvider):
             provider=self.provider_name,
             billable=billable,
             reserved_usd=reserved_usd,
+            response_model=self._reported_response_model(),
         )
 
     # --- 内部 ---------------------------------------------------------------
@@ -1830,6 +2187,13 @@ class BudgetGuardedLLMProvider(LLMProvider):
                     return parsed
         return None
 
+    def _reported_response_model(self) -> str | None:
+        for provider in self._provider_chain():
+            response_model = getattr(provider, "last_response_model", None)
+            if isinstance(response_model, str) and response_model:
+                return response_model
+        return None
+
     def _clear_reported_usage(self) -> None:
         for provider in self._provider_chain():
             if not hasattr(provider, "last_usage"):
@@ -1838,6 +2202,10 @@ class BudgetGuardedLLMProvider(LLMProvider):
                 setattr(provider, "last_usage", None)
             except (AttributeError, TypeError):
                 # Read-only telemetry properties cannot carry mutable stale state.
+                continue
+            try:
+                setattr(provider, "last_response_model", None)
+            except (AttributeError, TypeError):
                 continue
 
     def _usage_for(

@@ -424,6 +424,103 @@ async def test_recording_artifact_allows_identical_duplicate_decisions_as_pure_f
 
 
 @pytest.mark.anyio
+async def test_file_replay_releases_concurrent_requests_in_recorded_completion_order(
+    tmp_path,
+):
+    first_request = _arrive_home_request()
+    second_request = first_request.model_copy(update={"agent_id": "hvac_agent"})
+    first_decision = LLMRecording.decision_from_payload(_RECORDED_DECISION_JSON)
+    second_decision = first_decision.model_copy(update={"intent": "second decision"})
+    records = [
+        LLMRecording(
+            request_key=request_key(request),
+            prompt_hash=request_key(request),
+            agent_id=request.agent_id,
+            root_event_type=request.root_event_type,
+            provider="anthropic_compatible",
+            model="MiniMax-M3",
+            request_ordinal=request_ordinal,
+            started_request_count=2,
+            request=canonical_request_payload(request),
+            decision=decision,
+        )
+        for request_ordinal, request, decision in (
+            (1, first_request, first_decision),
+            (0, second_request, second_decision),
+        )
+    ]
+    path = tmp_path / LLM_RECORDINGS_FILENAME
+    path.write_text(
+        "".join(record.to_json_line() + "\n" for record in records),
+        encoding="utf-8",
+    )
+    replay = ReplayLLMProvider.from_file(path)
+
+    second_task = asyncio.create_task(replay.generate_decision(second_request))
+    await asyncio.sleep(0)
+    assert not second_task.done()
+
+    assert await replay.generate_decision(first_request) == first_decision
+    assert await second_task == second_decision
+    assert replay.hits == 2
+    assert replay.misses == 0
+
+
+@pytest.mark.anyio
+async def test_file_replay_waits_for_requests_that_started_before_recorded_completion(
+    tmp_path,
+):
+    first_request = _arrive_home_request()
+    second_request = first_request.model_copy(update={"agent_id": "hvac_agent"})
+    first_decision = LLMRecording.decision_from_payload(_RECORDED_DECISION_JSON)
+    second_decision = first_decision.model_copy(update={"intent": "second decision"})
+    records = [
+        LLMRecording(
+            request_key=request_key(request),
+            prompt_hash=request_key(request),
+            agent_id=request.agent_id,
+            root_event_type=request.root_event_type,
+            provider="anthropic_compatible",
+            model="MiniMax-M3",
+            request_ordinal=ordinal,
+            started_request_count=2,
+            request=canonical_request_payload(request),
+            decision=decision,
+        )
+        for ordinal, (request, decision) in enumerate(
+            (
+                (first_request, first_decision),
+                (second_request, second_decision),
+            )
+        )
+    ]
+    path = tmp_path / LLM_RECORDINGS_FILENAME
+    path.write_text(
+        "".join(record.to_json_line() + "\n" for record in records),
+        encoding="utf-8",
+    )
+    replay = ReplayLLMProvider.from_file(path)
+    events: list[str] = []
+
+    async def run_episode(label, request):
+        events.append(f"frame:{label}")
+        await replay.generate_decision(request)
+        events.append(f"decision:{label}")
+
+    await asyncio.gather(
+        run_episode("first", first_request),
+        run_episode("second", second_request),
+    )
+
+    assert events == [
+        "frame:first",
+        "frame:second",
+        "decision:first",
+        "decision:second",
+    ]
+
+
+@pytest.mark.anyio
 async def test_recording_checks_writability_before_live_call_and_fails_closed(tmp_path):
     blocked_parent = tmp_path / "not-a-directory"
     blocked_parent.write_text("blocked", encoding="utf-8")
@@ -631,6 +728,8 @@ def test_recording_with_tampered_request_is_rejected_not_silently_returned(tmp_p
         root_event_type=request.root_event_type,
         provider="anthropic_compatible",
         model="MiniMax-M2.7",
+        request_ordinal=0,
+        started_request_count=1,
         request=canonical_request_payload(request),
         decision=LLMRecording.decision_from_payload(_RECORDED_DECISION_JSON),
     )
@@ -660,6 +759,8 @@ async def test_replay_miss_falls_back_with_recording_miss_reason_labeled_event(t
         root_event_type=other_request.root_event_type,
         provider="anthropic_compatible",
         model="MiniMax-M2.7",
+        request_ordinal=0,
+        started_request_count=1,
         request=canonical_request_payload(other_request),
         decision=LLMRecording.decision_from_payload(_RECORDED_DECISION_JSON),
     )

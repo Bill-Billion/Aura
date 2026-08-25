@@ -1,0 +1,38 @@
+substudy_schema_version: "1.0"
+study_id: aurabench_m3_live_substudy
+
+# Option B: eight dynamic AuraBench families crossed with three frozen seeds.
+scenarios:
+  - ../aurabench-dev/episodes/comfort_smoke_preemption_dynamic.yaml
+  - ../aurabench-dev/episodes/partial_feedback_loss_dynamic.yaml
+  - ../aurabench-dev/episodes/read_then_leave_dynamic.yaml
+  - ../aurabench-dev/episodes/single_feedback_loss_dynamic.yaml
+  - ../aurabench-dev/episodes/target_failure_before_execution_dynamic.yaml
+  - ../aurabench-dev/episodes/target_failure_during_execution_dynamic.yaml
+  - ../aurabench-dev/episodes/unrelated_camera_failure_dynamic.yaml
+  - ../aurabench-dev/episodes/unrelated_resident_activity_dynamic.yaml
+seeds: [21001, 21002, 21003]
+
+provider: anthropic_compatible
+model: MiniMax-M3
+endpoint: https://api.minimaxi.com/anthropic
+anthropic_version: "2023-06-01"
+max_tokens: 1200
+timeout_ms: 45000
+strict_output: true
+decision_schema_sha256: e7dfb37fc03adf09eeeb3041099f6946a24f69b9b7d9687ee626807c1e784f3e
+topology: domain_multi
+governance: aura
+observation: stale_offline
+
+live_repetitions: 3
+capture_repetitions: 1
+replay_repetitions: 3
+billing_mode: token_plan
+
+# Informational accounting only. The token plan has no dollar stop gate.
+pricing:
+  input_usd_per_mtok: 0.3
+  output_usd_per_mtok: 1.2
+  source: https://platform.minimax.io/subscribe/token-plan?tab=api-enterprise
+  as_of: "2026-08-25"

@@ -15,6 +15,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from backend.core.safe_io import read_bounded_regular_file
+
 from .spec import (
     RESOLVED_MATRIX_SCHEMA_VERSION,
     ExperimentCell,
@@ -521,6 +523,7 @@ __all__ = [
     "cell_result_path",
     "read_cell_result",
     "read_cell_result_at",
+    "read_bounded_regular_file",
     "read_resolved_matrix",
     "resolved_matrix_path",
     "write_cell_result",

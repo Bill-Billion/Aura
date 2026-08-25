@@ -105,9 +105,72 @@ matrix_version / cell_id / scenario_id / seed / repetition / source_revision
 核心 benchmark 不依赖网络或新凭据。live 模型只用于用户明确授权的固定子集，并要求：
 
 - `AURA_ALLOW_LIVE_LLM=1`；
-- 明确 provider、model/version 与总预算；
-- 达到预算 80% 时停止启动新 live cell；
+- 明确 provider、model/version 与计费模式；按量计费研究必须冻结总预算，并在达到预算 80% 时停止启动新 live cell；token plan 研究不设置虚假的美元停机线，但仍逐 run 记录 token、调用数和按冻结价格估算的成本；
 - recording miss、歧义或不完整时 fail closed，禁止静默降级到其他模型。
+
+PR21 的 Option B 子研究固定为 `anthropic_compatible / MiniMax-M3`，并把
+`https://api.minimaxi.com/anthropic` 作为唯一允许的 HTTPS endpoint 冻结进研究契约、
+预检回执和 paid-run provenance；协议版本、`max_tokens=1200`、实际超时、严格输出模式
+及 decision schema SHA-256 同样进入冻结契约，任何环境漂移都会在网络调用前被拒绝。
+严格模式还要求 provider 回包中的实际 `model` 字段逐次等于 `MiniMax-M3`，并把实际模型
+写入 preflight、成本台账、capture recording 与最终汇总；缺失或上游降级都会 fail closed。
+实验条件固定为
+`domain_multi + aura + stale_offline`，使用 8 个 dynamic 场景族 × 3 个 seed 形成
+24 个实例。每个实例严格执行 `3 live + 1 capture + 3 replay`，合计 168 个槽位；
+其中 96 个槽位访问 provider，72 个 replay 槽位由不具备网络能力的 sentinel 守住。
+作者清单位于 `benchmarks/aurabench-m3-substudy/manifest.yaml`。
+token plan 的 runner 显式使用 `telemetry_only` 成本策略：仍记录每次调用、token 和冻结
+价格估算值，但美元阈值在代码路径上不参与放行决策。最终 scientific gate 必须重新验证
+sealed preflight，并把 preflight seal 写入 results manifest。
+
+执行顺序固定为：
+
+```bash
+python -m backend.experiments resolve-llm-substudy \
+  benchmarks/aurabench-m3-substudy/manifest.yaml \
+  --output <substudy-root>
+
+python -m backend.experiments preflight-llm-substudy \
+  <substudy-root>/resolved-substudy.json \
+  --output <substudy-root>
+
+python -m backend.experiments run-llm-substudy \
+  <substudy-root>/resolved-substudy.json \
+  --output <substudy-root>
+
+python -m backend.experiments summarize-llm-substudy \
+  <substudy-root>/resolved-substudy.json \
+  --output <substudy-root>
+```
+
+预检只发一条结构化请求，并把 provider、model、source revision、token usage 与响应
+摘要写入 sealed `preflight.json`；同时记录实际使用的 `tool_use` 或 `text_json` transport，
+不保存 API key 或原始认证信息。MiniMax Anthropic 兼容接口只支持 `tool_choice=auto/none`，
+因此两种 transport 都是合法观测，schema 校验失败仍直接形成无效证据。没有与 resolved study
+完全一致的预检回执，runner 不启动任何 paid slot。每个 slot result 为 create-only；
+resume 只跳过重新验证通过的 admitted 证据，失败或无效证据不会原地重试；如需重跑，
+必须使用新的 output root，防止“重试直到成功”污染模型可靠性结论。capture 必须有完整
+recording manifest；replay 必须零 billable
+call、零 miss、无 fallback，并与 capture 在声明的 provenance 差异之外保持 canonical trace、
+终态与核心评价结果一致。行为评价等价比较保留 outcome、criteria、终态和所有效果指标，
+只排除离线 replay 按设计不会复现的 `first_action_latency_ms` 网络传输耗时；若延迟阈值实际
+改变 outcome 或 criteria，门仍会失败。v2 录制的 JSONL 同时保存请求进入序号、每次响应完成
+时已有多少请求进入 provider，以及 provider 完成顺序；回放先等待相同请求水位，再按完成顺序
+放行，避免零延迟 replay 抢在 capture 网络等待期间的独立事件之前返回。只有 168/168 admitted
+且 72/72 replay equivalent 才能生成
+`scientific_gate=passed` 的 sealed results manifest。
+
+模型已返回且产生 token usage、但结构化内容为 `invalid_output` 时，PR21 不允许规则策略
+代打，也不把它当作可重抽的基础设施故障。研究专用 wrapper 生成零命令 decision，事件流
+必须出现 `reasoning.provider_failure_noop(fallback_strategy=none)`；admission 还会验证相同
+agent/correlation 下没有设备动作。slot 与最终 manifest 分别封存失败次数和原因。timeout、
+HTTP/凭证错误、预算阻断、录制缺失或损坏仍属于无效证据。该 strict 语义只作用于本子研究，
+不改变产品运行时默认的安全 fallback。
+
+动态场景中，模型没有产生任何匹配 action anchor 的动作不是基础设施无效运行：runner
+保留 `benchmark.perturbation_phase_violation(reason=anchor_not_observed)` 并正常封存，评价器
+将其计为 `perturbation_phase_valid` 失败。其他 phase violation（注入失败、时序逆序、运行时
+不支持等）仍然使证据无效。这样不会通过排除“不行动”的模型结果来抬高表现。
 
 ## 发布门
 

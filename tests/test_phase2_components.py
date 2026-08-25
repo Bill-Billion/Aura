@@ -87,7 +87,11 @@ def test_memory_prompt_omits_volatile_event_identities():
         data={
             "room_id": "living_room",
             "trigger_event_id": "random-event-id",
-            "nested": {"caused_by_event_id": "another-random-id", "value": 10},
+            "nested": {
+                "caused_by_event_id": "another-random-id",
+                "observation_capture_event_id": "third-random-id",
+                "value": 10,
+            },
         },
     )
     store.remember(root)
@@ -120,6 +124,26 @@ def test_memory_prompt_bounds_large_audit_event_for_next_request():
     )
 
     assert request.recent_events[0].endswith("…")
+
+
+def test_memory_prompt_omits_capture_replay_transport_labels():
+    store = AgentMemoryStore()
+    store.remember(
+        _event(
+            "reasoning.execution_plan",
+            data={
+                "intent": "keep resident safe",
+                "provider": "recording",
+                "latency_ms": 123,
+            },
+        )
+    )
+
+    line = store.build_recent_event_lines("security_agent", "corr-1")[0]
+
+    assert "keep resident safe" in line
+    assert "recording" not in line
+    assert "latency_ms" not in line
 
 
 def test_arbiter_prefers_higher_priority():

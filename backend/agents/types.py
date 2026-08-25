@@ -57,6 +57,9 @@ class AgentLLMDecision(BaseModel):
     )
     explanation: str = Field(max_length=MAX_EXPLANATION_CHARS)
     needs_coordination: bool = False
+    # Internal research marker. Provider-facing schemas never expose this key;
+    # only the strict substudy wrapper may set it after a paid invalid response.
+    provider_failure_reason: str | None = Field(default=None, max_length=128)
 
     @model_validator(mode="after")
     def validate_bounded_payload(self) -> "AgentLLMDecision":
@@ -104,7 +107,7 @@ class LLMDecisionRequest(BaseModel):
 class AgentDecisionEnvelope(BaseModel):
     agent_id: str
     agent_name: str
-    mode: Literal["llm", "fallback_rule_based"]
+    mode: Literal["llm", "fallback_rule_based", "provider_failure_noop"]
     trigger_event_type: str
     intent: str
     confidence: float = Field(ge=0.0, le=1.0)
@@ -122,4 +125,5 @@ class AgentDecisionEnvelope(BaseModel):
     relevant_devices: list[str] = Field(default_factory=list)
     relevant_rooms: list[str] = Field(default_factory=list)
     fallback_reason: str | None = None
+    provider_failure_reason: str | None = None
     failed_step: str | None = None

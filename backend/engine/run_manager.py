@@ -336,6 +336,13 @@ class RunMetadata(BaseModel):
     agent_versions: dict[str, str] = Field(default_factory=dict)
     llm_provider: str
     llm_model: str
+    llm_endpoint: str | None = None
+    llm_protocol_version: str | None = None
+    llm_max_tokens: int | None = None
+    llm_timeout_ms: int | None = None
+    llm_strict_output: bool | None = None
+    llm_decision_schema_sha256: str | None = None
+    llm_cost_policy: Literal["enforced", "telemetry_only"] = "enforced"
     llm_mode: LLMMode = LLMMode.LIVE
     # None 只用于加载没有该字段的 legacy 工件；RunManager.start_run 对所有新 run
     # 都会按实际 llm_mode 显式写入，不能把旧 live 工件误标成 rule_based。
@@ -364,16 +371,13 @@ class RunMetadata(BaseModel):
     def _validate_experiment_model_selection(self) -> "RunMetadata":
         if self.experiment is None:
             return self
-        expected_policy = (
-            BaselinePolicy.RULE_BASED
-            if self.experiment.model == "rule_based"
-            else BaselinePolicy.LLM_MOCKED
-        )
-        expected_mode = (
-            LLMMode.RULE_BASED
-            if self.experiment.model == "rule_based"
-            else LLMMode.MOCKED
-        )
+        expected_policy, expected_mode = {
+            "rule_based": (BaselinePolicy.RULE_BASED, LLMMode.RULE_BASED),
+            "mocked": (BaselinePolicy.LLM_MOCKED, LLMMode.MOCKED),
+            "live": (BaselinePolicy.LLM_LIVE, LLMMode.LIVE),
+            "recorded": (BaselinePolicy.LLM_RECORDED, LLMMode.RECORDED),
+            "replay": (BaselinePolicy.LLM_RECORDED, LLMMode.RECORDED),
+        }[self.experiment.model]
         if self.baseline_policy is not expected_policy or self.llm_mode is not expected_mode:
             raise ValueError(
                 "experiment model must match baseline_policy and llm_mode"
@@ -467,6 +471,7 @@ class RunManager:
         agent_versions: Mapping[str, str] | None = None,
         run_id: str | None = None,
         clear_event_history: bool = True,
+        llm_cost_policy: Literal["enforced", "telemetry_only"] = "enforced",
     ) -> RunMetadata:
         """开启新 run：结束上一 run → 记元数据 → 换总线上下文并清历史。
 
@@ -490,6 +495,21 @@ class RunManager:
             agent_versions=dict(agent_versions or {}),
             llm_provider=str(getattr(llm_provider, "provider_name", "disabled") or "disabled"),
             llm_model=str(getattr(llm_provider, "model", "rule_based") or "rule_based"),
+            llm_endpoint=(
+                str(endpoint)
+                if (endpoint := getattr(llm_provider, "base_url", None))
+                else None
+            ),
+            llm_protocol_version=getattr(llm_provider, "anthropic_version", None),
+            llm_max_tokens=getattr(llm_provider, "max_tokens", None),
+            llm_timeout_ms=getattr(llm_provider, "timeout_ms", None),
+            llm_strict_output=getattr(llm_provider, "strict_output", None),
+            llm_decision_schema_sha256=getattr(
+                llm_provider,
+                "decision_schema_sha256",
+                None,
+            ),
+            llm_cost_policy=llm_cost_policy,
             llm_mode=effective_mode,
             baseline_policy=(
                 BaselinePolicy(baseline_policy)

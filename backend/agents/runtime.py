@@ -412,12 +412,15 @@ class AgentRuntime:
         observation_projector: ObservableProjector | None = None,
         orchestrator: HomeOrchestratorAgent | None = None,
         arbitration_gate: ArbitrationGate | None = None,
+        run_artifacts_root: Path | str | None = None,
+        enforce_llm_budget: bool = True,
     ) -> None:
         self.agents: list[BaseAgent] = []
         # 编排层不在 self.agents 里：BaseAgent 控设备、发命令，编排器只负责派发任务。
         self.orchestrator = orchestrator or HomeOrchestratorAgent()
         self.event_bus = event_bus
         self.run_id_source = run_id_source
+        self.run_artifacts_root = run_artifacts_root
         self.state_manager = state_manager
         # §2.3：agent 只消费 observable 投影，不消费 ground truth。这台观测者是本 runtime
         # 里"世界 → agent"的**唯一**通道（见 observable_world），它持有的历史（每台设备
@@ -440,7 +443,7 @@ class AgentRuntime:
         self.llm_provider = self._resolve_llm_provider()
         # S3-T8 成本护栏（S3 review major-4）：台账挂在 runtime 上（跨 episode 累计，
         # run 工件要的是整份 run 的汇总），收费口按 episode 现套——见 _episode_llm_provider。
-        self.cost_guard = EpisodeCostGuard()
+        self.cost_guard = EpisodeCostGuard(enforce_budget=enforce_llm_budget)
         log.info("llm_mode_resolved", **llm_mode_health(self.llm_provider))
         self.memory_store = memory_store or AgentMemoryStore()
         self.arbiter = arbiter or Arbiter()
@@ -517,6 +520,7 @@ class AgentRuntime:
             return RunScopedRecordedProvider(
                 live_provider_factory=self._live_provider_factory,
                 run_id_source=self.current_run_id,
+                recordings_root=self.run_artifacts_root,
                 integrity_error_handler=self._mark_recording_integrity_error,
             )
         return build_provider_for_mode(
@@ -566,8 +570,14 @@ class AgentRuntime:
         else:
             if recording_source_run_id is not None:
                 try:
-                    source = read_run_metadata(recording_source_run_id)
-                    source_path = run_dir(recording_source_run_id) / LLM_RECORDINGS_FILENAME
+                    source = read_run_metadata(
+                        recording_source_run_id,
+                        root=self.run_artifacts_root,
+                    )
+                    source_path = (
+                        run_dir(recording_source_run_id, root=self.run_artifacts_root)
+                        / LLM_RECORDINGS_FILENAME
+                    )
                 except RunArtifactError as exc:
                     raise BaselinePolicyUnavailableError(
                         policy,
@@ -657,6 +667,7 @@ class AgentRuntime:
                 provider = RunScopedRecordedProvider(
                     live_provider_factory=lambda: live,
                     run_id_source=self.current_run_id,
+                    recordings_root=self.run_artifacts_root,
                     allow_env_override=False,
                     integrity_error_handler=self._mark_recording_integrity_error,
                 )
@@ -2290,7 +2301,7 @@ class AgentRuntime:
         episode = self.cost_guard.episode(correlation_id)
         if not episode.calls and not episode.blocked_calls:
             return
-        self.cost_guard.write_run_artifact(run_id)
+        self.cost_guard.write_run_artifact(run_id, root=self.run_artifacts_root)
 
     async def _emit_orchestrator_prefix(
         self,
@@ -2355,7 +2366,21 @@ class AgentRuntime:
         )
         parent_id = decomposition.event_id
 
-        if decision.plan.fallback_reason:
+        if decision.provider_failure_reason:
+            provider_failure = await self._emit_agent_event(
+                root_event=root_event,
+                agent_id=self.orchestrator.orchestrator_id,
+                event_type="reasoning.provider_failure_noop",
+                causal_parent=decomposition.event_id,
+                data={
+                    "orchestrator_id": context_view.orchestrator_id,
+                    "reason": decision.provider_failure_reason,
+                    "failed_step": "intent_classification",
+                    "fallback_strategy": "none",
+                },
+            )
+            parent_id = provider_failure.event_id
+        elif decision.plan.fallback_reason:
             fallback = await self._emit_agent_event(
                 root_event=root_event,
                 agent_id=self.orchestrator.orchestrator_id,
@@ -2647,6 +2672,7 @@ class AgentRuntime:
             "latency_ms": envelope.latency_ms,
             "task_steps": list(envelope.task_steps),
             "fallback_reason": envelope.fallback_reason,
+            "provider_failure_reason": envelope.provider_failure_reason,
             "perception": {
                 "trigger_event_type": envelope.trigger_event_type,
                 "world_summary": envelope.world_summary,
@@ -2669,6 +2695,20 @@ class AgentRuntime:
         挪进执行环补记就读不出"哪一步失败了才转的规则"。非降级 episode 不发。
         """
 
+        if envelope.mode == "provider_failure_noop":
+            await self._emit_agent_event(
+                root_event=root_event,
+                agent_id=envelope.agent_id,
+                event_type="reasoning.provider_failure_noop",
+                causal_parent=causal_parent,
+                data={
+                    "agent_id": envelope.agent_id,
+                    "reason": envelope.provider_failure_reason,
+                    "failed_step": envelope.failed_step or "intent_generation",
+                    "fallback_strategy": "none",
+                },
+            )
+            return
         if envelope.mode != "fallback_rule_based":
             return
         event = await self._emit_agent_event(

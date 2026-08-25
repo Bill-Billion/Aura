@@ -213,6 +213,15 @@ _BUILTIN_PRICES: tuple[ModelPrice, ...] = (
         as_of="2026-01-01",
         verified=False,
     ),
+    ModelPrice(
+        provider="minimax",
+        model="minimax-m3",
+        input_usd_per_mtok=0.3,
+        output_usd_per_mtok=1.2,
+        source="https://platform.minimax.io/subscribe/token-plan?tab=api-enterprise",
+        as_of="2026-08-25",
+        verified=True,
+    ),
 )
 
 

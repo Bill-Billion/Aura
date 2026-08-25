@@ -303,6 +303,23 @@ def test_budget_env_override_and_default():
         resolve_episode_budget_usd({EPISODE_BUDGET_ENV: "not-a-number"})
 
 
+def test_token_plan_cost_guard_records_without_enforcing_dollar_budget():
+    guard = EpisodeCostGuard(budget_usd=0.0, enforce_budget=False)
+
+    reservation = guard.check_affordable(
+        "token-plan",
+        model="MiniMax-M3",
+        provider="anthropic_compatible",
+        prompt_tokens=100,
+        max_output_tokens=1200,
+        agent_id="home_orchestrator",
+    )
+
+    assert reservation > 0
+    assert guard.episode("token-plan").blocked_calls == 0
+    assert guard.run_payload()["budget_policy"] == "telemetry_only"
+
+
 async def test_budget_breach_mid_episode_switches_remaining_agents_to_rule_fallback_with_budget_exceeded_reason():
     """预算在 episode 中途咬下去：后续 agent 走规则回退，且理由是 budget_exceeded。"""
 
@@ -500,7 +517,7 @@ async def test_billed_invalid_response_is_recorded_and_failed_retry_does_not_reu
                 200,
                 json={
                     "usage": {"input_tokens": 100, "output_tokens": 50},
-                    "output_text": json.dumps({"intent": "missing required fields"}),
+                    "output_text": json.dumps({"intent": "x" * 257}),
                 },
             )
         raise httpx.ReadTimeout("timed out", request=request)

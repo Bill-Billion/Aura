@@ -445,10 +445,20 @@ class ScenarioEvaluator:
         trace_spec = (
             scenario.trace_spec if isinstance(scenario, ScenarioSpecV2) else None
         )
+        unobserved_anchor = next(
+            (
+                event
+                for event in events
+                if event.get("event_type") == "benchmark.perturbation_phase_violation"
+                and event.get("data", {}).get("reason") == "anchor_not_observed"
+            ),
+            None,
+        )
         intervention_metadata: dict[str, Any] | None = None
         if (
             isinstance(scenario, ScenarioSpecV2)
             and scenario.intervention_response is not None
+            and unobserved_anchor is None
         ):
             from backend.evaluation.temporal import _trace_suffix_from_trigger
             from backend.evaluation.trace_index import TraceValidationError
@@ -533,6 +543,18 @@ class ScenarioEvaluator:
             trace_events = list(view.events)
             trace_spec = view.trace_spec
             intervention_metadata = view.metadata
+        elif (
+            isinstance(scenario, ScenarioSpecV2)
+            and scenario.intervention_response is not None
+            and unobserved_anchor is not None
+        ):
+            intervention_metadata = {
+                "trigger_missing_reason": "anchor_not_observed",
+                "phase_violation_event_id": unobserved_anchor.get("event_id"),
+                "phase_violation_seq": unobserved_anchor.get("seq"),
+                "evaluated_event_count": len(events),
+                "time_origin": scenario.intervention_response.time_origin,
+            }
 
         device_match = compute_device_state_match_rate(evaluation_collector)
         metrics = EvalMetrics(
@@ -555,6 +577,13 @@ class ScenarioEvaluator:
             has_expected_failures=bool(context["expected_failures"]),
             required_metrics=list(scenario.metrics),
         )
+        if unobserved_anchor is not None:
+            checks["perturbation_anchor_observed"] = False
+            if "perturbation_phase_valid" not in failed_metrics:
+                failed_metrics.append("perturbation_phase_valid")
+            reasons.append(
+                "perturbation phase: model produced no action matching the declared anchor"
+            )
         final_state_success: bool | None = None
         trajectory_properties_satisfied: bool | None = None
         trajectory_safe_success: bool | None = None
@@ -583,7 +612,12 @@ class ScenarioEvaluator:
                     if item.level == "hard" and item.status is VerificationStatus.FAIL
                 )
             else:
-                trace_unevaluable = True
+                if unobserved_anchor is not None:
+                    trajectory_properties_satisfied = False
+                    if "trajectory_properties_satisfied" not in failed_metrics:
+                        failed_metrics.append("trajectory_properties_satisfied")
+                else:
+                    trace_unevaluable = True
                 reasons.extend(
                     f"TraceSpec {item.property_id}: {item.message}"
                     for item in verification.properties

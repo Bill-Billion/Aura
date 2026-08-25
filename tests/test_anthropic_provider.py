@@ -42,6 +42,8 @@ async def test_anthropic_provider_parses_messages_payload_and_code_fence_json():
         assert payload["max_tokens"] == 1200
         assert payload["messages"][0]["role"] == "user"
         assert payload["system"].startswith("You are a smart-home orchestration planner. Return strict JSON only.")
+        assert payload["tool_choice"] == {"type": "auto"}
+        assert payload["tools"][0]["name"] == "submit_agent_decision"
         return httpx.Response(
             200,
             json={
@@ -90,6 +92,183 @@ async def test_anthropic_provider_parses_messages_payload_and_code_fence_json():
 
 
 @pytest.mark.anyio
+async def test_anthropic_provider_prefers_structured_tool_input():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "model": "MiniMax-M3",
+                "usage": {"input_tokens": 120, "output_tokens": 35},
+                "content": [
+                    {"type": "text", "text": "This text is intentionally not JSON."},
+                    {
+                        "type": "tool_use",
+                        "name": "submit_agent_decision",
+                        "id": "call_123",
+                        "input": {
+                            "intent": "light occupied room",
+                            "confidence": 0.91,
+                            "task_steps": ["set brightness"],
+                            "proposed_commands": [
+                                {
+                                    "device_id": "light_living_01",
+                                    "property": "extra.brightness",
+                                    "value": 70,
+                                    "reason": "occupied evening room",
+                                }
+                            ],
+                            "explanation": "Evening occupancy needs comfortable lighting.",
+                            "needs_coordination": False,
+                        },
+                    },
+                ],
+            },
+        )
+
+    provider = AnthropicCompatibleProvider(
+        api_key="test-key",
+        model="MiniMax-M3",
+        base_url="https://api.minimax.io/anthropic",
+        transport=httpx.MockTransport(handler),
+    )
+
+    decision = await provider.generate_decision(_request())
+
+    assert decision.intent == "light occupied room"
+    assert decision.proposed_commands[0].value == 70
+    assert provider.last_usage == {"input_tokens": 120, "output_tokens": 35}
+    assert provider.last_decision_transport == "tool_use"
+
+
+@pytest.mark.anyio
+async def test_anthropic_provider_drops_incomplete_tool_commands_without_guessing():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "model": "MiniMax-M3",
+                "usage": {"input_tokens": 120, "output_tokens": 35},
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "submit_agent_decision",
+                        "id": "call_123",
+                        "input": {
+                            "intent": "keep the occupied room comfortable",
+                            "confidence": 0.9,
+                            "task_steps": ["set brightness"],
+                            "proposed_commands": [
+                                {
+                                    "device_id": "light_living_01",
+                                    "property": "extra.brightness",
+                                    "value": 70,
+                                    "reason": "occupied evening room",
+                                },
+                                {
+                                    "device_id": "light_bedroom_01",
+                                    "property": "",
+                                },
+                            ],
+                            "needs_coordination": False,
+                        },
+                    }
+                ],
+            },
+        )
+
+    provider = AnthropicCompatibleProvider(
+        api_key="test-key",
+        model="MiniMax-M3",
+        base_url="https://api.minimax.io/anthropic",
+        transport=httpx.MockTransport(handler),
+    )
+
+    decision = await provider.generate_decision(_request())
+
+    assert [command.device_id for command in decision.proposed_commands] == [
+        "light_living_01"
+    ]
+    assert decision.explanation == decision.intent
+
+
+@pytest.mark.anyio
+async def test_anthropic_provider_strict_research_mode_rejects_partial_tool_input():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "model": "MiniMax-M3",
+                "usage": {"input_tokens": 120, "output_tokens": 35},
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "submit_agent_decision",
+                        "id": "call_123",
+                        "input": {
+                            "intent": "keep the room comfortable",
+                            "confidence": 0.9,
+                            "task_steps": ["set brightness"],
+                            "proposed_commands": [
+                                {
+                                    "device_id": "light_living_01",
+                                    "property": "extra.brightness",
+                                    "value": 70,
+                                }
+                            ],
+                            "explanation": "The room is occupied.",
+                            "needs_coordination": False,
+                        },
+                    }
+                ],
+            },
+        )
+
+    provider = AnthropicCompatibleProvider(
+        api_key="test-key",
+        model="MiniMax-M3",
+        base_url="https://api.minimax.io/anthropic",
+        strict_output=True,
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(LLMProviderError) as exc_info:
+        await provider.generate_decision(_request())
+
+    assert exc_info.value.reason == "invalid_output"
+    assert provider.last_usage == {"input_tokens": 120, "output_tokens": 35}
+    assert provider.last_decision_transport == "tool_use"
+
+
+@pytest.mark.anyio
+async def test_anthropic_provider_marks_billed_empty_strict_response():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "model": "MiniMax-M3",
+                "usage": {"input_tokens": 5, "output_tokens": 1},
+                "content": [],
+            },
+        )
+
+    provider = AnthropicCompatibleProvider(
+        api_key="test-key",
+        model="MiniMax-M3",
+        base_url="https://api.minimax.io/anthropic",
+        strict_output=True,
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(LLMProviderError) as exc_info:
+        await provider.generate_decision(_request())
+
+    assert exc_info.value.reason == "invalid_output"
+    assert provider.last_usage == {"input_tokens": 5, "output_tokens": 1}
+    assert provider.last_response_model == "MiniMax-M3"
+    assert provider.last_decision_transport == "empty"
+
+
+@pytest.mark.anyio
 async def test_anthropic_provider_clears_previous_usage_before_a_failed_request():
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("timed out", request=request)
@@ -110,6 +289,17 @@ async def test_anthropic_provider_clears_previous_usage_before_a_failed_request(
 def test_anthropic_provider_rejects_non_positive_output_cap():
     with pytest.raises(ValueError):
         AnthropicCompatibleProvider(api_key="test-key", max_tokens=0)
+
+
+def test_minimax_provider_has_a_realistic_timeout_floor():
+    provider = AnthropicCompatibleProvider(
+        api_key="test-key",
+        model="MiniMax-M3",
+        timeout_ms=1000,
+        base_url="https://api.minimax.io/anthropic",
+    )
+
+    assert provider.timeout_ms == 45000
 
 
 @pytest.mark.anyio
@@ -156,7 +346,7 @@ async def test_anthropic_provider_maps_invalid_schema_to_invalid_output():
                 "content": [
                     {
                         "type": "text",
-                        "text": "{\"intent\": \"missing fields\"}",
+                        "text": json.dumps({"intent": "x" * 257}),
                     }
                 ]
             },
