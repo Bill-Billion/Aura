@@ -144,7 +144,10 @@ def _write_review(
 
 def _frozen_pilot(tmp_path: Path):
     bundle = tmp_path / "aurabench-dev"
-    shutil.copytree(PILOT_ROOT, bundle)
+    # The repository now carries a sealed freeze.  These tests build an
+    # independent fixture, so copying that prior output would collide with the
+    # create-only paths below.
+    shutil.copytree(PILOT_ROOT, bundle, ignore=shutil.ignore_patterns("freeze"))
     frozen = bundle / "freeze"
     frozen.mkdir()
     matrix = resolve_matrix(
