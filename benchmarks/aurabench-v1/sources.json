@@ -1,0 +1,248 @@
+{
+  "source_registry_schema_version": "1.0",
+  "registry_id": "aurabench_v1_scenario_sources",
+  "accessed_on": "2026-08-27",
+  "sources": [
+    {
+      "source_id": "simuhome_iclr2026",
+      "title": "SimuHome: A Temporal- and Environment-Aware Benchmark for Smart Home LLM Agents",
+      "authors": "Gyuhyeon Seo, Jungwoo Yang, Junseong Pyo, Nalim Kim, Jonggeun Lee, Yohan Jo",
+      "year": 2026,
+      "source_type": "peer_reviewed_paper",
+      "venue": "ICLR 2026",
+      "url": "https://iclr.cc/virtual/2026/poster/10010052",
+      "doi": null,
+      "evidence_tags": [
+        "capability_grounding",
+        "dynamic_state",
+        "human_validation",
+        "implicit_intent",
+        "infeasible_request",
+        "physical_effect",
+        "reproducibility",
+        "state_verification",
+        "temporal_dependency"
+      ],
+      "use_in_aura": "Supports executable goals, pre-action state checks, feasible/infeasible requests, device dependencies, and time-aware workflows.",
+      "limits": "The released benchmark is simulated and does not establish household authority rules or emergency policy. Aura does not copy its episodes."
+    },
+    {
+      "source_id": "homebench_acl2025",
+      "title": "HomeBench: Evaluating LLMs in Smart Homes with Valid and Invalid Instructions Across Single and Multiple Devices",
+      "authors": "Silin Li, Yuhang Guo, Jiashu Yao, Zeming Liu, Haifeng Wang",
+      "year": 2025,
+      "source_type": "peer_reviewed_paper",
+      "venue": "ACL 2025",
+      "url": "https://aclanthology.org/2025.acl-long.597/",
+      "doi": "10.18653/v1/2025.acl-long.597",
+      "evidence_tags": [
+        "capability_grounding",
+        "human_validation",
+        "infeasible_request",
+        "multi_device_control"
+      ],
+      "use_in_aura": "Supports explicit invalid-request handling, mixed valid/invalid multi-device requests, and capability-aware evaluation.",
+      "limits": "Its instructions are generated in virtual homes and do not model mid-execution environmental changes."
+    },
+    {
+      "source_id": "personalhomebench_preprint2026",
+      "title": "PersonalHomeBench: Evaluating Agents in Personalized Smart Homes",
+      "authors": "Nikhil Verma et al.",
+      "year": 2026,
+      "source_type": "preprint",
+      "venue": "arXiv",
+      "url": "https://arxiv.org/abs/2604.16813",
+      "doi": null,
+      "evidence_tags": [
+        "counterfactual_pair",
+        "negative_control",
+        "partial_observability",
+        "personalization",
+        "physical_consistency",
+        "single_factor_change",
+        "state_change"
+      ],
+      "use_in_aura": "Supports paired single-factor counterfactuals, changed and unchanged answers, partial observability, and explicit physical and temporal consistency checks.",
+      "limits": "This source is a preprint and much of its household content is generated. It informs validation structure, not real-world frequencies."
+    },
+    {
+      "source_id": "casas_official_datasets",
+      "title": "CASAS Smart Home Data Sets",
+      "authors": "Washington State University CASAS",
+      "year": 2024,
+      "source_type": "official_dataset",
+      "venue": "WSU CASAS",
+      "url": "https://casas.wsu.edu/datasets/",
+      "doi": null,
+      "evidence_tags": [
+        "activity_transition",
+        "environment_sensor",
+        "longitudinal_home",
+        "multi_resident",
+        "real_home"
+      ],
+      "use_in_aura": "Supports realistic room transitions, overlapping residents, longitudinal routines, and ambient sensor observations.",
+      "limits": "CASAS records activities and sensors; it does not provide normative smart-home control actions or priority rules."
+    },
+    {
+      "source_id": "aras_pervasivehealth2013",
+      "title": "ARAS Human Activity Datasets in Multiple Homes with Multiple Residents",
+      "authors": "Hande Alemdar, Ozlem Durmaz Incel, Halil Ertan, Cem Ersoy",
+      "year": 2013,
+      "source_type": "peer_reviewed_paper",
+      "venue": "PervasiveHealth 2013",
+      "url": "https://eudl.eu/doi/10.4108/icst.pervasivehealth.2013.252120",
+      "doi": "10.4108/icst.pervasivehealth.2013.252120",
+      "evidence_tags": [
+        "activity_transition",
+        "multi_resident",
+        "real_home"
+      ],
+      "use_in_aura": "Supports simultaneous activities and state transitions for two residents in two real homes over two months.",
+      "limits": "ARAS is an activity-recognition dataset and does not encode device-control preferences or permissions."
+    },
+    {
+      "source_id": "casas_sw_official",
+      "title": "CASAS-SW Continuous In-the-wild Smartwatch Activity Data",
+      "authors": "Washington State University CASAS",
+      "year": 2021,
+      "source_type": "official_dataset",
+      "venue": "WSU CASAS",
+      "url": "https://casas.wsu.edu/datasets/smartwatch/",
+      "doi": null,
+      "evidence_tags": [
+        "activity_transition",
+        "observation_gap",
+        "real_world_trace",
+        "stale_observation"
+      ],
+      "use_in_aura": "Supports gaps, delayed labels, and last-observation-carried-forward behavior in real-world sensing traces.",
+      "limits": "The dataset uses wearable and location signals rather than Aura's exact ambient sensors; it supports the observation pathology, not a chosen delay duration."
+    },
+    {
+      "source_id": "lighting_conflicts_puc2017",
+      "title": "A perspective on multi-user interaction design based on an understanding of domestic lighting conflicts",
+      "authors": "Karin Niemantsverdriet, Harm van Essen, Berry Eggen",
+      "year": 2017,
+      "source_type": "peer_reviewed_paper",
+      "venue": "Personal and Ubiquitous Computing",
+      "url": "https://link.springer.com/article/10.1007/s00779-016-0998-5",
+      "doi": "10.1007/s00779-016-0998-5",
+      "evidence_tags": [
+        "activity_conflict",
+        "context_dependent_resolution",
+        "multi_resident",
+        "preference_conflict",
+        "real_home"
+      ],
+      "use_in_aura": "Supports activity and preference conflicts in shared lighting, including reading, sleeping, television viewing, brightness, and color-temperature differences.",
+      "limits": "The study warns against assuming one automatic resolution is socially correct. Aura scenarios must state the household agreement instead of inventing a universal winner."
+    },
+    {
+      "source_id": "routine_conflicts_imwut2023",
+      "title": "A User-Centric Evaluation of Smart Home Resolution Approaches for Conflicts Between Routines",
+      "authors": "Ali Zaidi, Rui Yang, Vinay Koshy, Camille Cobb, Indranil Gupta, Karrie Karahalios",
+      "year": 2023,
+      "source_type": "peer_reviewed_paper",
+      "venue": "Proceedings of the ACM on Interactive, Mobile, Wearable and Ubiquitous Technologies",
+      "url": "https://doi.org/10.1145/3581997",
+      "doi": "10.1145/3581997",
+      "evidence_tags": [
+        "context_dependent_resolution",
+        "human_validation",
+        "routine_conflict"
+      ],
+      "use_in_aura": "Supports context-dependent routine conflicts and the need to evaluate more than one resolution strategy.",
+      "limits": "The study uses scenario surveys and finds no context-agnostic best policy; Aura must not encode a universal preference winner."
+    },
+    {
+      "source_id": "nist_8259a_logical_access",
+      "title": "NISTIR 8259A Federal Profile: Logical Access to Interfaces",
+      "authors": "National Institute of Standards and Technology",
+      "year": 2021,
+      "source_type": "official_standard_guidance",
+      "venue": "NIST",
+      "url": "https://pages.nist.gov/FederalProfile-8259A/technical/logical/",
+      "doi": null,
+      "evidence_tags": [
+        "least_privilege",
+        "role_access_control",
+        "unauthorized_request"
+      ],
+      "use_in_aura": "Supports role hierarchies, permitted device actions, unauthorized-interaction rejection, temporary roles, and least privilege.",
+      "limits": "This federal profile does not prescribe family-specific owner, adult, child, or guest precedence. Aura must declare those permissions in the household contract."
+    },
+    {
+      "source_id": "soteria_usenix_atc2018",
+      "title": "SOTERIA: Automated IoT Safety and Security Analysis",
+      "authors": "Z. Berkay Celik, Patrick McDaniel, Gang Tan",
+      "year": 2018,
+      "source_type": "peer_reviewed_paper",
+      "venue": "USENIX ATC 2018",
+      "url": "https://www.usenix.org/system/files/conference/atc18/atc18-celik.pdf",
+      "doi": null,
+      "evidence_tags": [
+        "cross_app_conflict",
+        "formal_oracle",
+        "smoke_safety"
+      ],
+      "use_in_aura": "Supports trace-level safety properties for smoke alarms and failures caused by interacting otherwise-safe automations.",
+      "limits": "It establishes that smoke detection must preserve alarm safety. It does not mandate Aura's exact lighting brightness or response window."
+    },
+    {
+      "source_id": "safehome_hotedge2019",
+      "title": "Home, SafeHome: Ensuring a Safe and Reliable Home Using the Edge",
+      "authors": "Sara Ahsan et al.",
+      "year": 2019,
+      "source_type": "peer_reviewed_paper",
+      "venue": "USENIX HotEdge 2019",
+      "url": "https://www.usenix.org/system/files/hotedge19-paper-ahsan.pdf",
+      "doi": null,
+      "evidence_tags": [
+        "concurrent_routine",
+        "device_failure",
+        "disconnection",
+        "failure_recovery",
+        "routine_conflict"
+      ],
+      "use_in_aura": "Supports failures and disconnections during routines, concurrent command conflicts, and explicit safety invariants across device sequences.",
+      "limits": "Its motivating scenarios include device types Aura v1 does not model. Aura reuses the failure structure only where current device capabilities match."
+    },
+    {
+      "source_id": "argus_usenix2023_dataset",
+      "title": "ARGUS: Context-Based Detection of Stealthy IoT Infiltration Attacks, accompanying dataset",
+      "authors": "Phillip Rieger et al.",
+      "year": 2023,
+      "source_type": "official_dataset",
+      "venue": "USENIX Security 2023",
+      "url": "https://github.com/TRUST-TUDa/argus-data",
+      "doi": null,
+      "evidence_tags": [
+        "device_state_history",
+        "multi_resident",
+        "real_home",
+        "real_world_trace"
+      ],
+      "use_in_aura": "Supports real device-state transitions across five homes, including three homes with four inhabitants.",
+      "limits": "The dataset targets intrusion detection and does not label benign device failures or prescribe recovery actions."
+    },
+    {
+      "source_id": "thermal_conflicts_erss2020",
+      "title": "From thermal comfort to conflict: The contested control and usage of domestic smart heating in the United Kingdom",
+      "authors": "Benjamin K. Sovacool, Mari Martiskainen, Jordan Osborn, Anaam Anaam, Matthew Lipson",
+      "year": 2020,
+      "source_type": "peer_reviewed_paper",
+      "venue": "Energy Research & Social Science",
+      "url": "https://doi.org/10.1016/j.erss.2020.101566",
+      "doi": "10.1016/j.erss.2020.101566",
+      "evidence_tags": [
+        "context_dependent_resolution",
+        "multi_resident",
+        "real_home",
+        "thermal_preference_conflict"
+      ],
+      "use_in_aura": "Supports real household disagreement over temperature settings and heating practices in a 100-home living-lab study.",
+      "limits": "Observed conflict frequency and UK heating practices are not assumed to transfer unchanged to every Aura household."
+    }
+  ]
+}
