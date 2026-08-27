@@ -14,10 +14,11 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 
 from backend.agents.llm import (
-    AGENT_DECISION_SCHEMA_SHA256,
     AnthropicCompatibleProvider,
+    HOME_ORCHESTRATOR_AGENT_ID,
     LLMProvider,
     LLMProviderError,
+    STRICT_DECISION_SCHEMA_SET_SHA256,
 )
 from backend.agents.llm_modes import (
     ALLOW_LIVE_LLM_ENV,
@@ -27,7 +28,11 @@ from backend.agents.llm_modes import (
     validate_recording_artifact,
 )
 from backend.agents.llm_pricing import LLM_COST_FILENAME, parse_usage
-from backend.agents.types import AgentLLMDecision, LLMDecisionRequest
+from backend.agents.types import (
+    MAX_PROPOSED_COMMANDS,
+    AgentLLMDecision,
+    LLMDecisionRequest,
+)
 from backend.core.local_env import load_local_env
 from backend.core.safe_io import read_bounded_regular_file
 from backend.engine.event_log import (
@@ -60,10 +65,10 @@ from .resolve import FileOrLibraryScenarioResolver
 from .spec import sha256_json
 
 
-SUBSTUDY_SCHEMA_VERSION = "1.0"
-RESOLVED_SUBSTUDY_SCHEMA_VERSION = "1.0"
-SLOT_RESULT_SCHEMA_VERSION = "1.1"
-RESULTS_MANIFEST_SCHEMA_VERSION = "1.1"
+SUBSTUDY_SCHEMA_VERSION = "1.1"
+RESOLVED_SUBSTUDY_SCHEMA_VERSION = "1.1"
+SLOT_RESULT_SCHEMA_VERSION = "1.2"
+RESULTS_MANIFEST_SCHEMA_VERSION = "1.2"
 RESOLVED_SUBSTUDY_FILENAME = "resolved-substudy.json"
 RESULTS_MANIFEST_FILENAME = "results-manifest.json"
 PREFLIGHT_FILENAME = "preflight.json"
@@ -74,6 +79,7 @@ EXPECTED_SLOT_COUNT = 168
 MINIMAX_M3_ENDPOINT = "https://api.minimaxi.com/anthropic"
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 _SLOT_ID_RE = re.compile(r"^slot-[0-9a-f]{32}$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class _StrictModel(BaseModel):
@@ -88,7 +94,7 @@ class PricingSnapshot(_StrictModel):
 
 
 class LLMSubstudySpec(_StrictModel):
-    substudy_schema_version: Literal["1.0"] = SUBSTUDY_SCHEMA_VERSION
+    substudy_schema_version: Literal["1.1"] = SUBSTUDY_SCHEMA_VERSION
     study_id: str = Field(pattern=r"^[a-z][a-z0-9_-]{2,95}$")
     scenarios: list[str] = Field(min_length=8, max_length=8)
     seeds: list[StrictInt] = Field(min_length=3, max_length=3)
@@ -117,7 +123,7 @@ class LLMSubstudySpec(_StrictModel):
             raise ValueError("substudy requires three unique non-negative seeds")
         self.scenarios = sorted(value.strip() for value in self.scenarios)
         self.seeds = sorted(self.seeds)
-        if self.decision_schema_sha256 != AGENT_DECISION_SCHEMA_SHA256:
+        if self.decision_schema_sha256 != STRICT_DECISION_SCHEMA_SET_SHA256:
             raise ValueError("decision schema hash does not match this Aura revision")
         return self
 
@@ -157,7 +163,7 @@ class SubstudySlot(_StrictModel):
 
 
 class ResolvedLLMSubstudy(_StrictModel):
-    resolved_substudy_schema_version: Literal["1.0"] = (
+    resolved_substudy_schema_version: Literal["1.1"] = (
         RESOLVED_SUBSTUDY_SCHEMA_VERSION
     )
     study_id: str
@@ -189,7 +195,7 @@ class ResolvedLLMSubstudy(_StrictModel):
     def _validate_contract(self) -> "ResolvedLLMSubstudy":
         if self.study_hash != sha256_json(self.contract_payload()):
             raise ValueError("resolved substudy hash does not match its contents")
-        if self.decision_schema_sha256 != AGENT_DECISION_SCHEMA_SHA256:
+        if self.decision_schema_sha256 != STRICT_DECISION_SCHEMA_SET_SHA256:
             raise ValueError("resolved decision schema hash does not match this Aura revision")
         if len(self.scenarios) != 8 or len(self.instances) != EXPECTED_INSTANCE_COUNT:
             raise ValueError("resolved substudy must contain 8 scenarios and 24 instances")
@@ -293,8 +299,18 @@ class ResolvedLLMSubstudy(_StrictModel):
         return self
 
 
+class PreflightRoleCheck(_StrictModel):
+    agent_id: str
+    response_model: str
+    decision_transport: Literal["tool_use", "text_json"]
+    response_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    input_tokens: int = Field(ge=0)
+    output_tokens: int = Field(ge=0)
+    usage_source: str
+
+
 class PreflightReceipt(_StrictModel):
-    schema_version: Literal["1.0"] = "1.0"
+    schema_version: Literal["1.1"] = "1.1"
     study_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_revision: str
     provider: str
@@ -305,12 +321,24 @@ class PreflightReceipt(_StrictModel):
     timeout_ms: int
     strict_output: bool
     decision_schema_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    response_model: str
-    decision_transport: Literal["tool_use", "text_json"]
-    response_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    role_checks: dict[
+        Literal["home_orchestrator", "domain_agent"],
+        PreflightRoleCheck,
+    ]
     input_tokens: int = Field(ge=0)
     output_tokens: int = Field(ge=0)
-    usage_source: str
+
+    @model_validator(mode="after")
+    def _complete_role_checks(self) -> "PreflightReceipt":
+        if set(self.role_checks) != {"home_orchestrator", "domain_agent"}:
+            raise ValueError("preflight must seal orchestrator and domain role checks")
+        if self.input_tokens != sum(
+            check.input_tokens for check in self.role_checks.values()
+        ) or self.output_tokens != sum(
+            check.output_tokens for check in self.role_checks.values()
+        ):
+            raise ValueError("preflight token totals do not match role checks")
+        return self
 
 
 class SealedPreflightReceipt(_StrictModel):
@@ -330,8 +358,69 @@ class SlotError(_StrictModel):
     message: str
 
 
+class AgentSchemaCompliance(_StrictModel):
+    responses: int = Field(ge=0)
+    compliant: int = Field(ge=0)
+    invalid_output: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _partition(self) -> "AgentSchemaCompliance":
+        if self.compliant + self.invalid_output != self.responses:
+            raise ValueError("schema response counts do not partition responses")
+        return self
+
+
+class SchemaComplianceEvidence(_StrictModel):
+    responses: int = Field(ge=0)
+    compliant: int = Field(ge=0)
+    invalid_output: int = Field(ge=0)
+    by_agent: dict[str, AgentSchemaCompliance]
+
+    @model_validator(mode="after")
+    def _totals(self) -> "SchemaComplianceEvidence":
+        if (
+            self.responses != sum(item.responses for item in self.by_agent.values())
+            or self.compliant != sum(item.compliant for item in self.by_agent.values())
+            or self.invalid_output
+            != sum(item.invalid_output for item in self.by_agent.values())
+        ):
+            raise ValueError("schema evidence totals do not match per-agent counts")
+        return self
+
+
+class RawPlanEvidence(_StrictModel):
+    proposed_commands: int = Field(ge=0)
+    admitted_commands: int = Field(ge=0)
+    whitelist_rejected_commands: int = Field(ge=0)
+    validation_failed_commands: int = Field(ge=0)
+    valid_commands: int = Field(ge=0)
+    invalid_reasons: dict[str, int]
+    frozen_target_commands: int = Field(ge=0)
+    frozen_target_matches: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _bounded_counts(self) -> "RawPlanEvidence":
+        if self.admitted_commands > self.proposed_commands:
+            raise ValueError("admitted command count exceeds raw proposals")
+        if self.whitelist_rejected_commands != (
+            self.proposed_commands - self.admitted_commands
+        ):
+            raise ValueError("whitelist rejection count does not partition proposals")
+        if self.valid_commands + self.validation_failed_commands != self.admitted_commands:
+            raise ValueError("valid command count does not partition admitted commands")
+        if sum(self.invalid_reasons.values()) != (
+            self.whitelist_rejected_commands + self.validation_failed_commands
+        ) or any(count <= 0 for count in self.invalid_reasons.values()):
+            raise ValueError("invalid reason counts do not partition invalid commands")
+        if self.frozen_target_commands > self.proposed_commands:
+            raise ValueError("target command count exceeds raw proposals")
+        if self.frozen_target_matches > self.frozen_target_commands:
+            raise ValueError("target matches exceed target commands")
+        return self
+
+
 class SlotResult(_StrictModel):
-    slot_result_schema_version: Literal["1.1"] = SLOT_RESULT_SCHEMA_VERSION
+    slot_result_schema_version: Literal["1.2"] = SLOT_RESULT_SCHEMA_VERSION
     study_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     slot_id: str = Field(pattern=r"^slot-[0-9a-f]{32}$")
     status: Literal["admitted", "invalid_evidence", "failed"]
@@ -344,13 +433,23 @@ class SlotResult(_StrictModel):
     replay_equivalent: bool | None = None
     model_failure_count: int = Field(default=0, ge=0)
     model_failure_reasons: dict[str, int] = Field(default_factory=dict)
+    schema_compliance: SchemaComplianceEvidence | None = None
+    raw_plan: RawPlanEvidence | None = None
     error: SlotError | None = None
 
     @model_validator(mode="after")
     def _status_shape(self) -> "SlotResult":
         if self.status == "admitted":
-            if self.run_id is None or self.evaluation is None or self.error is not None:
-                raise ValueError("admitted slot requires run evidence and forbids error")
+            if (
+                self.run_id is None
+                or self.evaluation is None
+                or self.schema_compliance is None
+                or self.raw_plan is None
+                or self.error is not None
+            ):
+                raise ValueError(
+                    "admitted slot requires evaluation/plan evidence and forbids error"
+                )
         elif self.error is None:
             raise ValueError("non-admitted slot requires an error")
         return self
@@ -375,8 +474,41 @@ class SlotResultArtifact(_StrictModel):
         )
 
 
+class RatioMetric(_StrictModel):
+    numerator: int = Field(ge=0)
+    denominator: int = Field(ge=0)
+    rate: float | None = Field(default=None, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def _exact_ratio(self) -> "RatioMetric":
+        expected = (
+            None
+            if self.denominator == 0
+            else round(self.numerator / self.denominator, 8)
+        )
+        if self.numerator > self.denominator or self.rate != expected:
+            raise ValueError("ratio metric is internally inconsistent")
+        return self
+
+
+class CapabilityMetrics(_StrictModel):
+    schema_compliance: RatioMetric
+    schema_compliance_by_agent: dict[str, RatioMetric]
+    conditional_task_success: RatioMetric
+    live_only_success: RatioMetric
+    raw_command_validity: RatioMetric
+    frozen_target_command_match: RatioMetric
+
+
+class ReplayDiagnostics(_StrictModel):
+    evaluation_outcomes: dict[str, int]
+    usage_totals: dict[str, float | int]
+    model_failure_reasons: dict[str, int]
+    response_models: dict[str, int]
+
+
 class SubstudyResultsManifest(_StrictModel):
-    results_manifest_schema_version: Literal["1.1"] = RESULTS_MANIFEST_SCHEMA_VERSION
+    results_manifest_schema_version: Literal["1.2"] = RESULTS_MANIFEST_SCHEMA_VERSION
     study_id: str
     study_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_revision: str
@@ -390,7 +522,7 @@ class SubstudyResultsManifest(_StrictModel):
     decision_schema_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     preflight_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     billing_mode: Literal["token_plan"]
-    planned: Literal[168] = 168
+    planned: int = Field(ge=0)
     admitted: int = Field(ge=0)
     invalid_evidence: int = Field(ge=0)
     failed: int = Field(ge=0)
@@ -401,8 +533,111 @@ class SubstudyResultsManifest(_StrictModel):
     model_failures_by_kind: dict[str, int]
     model_failure_reasons: dict[str, int]
     response_models: dict[str, int]
+    replay_diagnostics: ReplayDiagnostics
+    capability_metrics: CapabilityMetrics
     scientific_gate: Literal["passed", "failed"]
     slot_result_sha256: dict[str, str]
+
+    @model_validator(mode="after")
+    def _consistent_summary(self) -> "SubstudyResultsManifest":
+        if self.admitted + self.invalid_evidence + self.failed != self.planned:
+            raise ValueError("result statuses do not partition planned slots")
+        if set(self.by_kind) != {"live", "capture", "replay"}:
+            raise ValueError("by_kind must contain the three frozen slot kinds")
+        if set(self.model_failures_by_kind) != {"live", "capture", "replay"}:
+            raise ValueError("model failure totals must contain all slot kinds")
+        counted_maps = (
+            self.evaluation_outcomes,
+            self.model_failures_by_kind,
+            self.model_failure_reasons,
+            self.response_models,
+            self.replay_diagnostics.evaluation_outcomes,
+            self.replay_diagnostics.model_failure_reasons,
+            self.replay_diagnostics.response_models,
+        )
+        if any(
+            not isinstance(count, int) or isinstance(count, bool) or count < 0
+            for counts in counted_maps
+            for count in counts.values()
+        ):
+            raise ValueError("summary count maps must contain non-negative integers")
+        for kind, counts in self.by_kind.items():
+            if set(counts) != {"planned", "admitted", "invalid_evidence", "failed"}:
+                raise ValueError(f"by_kind counts are incomplete for {kind}")
+            if any(
+                not isinstance(count, int)
+                or isinstance(count, bool)
+                or count < 0
+                for count in counts.values()
+            ):
+                raise ValueError(f"by_kind counts are invalid for {kind}")
+            if (
+                counts["admitted"]
+                + counts["invalid_evidence"]
+                + counts["failed"]
+                != counts["planned"]
+            ):
+                raise ValueError(f"by_kind counts do not partition {kind}")
+        if sum(counts["planned"] for counts in self.by_kind.values()) != self.planned:
+            raise ValueError("by_kind planned counts differ from the result total")
+        for status in ("admitted", "invalid_evidence", "failed"):
+            if sum(counts[status] for counts in self.by_kind.values()) != getattr(
+                self,
+                status,
+            ):
+                raise ValueError(f"by_kind {status} differs from the result total")
+        source_admitted = (
+            self.by_kind["live"]["admitted"]
+            + self.by_kind["capture"]["admitted"]
+        )
+        if sum(self.evaluation_outcomes.values()) != source_admitted:
+            raise ValueError("source evaluation outcomes differ from admitted slots")
+        if (
+            sum(self.replay_diagnostics.evaluation_outcomes.values())
+            != self.by_kind["replay"]["admitted"]
+        ):
+            raise ValueError("replay outcomes differ from admitted replay slots")
+        if sum(self.model_failure_reasons.values()) != (
+            self.model_failures_by_kind["live"]
+            + self.model_failures_by_kind["capture"]
+        ):
+            raise ValueError("source model failure reasons do not match by-kind totals")
+        if sum(self.replay_diagnostics.model_failure_reasons.values()) != (
+            self.model_failures_by_kind["replay"]
+        ):
+            raise ValueError("replay model failure reasons do not match by-kind totals")
+        if sum(self.response_models.values()) != int(
+            self.usage_totals.get("billable_calls", -1)
+        ):
+            raise ValueError("source response models differ from billable calls")
+        if self.replay_diagnostics.usage_totals.get("billable_calls") != 0:
+            raise ValueError("replay diagnostics contain billable calls")
+        if (
+            len(self.slot_result_sha256) != self.planned
+            or any(_SLOT_ID_RE.fullmatch(slot_id) is None for slot_id in self.slot_result_sha256)
+            or any(
+                not isinstance(digest, str)
+                or _SHA256_RE.fullmatch(digest) is None
+                for digest in self.slot_result_sha256.values()
+            )
+        ):
+            raise ValueError("slot result hashes do not cover the planned slots")
+        expected_pass = (
+            self.planned == EXPECTED_SLOT_COUNT
+            and self.admitted == EXPECTED_SLOT_COUNT
+            and self.invalid_evidence == 0
+            and self.failed == 0
+            and self.by_kind["live"]["planned"] == 72
+            and self.by_kind["capture"]["planned"] == 24
+            and self.by_kind["replay"]["planned"] == 72
+            and self.by_kind["live"]["admitted"] == 72
+            and self.by_kind["capture"]["admitted"] == 24
+            and self.by_kind["replay"]["admitted"] == 72
+            and self.replay_equivalent == 72
+        )
+        if (self.scientific_gate == "passed") is not expected_pass:
+            raise ValueError("scientific gate disagrees with frozen admission rules")
+        return self
 
 
 class SealedSubstudyResults(_StrictModel):
@@ -620,19 +855,54 @@ async def preflight_llm_substudy(
         raise ValueError("source revision drift: resolve the substudy again")
     provider = provider_factory(study)
     _validate_live_provider(study, provider)
-    decision = await provider.generate_decision(
-        LLMDecisionRequest(
-            agent_id="aura_pr21_preflight",
-            agent_name="Aura PR21 Preflight",
+    role_requests = {
+        "home_orchestrator": LLMDecisionRequest(
+            decision_role="home_orchestrator",
+            agent_id=HOME_ORCHESTRATOR_AGENT_ID,
+            agent_name="Home Orchestrator Preflight",
             root_event_type="system.llm_preflight",
             world_summary=(
-                "Validate structured smart-home planning access. No device action is required."
+                "Classify a routine occupied-room comfort event. "
+                "No device command is permitted at the orchestration layer."
             ),
+        ),
+        "domain_agent": LLMDecisionRequest(
+            agent_id="lighting_agent_preflight",
+            agent_name="Lighting Agent Preflight",
+            root_event_type="system.llm_preflight",
+            world_summary=(
+                "Validate a domain-agent planning response for an occupied room."
+            ),
+            available_devices=[
+                {
+                    "device_id": "light_preflight_01",
+                    "room": "preflight_room",
+                    "type": "light",
+                    "state": {"power": False},
+                }
+            ],
+            allowed_commands=[
+                {"device_id": "light_preflight_01", "property": "power"}
+            ],
+        ),
+    }
+    role_checks: dict[str, PreflightRoleCheck] = {}
+    for role, request in role_requests.items():
+        decision = await provider.generate_decision(request)
+        usage = _usage_payload(provider)
+        if usage["input_tokens"] + usage["output_tokens"] <= 0:
+            raise ValueError(
+                f"preflight {role} response returned no usable token telemetry"
+            )
+        role_checks[role] = PreflightRoleCheck(
+            agent_id=request.agent_id,
+            response_model=str(getattr(provider, "last_response_model", "") or ""),
+            decision_transport=str(
+                getattr(provider, "last_decision_transport", "")
+            ),
+            response_sha256=sha256_json(decision.model_dump(mode="json")),
+            **usage,
         )
-    )
-    usage = _usage_payload(provider)
-    if usage["input_tokens"] + usage["output_tokens"] <= 0:
-        raise ValueError("preflight provider returned no usable token telemetry")
     receipt = PreflightReceipt(
         study_hash=study.study_hash,
         source_revision=study.source_revision,
@@ -646,10 +916,9 @@ async def preflight_llm_substudy(
         decision_schema_sha256=str(
             getattr(provider, "decision_schema_sha256", "")
         ),
-        response_model=str(getattr(provider, "last_response_model", "") or ""),
-        decision_transport=str(getattr(provider, "last_decision_transport", "")),
-        response_sha256=sha256_json(decision.model_dump(mode="json")),
-        **usage,
+        role_checks=role_checks,
+        input_tokens=sum(check.input_tokens for check in role_checks.values()),
+        output_tokens=sum(check.output_tokens for check in role_checks.values()),
     )
     sealed = SealedPreflightReceipt(
         receipt=receipt,
@@ -683,11 +952,21 @@ def validate_preflight_receipt(
         or receipt.timeout_ms != study.timeout_ms
         or receipt.strict_output is not study.strict_output
         or receipt.decision_schema_sha256 != study.decision_schema_sha256
-        or receipt.response_model != study.model
         or receipt.input_tokens + receipt.output_tokens <= 0
-        or receipt.usage_source == "missing"
     ):
         raise ValueError("preflight receipt does not admit this frozen study")
+    for role, expected_agent_id in {
+        "home_orchestrator": HOME_ORCHESTRATOR_AGENT_ID,
+        "domain_agent": "lighting_agent_preflight",
+    }.items():
+        check = receipt.role_checks[role]
+        if (
+            check.agent_id != expected_agent_id
+            or check.response_model != study.model
+            or check.input_tokens + check.output_tokens <= 0
+            or check.usage_source == "missing"
+        ):
+            raise ValueError("preflight role check does not admit this frozen study")
     return sealed
 
 
@@ -978,6 +1257,9 @@ class LLMSubstudyRunner:
         source_run_id: str | None,
     ) -> SlotResult:
         instance = self.instances[slot.instance_id]
+        scenario = load_scenario_file(
+            _REPOSITORY_ROOT / instance.scenario_reference
+        )
         metadata = read_run_metadata(run_id, root=self.runs_root)
         verify_finalized_event_log(run_id, metadata=metadata, root=self.runs_root)
         events, _ = read_run_events(run_id, root=self.runs_root, verify_integrity=True)
@@ -1033,6 +1315,9 @@ class LLMSubstudyRunner:
             reasons = sorted({str(event.get("data", {}).get("reason")) for event in fallbacks})
             raise ValueError(f"LLM fallback disqualifies evidence: {reasons}")
         model_failure_reasons = _validate_model_failure_noops(events)
+        schema_compliance = _schema_compliance_evidence(events)
+        if schema_compliance.invalid_output != sum(model_failure_reasons.values()):
+            raise ValueError("schema compliance evidence differs from failure no-ops")
         decisions = [event for event in events if event.get("event_type") == "reasoning.coordination_decision"]
         if not decisions or any(
             event.get("data", {}).get("runtime_profile") != "aura"
@@ -1063,6 +1348,8 @@ class LLMSubstudyRunner:
                 self.study.model: usage.get("billable_calls")
             }:
                 raise ValueError("paid run response model evidence is missing or mismatched")
+            if schema_compliance.responses != usage.get("billable_calls"):
+                raise ValueError("schema response evidence differs from paid call count")
             used_prices = cost_payload.get("pricing", {}).get("used", [])
             matching_prices = [
                 item.get("price", {})
@@ -1084,8 +1371,11 @@ class LLMSubstudyRunner:
                 for price in matching_prices
             ):
                 raise ValueError("run pricing evidence differs from the frozen snapshot")
-        elif usage.get("billable_calls") != 0:
-            raise ValueError("replay made a billable call")
+        else:
+            if usage.get("billable_calls") != 0:
+                raise ValueError("replay made a billable call")
+            if schema_compliance.responses != usage.get("calls"):
+                raise ValueError("replay schema evidence differs from replay call count")
         recording: dict[str, Any] | None = None
         equivalent: bool | None = None
         if slot.kind == "capture":
@@ -1136,6 +1426,10 @@ class LLMSubstudyRunner:
         if report.outcome is EvalOutcome.ERROR:
             raise ValueError(f"evaluation error: {report.failure_reasons}")
         evaluation = report.to_dict()
+        raw_plan = _raw_plan_evidence(
+            events,
+            scenario=scenario,
+        )
         if slot.kind == "replay":
             source_report = evaluate_run(
                 source_run_id,
@@ -1157,6 +1451,8 @@ class LLMSubstudyRunner:
             replay_equivalent=equivalent,
             model_failure_count=sum(model_failure_reasons.values()),
             model_failure_reasons=model_failure_reasons,
+            schema_compliance=schema_compliance,
+            raw_plan=raw_plan,
         )
 
     def validate_result(self, slot: SubstudySlot, result: SlotResult) -> bool:
@@ -1284,6 +1580,180 @@ def _validate_model_failure_noops(
     return counts
 
 
+def _schema_compliance_evidence(
+    events: Sequence[Mapping[str, Any]],
+) -> SchemaComplianceEvidence:
+    """Count exact-schema responses from their sealed reasoning events."""
+
+    attempts: dict[str, int] = {}
+    invalid: dict[str, int] = {}
+    for event in events:
+        event_type = event.get("event_type")
+        source = str(event.get("source") or "")
+        data = event.get("data")
+        is_attempt = event_type == "reasoning.task_decomposition" and (
+            source == HOME_ORCHESTRATOR_AGENT_ID
+        )
+        if event_type == "reasoning.execution_plan" and isinstance(data, Mapping):
+            is_attempt = data.get("execution_mode") in {
+                "llm",
+                "provider_failure_noop",
+            }
+        if is_attempt:
+            attempts[source] = attempts.get(source, 0) + 1
+        if event_type == "reasoning.provider_failure_noop":
+            if not isinstance(data, Mapping) or data.get("reason") != "invalid_output":
+                continue
+            invalid[source] = invalid.get(source, 0) + 1
+
+    by_agent: dict[str, AgentSchemaCompliance] = {}
+    for agent_id in sorted(set(attempts) | set(invalid)):
+        responses = attempts.get(agent_id, 0)
+        invalid_output = invalid.get(agent_id, 0)
+        if invalid_output > responses:
+            raise ValueError(
+                f"schema failures exceed response attempts for {agent_id}"
+            )
+        by_agent[agent_id] = AgentSchemaCompliance(
+            responses=responses,
+            compliant=responses - invalid_output,
+            invalid_output=invalid_output,
+        )
+    return SchemaComplianceEvidence(
+        responses=sum(item.responses for item in by_agent.values()),
+        compliant=sum(item.compliant for item in by_agent.values()),
+        invalid_output=sum(item.invalid_output for item in by_agent.values()),
+        by_agent=by_agent,
+    )
+
+
+def _raw_plan_evidence(
+    events: Sequence[Mapping[str, Any]],
+    *,
+    scenario: Any,
+) -> RawPlanEvidence:
+    """Diagnose raw domain proposals without changing benchmark pass/fail.
+
+    Target matching is command-level: it asks whether a command aimed at a
+    frozen target field chose a value accepted by that phase's contract.  It
+    intentionally does not claim that omitted commands are unreasonable.
+    """
+
+    injection_seq = next(
+        (
+            event.get("seq")
+            for event in events
+            if event.get("event_type") == "benchmark.perturbation_injected"
+            and isinstance(event.get("seq"), int)
+        ),
+        None,
+    )
+
+    base_targets = {
+        (effect.device_id, path): expected
+        for effect in scenario.expected_device_effects
+        for path, expected in effect.expected.items()
+    }
+    intervention = getattr(scenario, "intervention_response", None)
+    intervention_targets = {
+        (effect.device_id, path): expected
+        for effect in (
+            intervention.expected_device_effects
+            if intervention is not None
+            else []
+        )
+        for path, expected in effect.expected.items()
+    }
+
+    proposed = 0
+    admitted = 0
+    whitelist_rejected = 0
+    validation_failed = 0
+    valid = 0
+    invalid_reasons: dict[str, int] = {}
+    target_commands = 0
+    target_matches = 0
+    for event in events:
+        if event.get("event_type") != "reasoning.execution_plan":
+            continue
+        data = event.get("data")
+        if not isinstance(data, Mapping) or data.get("execution_mode") != "llm":
+            continue
+        raw_commands = data.get("raw_commands")
+        candidate_commands = data.get("candidate_commands")
+        assessments = data.get("raw_command_assessments")
+        if (
+            not isinstance(raw_commands, list)
+            or not isinstance(candidate_commands, list)
+            or not isinstance(assessments, list)
+            or len(assessments) != len(raw_commands)
+            or len(raw_commands) > MAX_PROPOSED_COMMANDS
+            or len(candidate_commands) > MAX_PROPOSED_COMMANDS
+        ):
+            raise ValueError("execution plan lacks raw/admitted command evidence")
+        proposed += len(raw_commands)
+        event_admitted = 0
+        for index, assessment in enumerate(assessments):
+            if not isinstance(assessment, Mapping):
+                raise ValueError("raw command assessment must be an object")
+            if assessment.get("command_index") != index:
+                raise ValueError("raw command assessment indices are not canonical")
+            admitted_by_agent = assessment.get("admitted_by_agent")
+            valid_at_plan_time = assessment.get("valid_at_plan_time")
+            failure_code = assessment.get("failure_code")
+            if not isinstance(admitted_by_agent, bool) or not isinstance(
+                valid_at_plan_time,
+                bool,
+            ):
+                raise ValueError("raw command assessment flags must be booleans")
+            if valid_at_plan_time != (admitted_by_agent and failure_code is None):
+                raise ValueError("raw command assessment outcome is inconsistent")
+            event_admitted += int(admitted_by_agent)
+            valid += int(valid_at_plan_time)
+            if failure_code is not None:
+                if not isinstance(failure_code, str) or not failure_code:
+                    raise ValueError("raw command failure code must be a string")
+                invalid_reasons[failure_code] = invalid_reasons.get(failure_code, 0) + 1
+                if admitted_by_agent:
+                    validation_failed += 1
+                elif failure_code == "agent_whitelist_rejected":
+                    whitelist_rejected += 1
+                else:
+                    raise ValueError("non-admitted command has an invalid rejection code")
+        if event_admitted != len(candidate_commands):
+            raise ValueError("assessment admission differs from candidate commands")
+        admitted += event_admitted
+        seq = event.get("seq")
+        after_intervention = (
+            isinstance(seq, int)
+            and injection_seq is not None
+            and seq > injection_seq
+        )
+        targets = intervention_targets if after_intervention else base_targets
+        for command in raw_commands:
+            if not isinstance(command, Mapping):
+                raise ValueError("raw command evidence must contain objects")
+            target = targets.get(
+                (str(command.get("device_id") or ""), str(command.get("property") or ""))
+            )
+            if target is None:
+                continue
+            target_commands += 1
+            if target.matches(command.get("value")):
+                target_matches += 1
+
+    return RawPlanEvidence(
+        proposed_commands=proposed,
+        admitted_commands=admitted,
+        whitelist_rejected_commands=whitelist_rejected,
+        validation_failed_commands=validation_failed,
+        valid_commands=valid,
+        invalid_reasons=dict(sorted(invalid_reasons.items())),
+        frozen_target_commands=target_commands,
+        frozen_target_matches=target_matches,
+    )
+
+
 def _replay_equivalence_trace(events: Sequence[Mapping[str, Any]]) -> str:
     """Compare semantics while retaining visible capture/replay audit labels.
 
@@ -1320,6 +1790,14 @@ def _replay_equivalence_trace(events: Sequence[Mapping[str, Any]]) -> str:
     return canonical_trace_text(normalize(event) for event in events)
 
 
+def _ratio(numerator: int, denominator: int) -> RatioMetric:
+    return RatioMetric(
+        numerator=numerator,
+        denominator=denominator,
+        rate=(None if denominator == 0 else round(numerator / denominator, 8)),
+    )
+
+
 def summarize_llm_substudy(
     study: ResolvedLLMSubstudy,
     *,
@@ -1347,10 +1825,30 @@ def summarize_llm_substudy(
         "output_tokens": 0,
         "cost_usd": 0.0,
     }
+    replay_outcomes: dict[str, int] = {}
+    replay_usage_totals: dict[str, float | int] = {
+        "calls": 0,
+        "billable_calls": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cost_usd": 0.0,
+    }
     replay_equivalent = 0
     model_failures_by_kind = {kind: 0 for kind in ("live", "capture", "replay")}
     model_failure_reasons: dict[str, int] = {}
+    replay_model_failure_reasons: dict[str, int] = {}
     response_models: dict[str, int] = {}
+    replay_response_models: dict[str, int] = {}
+    schema_responses = 0
+    schema_compliant = 0
+    schema_by_agent: dict[str, list[int]] = {}
+    conditional_eligible = 0
+    conditional_passed = 0
+    live_passed = 0
+    raw_proposed = 0
+    raw_valid = 0
+    raw_target_commands = 0
+    raw_target_matches = 0
     result_hashes: dict[str, str] = {}
     for slot in study.slots:
         by_kind[slot.kind]["planned"] += 1
@@ -1363,18 +1861,75 @@ def summarize_llm_substudy(
         result_hashes[slot.slot_id] = artifact.seal.sha256
         if result.evaluation is not None:
             outcome = str(result.evaluation.get("outcome"))
-            outcomes[outcome] = outcomes.get(outcome, 0) + 1
+            target_outcomes = replay_outcomes if slot.kind == "replay" else outcomes
+            target_outcomes[outcome] = target_outcomes.get(outcome, 0) + 1
+            if slot.kind == "live" and outcome == "pass":
+                live_passed += 1
         if result.usage is not None:
-            for key in usage_totals:
-                usage_totals[key] += result.usage.get(key, 0)
+            target_usage = replay_usage_totals if slot.kind == "replay" else usage_totals
+            for key in target_usage:
+                target_usage[key] += result.usage.get(key, 0)
+            target_models = (
+                replay_response_models
+                if slot.kind == "replay"
+                else response_models
+            )
             for model, count in result.usage.get("response_models", {}).items():
-                response_models[model] = response_models.get(model, 0) + int(count)
+                target_models[model] = target_models.get(model, 0) + int(count)
         replay_equivalent += int(result.replay_equivalent is True)
         model_failures_by_kind[slot.kind] += result.model_failure_count
+        target_failures = (
+            replay_model_failure_reasons
+            if slot.kind == "replay"
+            else model_failure_reasons
+        )
         for reason, count in result.model_failure_reasons.items():
-            model_failure_reasons[reason] = model_failure_reasons.get(reason, 0) + count
+            target_failures[reason] = target_failures.get(reason, 0) + count
+        if slot.kind in {"live", "capture"} and result.status == "admitted":
+            if result.schema_compliance is None or result.raw_plan is None:
+                raise ValueError("source slot is missing capability evidence")
+            schema_responses += result.schema_compliance.responses
+            schema_compliant += result.schema_compliance.compliant
+            for agent_id, evidence in result.schema_compliance.by_agent.items():
+                counts = schema_by_agent.setdefault(agent_id, [0, 0])
+                counts[0] += evidence.compliant
+                counts[1] += evidence.responses
+            if result.schema_compliance.invalid_output == 0:
+                conditional_eligible += 1
+                conditional_passed += int(
+                    result.evaluation is not None
+                    and result.evaluation.get("outcome") == "pass"
+                )
+            raw_proposed += result.raw_plan.proposed_commands
+            raw_valid += result.raw_plan.valid_commands
+            raw_target_commands += result.raw_plan.frozen_target_commands
+            raw_target_matches += result.raw_plan.frozen_target_matches
     usage_totals["cost_usd"] = round(float(usage_totals["cost_usd"]), 8)
+    replay_usage_totals["cost_usd"] = round(
+        float(replay_usage_totals["cost_usd"]),
+        8,
+    )
     passed = status_counts == {"admitted": EXPECTED_SLOT_COUNT, "invalid_evidence": 0, "failed": 0} and replay_equivalent == 72
+    capability_metrics = CapabilityMetrics(
+        schema_compliance=_ratio(schema_compliant, schema_responses),
+        schema_compliance_by_agent={
+            agent_id: _ratio(counts[0], counts[1])
+            for agent_id, counts in sorted(schema_by_agent.items())
+        },
+        conditional_task_success=_ratio(
+            conditional_passed,
+            conditional_eligible,
+        ),
+        live_only_success=_ratio(
+            live_passed,
+            by_kind["live"]["planned"],
+        ),
+        raw_command_validity=_ratio(raw_valid, raw_proposed),
+        frozen_target_command_match=_ratio(
+            raw_target_matches,
+            raw_target_commands,
+        ),
+    )
     results = SubstudyResultsManifest(
         study_id=study.study_id,
         study_hash=study.study_hash,
@@ -1389,6 +1944,7 @@ def summarize_llm_substudy(
         decision_schema_sha256=study.decision_schema_sha256,
         preflight_sha256=preflight.seal.sha256,
         billing_mode=study.billing_mode,
+        planned=len(study.slots),
         **status_counts,
         by_kind=by_kind,
         evaluation_outcomes=outcomes,
@@ -1397,6 +1953,13 @@ def summarize_llm_substudy(
         model_failures_by_kind=model_failures_by_kind,
         model_failure_reasons=model_failure_reasons,
         response_models=response_models,
+        replay_diagnostics=ReplayDiagnostics(
+            evaluation_outcomes=replay_outcomes,
+            usage_totals=replay_usage_totals,
+            model_failure_reasons=replay_model_failure_reasons,
+            response_models=replay_response_models,
+        ),
+        capability_metrics=capability_metrics,
         scientific_gate="passed" if passed else "failed",
         slot_result_sha256=result_hashes,
     )

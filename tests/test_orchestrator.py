@@ -212,6 +212,7 @@ async def test_llm_intent_refines_rule_intent_when_mocked_provider_configured():
 
     assert len(provider.requests) == 1
     assert provider.requests[0].agent_id == DEFAULT_ORCHESTRATOR_ID
+    assert provider.requests[0].decision_role == "home_orchestrator"
     # LLM 只精炼 intent 与 confidence，不发命令
     assert decision.plan.intent == "welcome the resident home with warm evening lighting"
     assert decision.plan.confidence_source in {ConfidenceSource.LLM, ConfidenceSource.BLENDED}
@@ -269,9 +270,16 @@ async def test_llm_is_not_called_in_mocked_mode():
     assert decision.plan.confidence_source is ConfidenceSource.RULE_BASED
 
 
-def test_intent_schema_is_small_and_domain_constrained():
-    assert ORCHESTRATOR_INTENT_SCHEMA["required"] == ["intent", "domain", "confidence", "explanation"]
-    assert "safety" in ORCHESTRATOR_INTENT_SCHEMA["properties"]["domain"]["enum"]
+def test_intent_schema_is_command_free_and_exact():
+    assert ORCHESTRATOR_INTENT_SCHEMA["required"] == [
+        "intent",
+        "confidence",
+        "task_steps",
+        "explanation",
+        "needs_coordination",
+    ]
+    assert "proposed_commands" not in ORCHESTRATOR_INTENT_SCHEMA["properties"]
+    assert ORCHESTRATOR_INTENT_SCHEMA["additionalProperties"] is False
 
 
 # ---------------------------------------------------- 3. confidence 的真实消费者

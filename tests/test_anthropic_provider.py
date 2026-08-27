@@ -33,6 +33,16 @@ def _request() -> LLMDecisionRequest:
     )
 
 
+def _orchestrator_request() -> LLMDecisionRequest:
+    return LLMDecisionRequest(
+        decision_role="home_orchestrator",
+        agent_id="home_orchestrator",
+        agent_name="Home Orchestrator",
+        root_event_type="user.enters_room",
+        world_summary="occupied_rooms=living_room; candidate_domains=comfort,safety",
+    )
+
+
 @pytest.mark.anyio
 async def test_anthropic_provider_parses_messages_payload_and_code_fence_json():
     def handler(request: httpx.Request) -> httpx.Response:
@@ -138,6 +148,214 @@ async def test_anthropic_provider_prefers_structured_tool_input():
     assert decision.proposed_commands[0].value == 70
     assert provider.last_usage == {"input_tokens": 120, "output_tokens": 35}
     assert provider.last_decision_transport == "tool_use"
+
+
+@pytest.mark.anyio
+async def test_strict_orchestrator_uses_command_free_schema():
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        tool = payload["tools"][0]
+        assert tool["name"] == "submit_orchestrator_decision"
+        assert tool["input_schema"]["required"] == [
+            "intent",
+            "confidence",
+            "task_steps",
+            "explanation",
+            "needs_coordination",
+        ]
+        assert "proposed_commands" not in tool["input_schema"]["properties"]
+        return httpx.Response(
+            200,
+            json={
+                "model": "MiniMax-M3",
+                "usage": {"input_tokens": 80, "output_tokens": 24},
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "submit_orchestrator_decision",
+                        "id": "call_orchestrator",
+                        "input": {
+                            "intent": "provide occupied-room comfort",
+                            "confidence": 0.9,
+                            "task_steps": ["coordinate comfort agents"],
+                            "explanation": "The living room is occupied.",
+                            "needs_coordination": True,
+                        },
+                    }
+                ],
+            },
+        )
+
+    provider = AnthropicCompatibleProvider(
+        api_key="test-key",
+        model="MiniMax-M3",
+        strict_output=True,
+        base_url="https://api.minimax.io/anthropic",
+        transport=httpx.MockTransport(handler),
+    )
+
+    decision = await provider.generate_decision(
+        _orchestrator_request().model_copy(
+            update={"agent_id": "custom_orchestrator"}
+        )
+    )
+
+    assert decision.intent == "provide occupied-room comfort"
+    assert decision.proposed_commands == []
+
+
+@pytest.mark.parametrize("content", [None, ["bad-block"]])
+@pytest.mark.anyio
+async def test_strict_paid_malformed_content_is_invalid_output(content):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "model": "MiniMax-M3",
+                "usage": {"input_tokens": 80, "output_tokens": 24},
+                "content": content,
+            },
+        )
+
+    provider = AnthropicCompatibleProvider(
+        api_key="test-key",
+        model="MiniMax-M3",
+        strict_output=True,
+        base_url="https://api.minimax.io/anthropic",
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(LLMProviderError) as exc_info:
+        await provider.generate_decision(_orchestrator_request())
+
+    assert exc_info.value.reason == "invalid_output"
+    assert provider.last_usage == {"input_tokens": 80, "output_tokens": 24}
+    assert provider.last_response_model == "MiniMax-M3"
+    assert provider.last_decision_transport == "empty"
+
+
+@pytest.mark.anyio
+async def test_strict_model_mismatch_does_not_expose_reported_model():
+    reported_model = "attacker-controlled-resident-secret"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "model": reported_model,
+                "usage": {"input_tokens": 80, "output_tokens": 24},
+                "content": [],
+            },
+        )
+
+    provider = AnthropicCompatibleProvider(
+        api_key="test-key",
+        model="MiniMax-M3",
+        strict_output=True,
+        base_url="https://api.minimax.io/anthropic",
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(LLMProviderError) as exc_info:
+        await provider.generate_decision(_orchestrator_request())
+
+    assert exc_info.value.reason == "provider_error"
+    assert reported_model not in str(exc_info.value)
+    assert provider.last_response_model == "__model_mismatch__"
+
+
+@pytest.mark.anyio
+async def test_normal_live_orchestrator_accepts_its_role_specific_tool():
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        assert payload["tools"][0]["name"] == "submit_orchestrator_decision"
+        return httpx.Response(
+            200,
+            json={
+                "model": "MiniMax-M3",
+                "usage": {"input_tokens": 80, "output_tokens": 24},
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "submit_orchestrator_decision",
+                        "id": "call_orchestrator",
+                        "input": {
+                            "intent": "provide occupied-room comfort",
+                            "confidence": 0.9,
+                            "task_steps": ["coordinate comfort agents"],
+                            "explanation": "The living room is occupied.",
+                            "needs_coordination": True,
+                        },
+                    }
+                ],
+            },
+        )
+
+    provider = AnthropicCompatibleProvider(
+        api_key="test-key",
+        model="MiniMax-M3",
+        strict_output=False,
+        base_url="https://api.minimax.io/anthropic",
+        transport=httpx.MockTransport(handler),
+    )
+
+    decision = await provider.generate_decision(_orchestrator_request())
+
+    assert decision.intent == "provide occupied-room comfort"
+    assert decision.proposed_commands == []
+
+
+@pytest.mark.parametrize(
+    "tool_input",
+    [
+        {
+            "intent": "provide comfort",
+            "confidence": 0.9,
+            "task_steps": ["coordinate comfort agents"],
+            "explanation": "The room is occupied.",
+        },
+        {
+            "intent": "provide comfort",
+            "confidence": 0.9,
+            "task_steps": ["coordinate comfort agents"],
+            "explanation": "The room is occupied.",
+            "needs_coordination": True,
+            "proposed_commands": [],
+        },
+    ],
+    ids=["missing-field", "extra-command-field"],
+)
+@pytest.mark.anyio
+async def test_strict_orchestrator_rejects_non_exact_payload(tool_input):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "model": "MiniMax-M3",
+                "usage": {"input_tokens": 80, "output_tokens": 24},
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "submit_orchestrator_decision",
+                        "id": "call_orchestrator",
+                        "input": tool_input,
+                    }
+                ],
+            },
+        )
+
+    provider = AnthropicCompatibleProvider(
+        api_key="test-key",
+        model="MiniMax-M3",
+        strict_output=True,
+        base_url="https://api.minimax.io/anthropic",
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(LLMProviderError) as exc_info:
+        await provider.generate_decision(_orchestrator_request())
+
+    assert exc_info.value.reason == "invalid_output"
 
 
 @pytest.mark.anyio
@@ -447,7 +665,7 @@ async def test_anthropic_provider_normalizes_percent_confidence():
 
 
 @pytest.mark.anyio
-async def test_anthropic_provider_invalid_output_exposes_preview():
+async def test_anthropic_provider_invalid_output_does_not_expose_response_text():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
@@ -471,4 +689,4 @@ async def test_anthropic_provider_invalid_output_exposes_preview():
         await provider.generate_decision(_request())
 
     assert exc_info.value.reason == "invalid_output"
-    assert "Sorry, I cannot follow" in str(exc_info.value)
+    assert "Sorry, I cannot follow" not in str(exc_info.value)

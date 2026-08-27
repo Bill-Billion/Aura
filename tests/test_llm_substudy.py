@@ -6,9 +6,9 @@ from pathlib import Path
 import pytest
 
 from backend.agents.llm import (
-    AGENT_DECISION_SCHEMA_SHA256,
     LLMProvider,
     LLMProviderError,
+    STRICT_DECISION_SCHEMA_SET_SHA256,
 )
 from backend.agents.types import AgentCommandProposal, AgentLLMDecision
 from backend.engine.run_manager import read_source_revision
@@ -16,10 +16,12 @@ from backend.experiments.llm_substudy import (
     LLMSubstudyRunner,
     MINIMAX_M3_ENDPOINT,
     PreflightReceipt,
+    RawPlanEvidence,
     ResolvedLLMSubstudy,
     SlotError,
     SlotResult,
     SlotResultArtifact,
+    SubstudyResultsManifest,
     preflight_llm_substudy,
     read_slot_result,
     read_resolved_llm_substudy,
@@ -47,7 +49,7 @@ class _StubM3Provider(LLMProvider):
     anthropic_version = "2023-06-01"
     timeout_ms = 45000
     strict_output = True
-    decision_schema_sha256 = AGENT_DECISION_SCHEMA_SHA256
+    decision_schema_sha256 = STRICT_DECISION_SCHEMA_SET_SHA256
 
     def __init__(self) -> None:
         self.calls = 0
@@ -259,10 +261,14 @@ async def test_preflight_is_sealed_and_bound_to_exact_provider_model(tmp_path):
     assert receipt.provider == "anthropic_compatible"
     assert receipt.model == "MiniMax-M3"
     assert receipt.endpoint == MINIMAX_M3_ENDPOINT
-    assert receipt.response_model == "MiniMax-M3"
-    assert receipt.decision_transport == "tool_use"
-    assert receipt.input_tokens == 40
-    assert provider.calls == 1
+    assert set(receipt.role_checks) == {"home_orchestrator", "domain_agent"}
+    assert all(
+        check.response_model == "MiniMax-M3"
+        and check.decision_transport == "tool_use"
+        for check in receipt.role_checks.values()
+    )
+    assert receipt.input_tokens == 80
+    assert provider.calls == 2
 
 
 @pytest.mark.anyio
@@ -391,6 +397,12 @@ async def test_invalid_model_output_is_admitted_as_strict_noop_not_rule_fallback
     result = read_slot_result(tmp_path, slot.slot_id).result
     assert result.model_failure_count > 0
     assert result.model_failure_reasons == {"invalid_output": result.model_failure_count}
+    assert result.schema_compliance.invalid_output == result.model_failure_count
+    assert (
+        result.schema_compliance.compliant
+        + result.schema_compliance.invalid_output
+        == result.schema_compliance.responses
+    )
     assert result.evaluation["outcome"] == "fail"
     events = (tmp_path / "runs" / result.run_id / "events.jsonl").read_text(
         encoding="utf-8"
@@ -454,6 +466,37 @@ async def test_one_instance_runs_3_live_capture_and_3_offline_replays_resumably(
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     preflight = validate_preflight_receipt(study, output_dir=tmp_path)
     assert summary["results"]["preflight_sha256"] == preflight.seal.sha256
+    source_results = [
+        read_slot_result(tmp_path, slot.slot_id).result
+        for slot in slots
+        if slot.kind in {"live", "capture"}
+    ]
+    capability = summary["results"]["capability_metrics"]
+    assert sum(summary["results"]["evaluation_outcomes"].values()) == 4
+    assert sum(
+        summary["results"]["replay_diagnostics"]["evaluation_outcomes"].values()
+    ) == 3
+    assert summary["results"]["usage_totals"]["calls"] == sum(
+        result.usage["calls"] for result in source_results
+    )
+    assert capability["schema_compliance"]["denominator"] == sum(
+        result.usage["billable_calls"] for result in source_results
+    )
+    assert capability["schema_compliance"]["rate"] == 1.0
+    assert capability["conditional_task_success"]["denominator"] == 4
+    assert capability["live_only_success"]["denominator"] == 3
+    assert capability["raw_command_validity"]["rate"] == 1.0
+    assert capability["frozen_target_command_match"]["rate"] == 1.0
+
+    contradictory = dict(summary["results"])
+    contradictory["scientific_gate"] = "passed"
+    with pytest.raises(ValueError):
+        SubstudyResultsManifest.model_validate(contradictory)
+
+    raw_plan = source_results[0].raw_plan.model_dump(mode="json")
+    raw_plan["frozen_target_commands"] = raw_plan["proposed_commands"] + 1
+    with pytest.raises(ValueError):
+        RawPlanEvidence.model_validate(raw_plan)
 
 
 @pytest.mark.anyio

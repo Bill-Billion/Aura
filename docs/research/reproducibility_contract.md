@@ -111,7 +111,12 @@ matrix_version / cell_id / scenario_id / seed / repetition / source_revision
 PR21 的 Option B 子研究固定为 `anthropic_compatible / MiniMax-M3`，并把
 `https://api.minimaxi.com/anthropic` 作为唯一允许的 HTTPS endpoint 冻结进研究契约、
 预检回执和 paid-run provenance；协议版本、`max_tokens=1200`、实际超时、严格输出模式
-及 decision schema SHA-256 同样进入冻结契约，任何环境漂移都会在网络调用前被拒绝。
+及角色化 decision schema bundle SHA-256 同样进入冻结契约，任何环境漂移都会在网络调用前被拒绝。
+bundle 中 `home_orchestrator` 的严格契约只有
+`intent/confidence/task_steps/explanation/needs_coordination` 五个字段，明确禁止设备命令；
+域 Agent 仍使用包含 `proposed_commands` 的六字段契约。两者都禁止字段修复、丢弃和补全。
+角色由 canonical request 的显式 `decision_role` 决定，而不是从 Agent ID 猜测；因此录制契约
+升级为 `aura.llm_recording.v3`，旧 v1/v2 工件会被明确拒绝并要求重新录制，不会静默 replay miss。
 严格模式还要求 provider 回包中的实际 `model` 字段逐次等于 `MiniMax-M3`，并把实际模型
 写入 preflight、成本台账、capture recording 与最终汇总；缺失或上游降级都会 fail closed。
 实验条件固定为
@@ -143,8 +148,9 @@ python -m backend.experiments summarize-llm-substudy \
   --output <substudy-root>
 ```
 
-预检只发一条结构化请求，并把 provider、model、source revision、token usage 与响应
-摘要写入 sealed `preflight.json`；同时记录实际使用的 `tool_use` 或 `text_json` transport，
+预检依次向编排器与域 Agent 契约各发一条结构化请求，并把 provider、model、source revision、
+逐角色 token usage 与响应摘要写入 sealed `preflight.json`；同时记录每个角色实际使用的
+`tool_use` 或 `text_json` transport，
 不保存 API key 或原始认证信息。MiniMax Anthropic 兼容接口只支持 `tool_choice=auto/none`，
 因此两种 transport 都是合法观测，schema 校验失败仍直接形成无效证据。没有与 resolved study
 完全一致的预检回执，runner 不启动任何 paid slot。每个 slot result 为 create-only；
@@ -159,6 +165,21 @@ call、零 miss、无 fallback，并与 capture 在声明的 provenance 差异�
 放行，避免零延迟 replay 抢在 capture 网络等待期间的独立事件之前返回。只有 168/168 admitted
 且 72/72 replay equivalent 才能生成
 `scientific_gate=passed` 的 sealed results manifest。
+
+每个 admitted slot 还封存逐 Agent 的严格响应数、合规数与 `invalid_output` 数，以及域 Agent
+的原始命令、白名单候选命令和冻结目标字段命中计数。最终 manifest 的能力指标只聚合
+live/capture source slots：`schema_compliance` 按真实响应计数；
+`conditional_task_success` 只以整条 run 没有 schema failure 的 source slots 为分母；
+`live_only_success` 只使用 live slots。`raw_command_validity` 将被 Agent 白名单丢弃或被统一
+命令校验在规划快照上判为未知/离线设备、能力不可写、值类型/范围错误的原始命令记为无效；
+逐命令 assessment 与失败码随 execution plan 封存，因此动态取消、超时和仲裁落败既不冒充
+格式/命令非法，也不会因未到达 executor 被推断为有效。`frozen_target_command_match` 只判断模型主动针对冻结目标字段
+发出的值是否匹配当时的 base/intervention 契约，不把未发命令主观解释为“不合理”。这些诊断
+不修改场景 pass/fail，避免看过模型输出后移动 benchmark 终点。
+
+最终 manifest 的 `evaluation_outcomes`、`usage_totals`、`model_failure_reasons` 与
+`response_models` 只汇总 live/capture source evidence；replay 对应数据进入独立的
+`replay_diagnostics`。这既保留回放审计，也不让一份 capture 因三次 replay 获得四倍权重。
 
 模型已返回且产生 token usage、但结构化内容为 `invalid_output` 时，PR21 不允许规则策略
 代打，也不把它当作可重抽的基础设施故障。研究专用 wrapper 生成零命令 decision，事件流

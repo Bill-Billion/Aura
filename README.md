@@ -98,13 +98,13 @@ PR21 的 Option B 研究使用 8 个动态场景 × 3 个 seed，并为每个实
 
 ```bash
 python -m backend.experiments resolve-llm-substudy \
-  benchmarks/aurabench-m3-substudy/manifest.yaml --output output/aurabench-m3
+  benchmarks/aurabench-m3-substudy/manifest.yaml --output output/aurabench-m3-role-schema
 python -m backend.experiments preflight-llm-substudy \
-  output/aurabench-m3/resolved-substudy.json --output output/aurabench-m3
+  output/aurabench-m3-role-schema/resolved-substudy.json --output output/aurabench-m3-role-schema
 python -m backend.experiments run-llm-substudy \
-  output/aurabench-m3/resolved-substudy.json --output output/aurabench-m3
+  output/aurabench-m3-role-schema/resolved-substudy.json --output output/aurabench-m3-role-schema
 python -m backend.experiments summarize-llm-substudy \
-  output/aurabench-m3/resolved-substudy.json --output output/aurabench-m3
+  output/aurabench-m3-role-schema/resolved-substudy.json --output output/aurabench-m3-role-schema
 ```
 
 API key 只从服务端环境读取，不进入清单、预检回执或结果工件。当前研究使用 token plan，
@@ -114,9 +114,17 @@ API key 只从服务端环境读取，不进入清单、预检回执或结果工
 fallback；这类失败计入结果而不是被选择性排除。该子研究还把
 `https://api.minimaxi.com/anthropic` 冻结为唯一 endpoint；预检后更改 endpoint 会被拒绝，
 API key 与家居轨迹不会被发送到其他 Anthropic-compatible 服务。协议版本、输出上限、
-超时和 decision schema hash 也会冻结；token plan 使用只记账不拦截的成本策略，最终结果
+超时和角色化 decision schema bundle hash 也会冻结；token plan 使用只记账不拦截的成本策略，最终结果
 必须引用通过验证的 sealed preflight。provider 回包中的实际模型也会逐次核对并留证，
 因此“请求了 M3”不会被误写成“证明运行了 M3”。
+
+严格输出按角色冻结：`home_orchestrator` 使用不含设备命令的五字段 schema，域 Agent
+继续使用包含 `proposed_commands` 的六字段 schema；preflight 会分别真实验证两种契约。
+最终 manifest 单独报告真实响应的 schema 合规率、全部响应合规后的 source-run 任务成功率、
+Live-only 成功率，以及不改变 pass/fail 的原始命令合法性和冻结目标命中诊断。所有能力指标
+排除 replay，模型 outcome、token 与 failure 总量也只聚合 live/capture；离线重放单列在
+`replay_diagnostics`，避免把同一份 capture 的三次回放当成三次新的模型成功。原始命令会在
+规划快照上逐条经过 Agent 白名单和统一能力校验，未进入 executor 的命令不会再被推断为有效。
 
 ### Frontend
 

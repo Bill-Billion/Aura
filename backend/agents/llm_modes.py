@@ -81,7 +81,11 @@ from backend.agents.llm_pricing import (
 )
 from backend.agents.types import AgentCommandProposal, AgentLLMDecision, LLMDecisionRequest
 from backend.core.logging import log
-from backend.core.safe_io import read_bounded_regular_file
+from backend.core.safe_io import (
+    atomic_replace_private_file,
+    open_private_append,
+    read_bounded_regular_file,
+)
 from backend.engine.event_bus import SimEvent
 from backend.engine.event_log import (
     LLM_RECORDINGS_FILENAME,
@@ -176,8 +180,10 @@ MAX_LLM_RECORDING_MANIFEST_BYTES = 1024 * 1024
 # 的降级标签。刻意不静默改用 live：那等于研究者以为自己在录，实际什么都没留下。
 RECORDING_UNAVAILABLE_REASON = "recording_unavailable"
 
-RECORDING_SCHEMA = "aura.llm_recording.v2"
-_LEGACY_RECORDING_SCHEMA = "aura.llm_recording.v1"
+RECORDING_SCHEMA = "aura.llm_recording.v3"
+_LEGACY_RECORDING_SCHEMAS = frozenset(
+    {"aura.llm_recording.v1", "aura.llm_recording.v2"}
+)
 RECORDING_MISS_REASON = "recording_miss"
 RECORDING_CORRUPT_REASON = "recording_corrupt"
 MOCK_FIXTURE_MISS_REASON = "mock_fixture_miss"
@@ -382,14 +388,14 @@ class LLMRecording(BaseModel):
     @model_validator(mode="after")
     def validate_replay_schedule(self) -> "LLMRecording":
         schedule = (self.request_ordinal, self.started_request_count)
-        if self.schema_version == _LEGACY_RECORDING_SCHEMA:
-            if any(value is not None for value in schedule):
-                raise ValueError("v1 recording cannot declare v2 replay schedule fields")
-            return self
+        if self.schema_version in _LEGACY_RECORDING_SCHEMAS:
+            raise ValueError(
+                "recording predates the decision_role request contract; re-record it"
+            )
         if self.schema_version != RECORDING_SCHEMA:
             raise ValueError(f"unsupported LLM recording schema: {self.schema_version}")
         if any(value is None for value in schedule):
-            raise ValueError("v2 recording requires request_ordinal and started_request_count")
+            raise ValueError("v3 recording requires request_ordinal and started_request_count")
         assert self.request_ordinal is not None
         assert self.started_request_count is not None
         if self.started_request_count <= self.request_ordinal:
@@ -850,9 +856,8 @@ class RecordingLLMProvider(LLMProvider):
             decision=decision,
         )
         try:
-            self.recordings_path.parent.mkdir(parents=True, exist_ok=True)
-            with self.recordings_path.open("a", encoding="utf-8") as handle:
-                handle.write(record.to_json_line() + "\n")
+            with open_private_append(self.recordings_path) as handle:
+                handle.write((record.to_json_line() + "\n").encode("utf-8"))
                 handle.flush()
         except OSError as exc:
             # 录不下来就说话：一份缺行的录制会让 S4 的回放静默变成"部分 live"。
@@ -868,10 +873,15 @@ class RecordingLLMProvider(LLMProvider):
 
     def _write_manifest(self) -> None:
         manifest_path = recording_manifest_path(self.recordings_path)
-        temp_path = manifest_path.with_name(f".{manifest_path.name}.tmp")
         try:
-            manifest_path.parent.mkdir(parents=True, exist_ok=True)
-            raw = self.recordings_path.read_bytes() if self.recordings_path.is_file() else b""
+            raw = (
+                read_bounded_regular_file(
+                    self.recordings_path,
+                    max_bytes=MAX_LLM_RECORDING_BYTES,
+                )
+                if self.recordings_path.is_file()
+                else b""
+            )
             manifest = LLMRecordingManifest(
                 requested=self.requested,
                 recorded=self.written,
@@ -884,18 +894,17 @@ class RecordingLLMProvider(LLMProvider):
                 recording_sha256=hashlib.sha256(raw).hexdigest(),
                 last_error=self.last_error,
             )
-            temp_path.write_text(
+            encoded = (
                 json.dumps(
                     manifest.model_dump(mode="json", by_alias=True),
                     ensure_ascii=False,
                     indent=2,
                     sort_keys=True,
                 )
-                + "\n",
-                encoding="utf-8",
+                + "\n"
             )
-            temp_path.replace(manifest_path)
-        except OSError as exc:
+            atomic_replace_private_file(manifest_path, encoded.encode("utf-8"))
+        except (OSError, ValueError) as exc:
             log.error(
                 "llm_recording_manifest_write_failed",
                 path=str(manifest_path),

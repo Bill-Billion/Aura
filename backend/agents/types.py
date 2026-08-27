@@ -47,6 +47,22 @@ class AgentCommandProposal(BaseModel):
     reason: str = Field(default="", max_length=MAX_COMMAND_REASON_CHARS)
 
 
+class RawCommandAssessment(BaseModel):
+    command_index: int = Field(ge=0)
+    admitted_by_agent: bool
+    valid_at_plan_time: bool
+    failure_code: str | None = None
+
+    @model_validator(mode="after")
+    def validate_outcome(self) -> "RawCommandAssessment":
+        expected_valid = self.admitted_by_agent and self.failure_code is None
+        if self.valid_at_plan_time is not expected_valid:
+            raise ValueError("raw command assessment is internally inconsistent")
+        if not self.admitted_by_agent and self.failure_code != "agent_whitelist_rejected":
+            raise ValueError("non-admitted raw command must record whitelist rejection")
+        return self
+
+
 class AgentLLMDecision(BaseModel):
     intent: str = Field(max_length=MAX_INTENT_CHARS)
     confidence: float = Field(ge=0.0, le=1.0)
@@ -76,6 +92,7 @@ class AgentLLMDecision(BaseModel):
 
 
 class LLMDecisionRequest(BaseModel):
+    decision_role: Literal["domain_agent", "home_orchestrator"] = "domain_agent"
     agent_id: str = Field(max_length=MAX_AGENT_ID_CHARS)
     agent_name: str = Field(max_length=MAX_AGENT_NAME_CHARS)
     root_event_type: str = Field(max_length=MAX_EVENT_TYPE_CHARS)
@@ -115,6 +132,8 @@ class AgentDecisionEnvelope(BaseModel):
     needs_coordination: bool = False
     priority: PriorityLabel
     task_steps: list[str] = Field(default_factory=list)
+    raw_candidate_commands: list[AgentCommandProposal] = Field(default_factory=list)
+    raw_command_assessments: list[RawCommandAssessment] = Field(default_factory=list)
     candidate_commands: list[AgentCommandProposal] = Field(default_factory=list)
     root_event_id: str
     root_event_timestamp: float

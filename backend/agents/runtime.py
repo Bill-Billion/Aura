@@ -2593,7 +2593,6 @@ class AgentRuntime:
                 agent=agent,
                 reason=exc.reason,
                 error_message=str(exc),
-                raw_output_preview=exc.raw_output_preview,
             )
             return self._build_agent_fallback(
                 agent=agent,
@@ -2637,7 +2636,6 @@ class AgentRuntime:
         agent: BaseAgent,
         reason: str,
         error_message: str,
-        raw_output_preview: str | None = None,
     ) -> None:
         log.warning(
             "agent_episode_fallback",
@@ -2646,7 +2644,6 @@ class AgentRuntime:
             model=getattr(self.llm_provider, "model", ""),
             reason=reason,
             error=error_message,
-            raw_output_preview=raw_output_preview,
         )
 
     @staticmethod
@@ -2673,6 +2670,18 @@ class AgentRuntime:
             "task_steps": list(envelope.task_steps),
             "fallback_reason": envelope.fallback_reason,
             "provider_failure_reason": envelope.provider_failure_reason,
+            "raw_commands": [
+                command.model_dump(mode="json")
+                for command in envelope.raw_candidate_commands
+            ],
+            "candidate_commands": [
+                command.model_dump(mode="json")
+                for command in envelope.candidate_commands
+            ],
+            "raw_command_assessments": [
+                assessment.model_dump(mode="json")
+                for assessment in envelope.raw_command_assessments
+            ],
             "perception": {
                 "trigger_event_type": envelope.trigger_event_type,
                 "world_summary": envelope.world_summary,

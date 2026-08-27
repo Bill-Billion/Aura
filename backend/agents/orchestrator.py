@@ -51,7 +51,11 @@ from backend.agents.contracts import (
     TaskPlan,
     priority_rank,
 )
-from backend.agents.llm import LLMProvider, LLMProviderError
+from backend.agents.llm import (
+    LLMProvider,
+    LLMProviderError,
+    ORCHESTRATOR_DECISION_SCHEMA,
+)
 from backend.agents.llm_modes import (
     BUDGET_EXCEEDED_REASON,
     EPISODE_BUDGET_ENV,
@@ -143,23 +147,12 @@ ORCHESTRATOR_SYSTEM_PROMPT = (
     "Return strict JSON only."
 )
 
-ORCHESTRATOR_INTENT_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "required": ["intent", "domain", "confidence", "explanation"],
-    "properties": {
-        "intent": {"type": "string"},
-        "domain": {"type": "string", "enum": list(INTENT_DOMAINS)},
-        "confidence": {"type": "number"},
-        "explanation": {"type": "string"},
-    },
-}
-"""§8.3 意图分类那一小步的输出契约。
+ORCHESTRATOR_INTENT_SCHEMA = ORCHESTRATOR_DECISION_SCHEMA
+"""§8.3 command-free intent contract used by the real provider boundary.
 
-刻意**只有四个键**：编排器要的是"这是哪一类事件、有多确定"，不是设备命令。
-传输层今天仍复用 ``llm.py`` 的 :data:`~backend.agents.llm.AGENT_DECISION_SCHEMA`
-（provider 的 ``generate_decision`` 是唯一入口），本模块解析回来时按本 schema 收口：
-``proposed_commands`` **一律丢弃**——编排器发命令等于绕过域 agent 与仲裁。
+The alias is retained for callers of the orchestration module, while
+``backend.agents.llm`` remains the single source used to construct paid API
+requests.  The exact five fields deliberately exclude device commands.
 """
 
 
@@ -664,6 +657,7 @@ class HomeOrchestratorAgent:
     def _build_request(self, context: RootEventContext, rule: RuleIntent) -> LLMDecisionRequest:
         state = context.observable_state
         return LLMDecisionRequest(
+            decision_role="home_orchestrator",
             agent_id=self.orchestrator_id,
             agent_name=self.name,
             root_event_type=context.root_event.event_type,

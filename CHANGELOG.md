@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Role-specific MiniMax research contracts**: MiniMax-M3 子研究现在为 `home_orchestrator` 使用不含设备命令的五字段严格 schema，域 Agent 保留六字段命令 schema，并以单一 bundle hash 冻结；双角色 sealed preflight 会在完整运行前分别验证真实响应。canonical request 以显式 `decision_role` 路由，录制契约升级为 v3 并拒绝不兼容旧录制。slot evidence 与最终 manifest 新增按 Agent 的 schema 合规率、合规后任务成功率、Live-only 成功率、规划快照逐命令合法性和冻结目标命中诊断；模型结果/token/failure 只聚合 source evidence，replay 单列，且不进行输出修复或事后放宽场景目标。
 - **MiniMax-M3 live substudy gate**: 新增 Option B 的 24 实例/168 槽位冻结清单，以及 `resolve → sealed preflight → serial resumable run → sealed summarize` 工作流；每个实例固定执行 3 次 live、1 次 recorded capture 和 3 次零网络 replay，只有 exact provider/model/HTTPS endpoint/request contract、逐次实际响应模型、完整 token/recording 工件、无 fallback、sealed preflight 引用且 72 组回放等价全部成立时才通过科学门。token plan 使用 telemetry-only 成本策略，美元阈值不参与调用放行，估算成本仍随 run 留证，API key 只留在服务端环境。
 - **MiniMax structured decisions**: Anthropic-compatible MiniMax-M3 调用现在优先使用官方 `tools/input_schema` 的 `tool_use` 结构化输入，并保留 JSON 文本兼容路径；正式子研究使用不补字段、不丢命令的 exact-schema parser，slot 结果严格 create-only，无效证据不得原地重试。
 - **MiniMax live stability**: MiniMax 调用使用 45 秒 provider 超时下限，PR21 runner 的 episode 收尾窗口始终覆盖 provider 超时，避免把正常的长响应误记为模型 fallback。

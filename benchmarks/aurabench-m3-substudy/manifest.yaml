@@ -1,5 +1,5 @@
-substudy_schema_version: "1.0"
-study_id: aurabench_m3_live_substudy
+substudy_schema_version: "1.1"
+study_id: aurabench_m3_role_schema_substudy
 
 # Option B: eight dynamic AuraBench families crossed with three frozen seeds.
 scenarios:
@@ -20,7 +20,7 @@ anthropic_version: "2023-06-01"
 max_tokens: 1200
 timeout_ms: 45000
 strict_output: true
-decision_schema_sha256: e7dfb37fc03adf09eeeb3041099f6946a24f69b9b7d9687ee626807c1e784f3e
+decision_schema_sha256: ab6b2506cb16e0cccf5098ec0c07951eb5878d345bb868ff1ced5898392807e1
 topology: domain_multi
 governance: aura
 observation: stale_offline
