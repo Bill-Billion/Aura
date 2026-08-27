@@ -69,4 +69,6 @@ ScenarioSpec 2.x 冻结六类单因素干预：
 
 这个 pilot 只纳入当前 runtime 能真实执行和评价的因子。`observation_delay`、可执行的多居民冲突、偏好变化和跨根联合仲裁在相应运行语义完成前不进入矩阵，也不以 YAML 声明伪装成已有能力。
 
+主实验的 48 对设计目录冻结在 `benchmarks/aurabench-v1/catalog.yaml`：每个场景族 6 对，按 3 对 dev、1 对 validation、2 对 test 切分，并且每族恰好保留 1 对负对照。PR23 阶段的目录项全部是 `planned`，只通过来源与结构校验，不代表对应运行语义或场景 YAML 已完成。来源注册表与现实性审阅材料和目录一起做内容哈希绑定，避免场景实现后静默替换依据。
+
 扩张前还必须完成两名不同 reviewer 的独立复核。两人逐 pair 判断干预是否真实、oracle 是否合理、是否只有声明的差异，以及 TraceSpec 是否允许多种合理策略；任一分歧进入第三方 adjudication，原始复核工件不得覆盖。

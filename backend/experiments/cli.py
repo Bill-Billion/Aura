@@ -12,6 +12,7 @@ from typing import Sequence
 from .adapters import AuraCellExecutor
 from .analysis import AnalysisPlan, analyze_matrix_results, render_analysis_bundle
 from .artifacts import read_resolved_matrix, write_resolved_matrix
+from .benchmark_catalog import validate_benchmark_catalog
 from .pilot_bundle import validate_pilot_bundle
 from .pilot_freeze import (
     validate_pilot_freeze,
@@ -74,6 +75,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     validate_pilot.add_argument("manifest", type=Path)
     validate_pilot.add_argument("--require-approved", action="store_true")
+
+    validate_catalog = commands.add_parser(
+        "validate-catalog",
+        help="validate the evidence-backed AuraBench-v1 design catalog",
+    )
+    validate_catalog.add_argument("catalog", type=Path)
 
     inventory = commands.add_parser(
         "inventory-pilot", help="seal the raw evidence for a completed pilot"
@@ -231,6 +238,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             payload = validate_pilot_bundle(args.manifest)
             if args.require_approved and payload["gate_status"] != "approved":
                 raise ValueError("pilot human-review gate is not approved")
+        elif args.command == "validate-catalog":
+            payload = validate_benchmark_catalog(args.catalog)
         elif args.command == "inventory-pilot":
             path = write_pilot_run_inventory(
                 resolved_matrix=args.resolved_matrix,
