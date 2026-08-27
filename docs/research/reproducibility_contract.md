@@ -42,7 +42,33 @@ run 继续使用 sealed `run.json`、`events.jsonl` 和既有完整性校验。�
 
 pilot 根目录还必须提交 `manifest.json`。manifest 冻结 matrix contract hash、seed、每个 static/dynamic 场景 contract hash、pair fingerprint、`pair_set_hash`，以及 human-review 协议和状态工件的内容 hash。验证器重新加载 YAML 和设备注册表计算这些值，并要求 matrix 的 scenario/seed 轴与 manifest 完全一致；任一漂移都 fail closed。
 
-人审工件同时绑定 `pair_set_hash` 和 sealed run 的 `source_revision`。PR16 的初始状态必须明确为两个未分配 reviewer slot 和 `pending`，不得填写虚构身份或日期；验证器在密封 run 绑定于 PR20 落地前拒绝任何人工填写的终态。此后只有两个不同 reviewer 对同一 revision 提交覆盖全部 pair 的不可变工件，gate 才能转为 `approved`；分歧必须保留原工件并进入单独 adjudication。
+人审工件同时绑定 `pair_set_hash`、resolved matrix hash、results manifest seal、run inventory seal 和 sealed run 的 `source_revision`。运行前状态必须明确为两个未分配 reviewer slot 和 `pending`，不得填写虚构身份或日期。运行完成后，逐 cell inventory 重新验证 result seal、`run.json` hash 和 finalized event-log seal；只有两个不同 reviewer 对同一批证据提交覆盖全部 pair 的不可变工件，最终 freeze gate 才能转为 `approved`。分歧必须保留原工件并进入单独 adjudication。
+
+PR20 的封存顺序固定为：
+
+```bash
+python -m backend.experiments inventory-pilot \
+  --resolved-matrix <experiment-root>/resolved-matrix.json \
+  --result-root <experiment-root> \
+  --benchmark-manifest benchmarks/aurabench-dev/manifest.json \
+  --results-manifest <analysis-dir>/results-manifest.json \
+  --output benchmarks/aurabench-dev/freeze/run-inventory.json
+
+python -m backend.experiments freeze-pilot \
+  --bundle-root benchmarks/aurabench-dev \
+  --result-root <experiment-root> \
+  --benchmark-manifest benchmarks/aurabench-dev/manifest.json \
+  --resolved-matrix benchmarks/aurabench-dev/freeze/resolved-matrix.json \
+  --results-manifest benchmarks/aurabench-dev/freeze/results-manifest.json \
+  --run-inventory benchmarks/aurabench-dev/freeze/run-inventory.json \
+  --review benchmarks/aurabench-dev/reviews/<reviewer-1>.json \
+  --review benchmarks/aurabench-dev/reviews/<reviewer-2>.json \
+  --output benchmarks/aurabench-dev/freeze.json
+
+python -m backend.experiments validate-freeze \
+  benchmarks/aurabench-dev/freeze.json \
+  --result-root <experiment-root> --require-approved
+```
 
 旧 ScenarioSpec 1.x 与历史工件必须继续可加载和重评；2.x 采用新增字段和新 major，不原地迁移或改写 v1 文件。未知 major 必须 fail closed。
 

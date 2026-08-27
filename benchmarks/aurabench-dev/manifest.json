@@ -133,7 +133,7 @@
   "human_review": {
     "protocol": {
       "reference": "human-review-protocol.md",
-      "sha256": "c70650ec78e88188aa380b5d11b4cfc4385bdc52954793f5488424a1676502c4"
+      "sha256": "5af7da3d6ddfe3cb0b04db534d1c4f7fd16206bba78a067cfc0065e0a29d97f6"
     },
     "status": {
       "reference": "reviews/status.json",
