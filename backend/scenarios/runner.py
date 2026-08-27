@@ -164,12 +164,15 @@ class ScenarioRunner:
         tick_interval: float | None = None,
         episode_timeout_ms: int | None = None,
         episode_settle_timeout_s: float = EPISODE_SETTLE_TIMEOUT_S,
+        allow_unobserved_perturbation_anchor: bool = False,
         stochastic_overrides: dict[str, Any] | None = None,
         seed: int | None = None,
         baseline_policy: BaselinePolicy | None = None,
+        recording_source_run_id: str | None = None,
         experiment: ExperimentProvenance | None = None,
         experiment_runtime: ExperimentRuntimeSelection | None = None,
         run_artifacts_root: Path | str | None = None,
+        enforce_llm_budget: bool = True,
     ) -> None:
         self.spec = spec
         self.seed = validate_seed(spec.seed if seed is None else seed)
@@ -181,6 +184,9 @@ class ScenarioRunner:
         ):
             raise ValueError("episode_settle_timeout_s 必须是有限正数")
         self.episode_settle_timeout_s = float(episode_settle_timeout_s)
+        self.allow_unobserved_perturbation_anchor = bool(
+            allow_unobserved_perturbation_anchor
+        )
         self.stochastic_overrides = stochastic_overrides
         if experiment is not None:
             if experiment_runtime is None:
@@ -193,6 +199,7 @@ class ScenarioRunner:
         elif experiment_runtime is not None:
             raise ValueError("runtime experiment condition requires provenance")
         self.baseline_policy = baseline_policy
+        self.recording_source_run_id = recording_source_run_id
         self.experiment = experiment
         self.experiment_runtime = experiment_runtime
         self._collected: list[SimEvent] = []
@@ -209,6 +216,7 @@ class ScenarioRunner:
             llm_provider=llm_provider or _DisabledProvider(),
             agent_episode_timeout_ms=episode_timeout_ms,
             run_artifacts_root=run_artifacts_root,
+            enforce_llm_budget=enforce_llm_budget,
         )
         if tick_interval is not None:
             self.engine.timer.tick_interval = float(tick_interval)
@@ -256,7 +264,10 @@ class ScenarioRunner:
         # 并装上 §4.5 三条产线——装配只有那一处，活着的服务端与本 runner 共用它
         # （S2 review major-1/major-2）。
         policy_selection = (
-            engine.agent_runtime.prepare_baseline_policy(self.baseline_policy)
+            engine.agent_runtime.prepare_baseline_policy(
+                self.baseline_policy,
+                recording_source_run_id=self.recording_source_run_id,
+            )
             if self.baseline_policy is not None
             else None
         )
@@ -314,15 +325,24 @@ class ScenarioRunner:
             try:
                 await engine.finalize_perturbation_phase()
             except PerturbationPhaseError as exc:
-                raise ScenarioRunError(
-                    ScenarioRunErrorCode.PERTURBATION_PHASE_INVALID,
-                    str(exc),
-                    details={
-                        "scenario_id": exc.scenario_id,
-                        "reason": exc.reason,
-                        **exc.details,
-                    },
-                ) from exc
+                if not (
+                    self.allow_unobserved_perturbation_anchor
+                    and exc.reason == "anchor_not_observed"
+                ):
+                    raise ScenarioRunError(
+                        ScenarioRunErrorCode.PERTURBATION_PHASE_INVALID,
+                        str(exc),
+                        details={
+                            "scenario_id": exc.scenario_id,
+                            "reason": exc.reason,
+                            **exc.details,
+                        },
+                    ) from exc
+                log.info(
+                    "scenario_perturbation_anchor_unobserved_as_outcome",
+                    scenario_id=exc.scenario_id,
+                    reason=exc.reason,
+                )
             await engine.command_executor.cancel_pending(
                 "scenario_horizon_reached",
                 tick=engine.timer.current_tick,

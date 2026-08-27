@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Role-specific MiniMax research contracts**: MiniMax-M3 子研究现在为 `home_orchestrator` 使用不含设备命令的五字段严格 schema，域 Agent 保留六字段命令 schema，并以单一 bundle hash 冻结；双角色 sealed preflight 会在完整运行前分别验证真实响应。canonical request 以显式 `decision_role` 路由，录制契约升级为 v3 并拒绝不兼容旧录制。slot evidence 与最终 manifest 新增按 Agent 的 schema 合规率、合规后任务成功率、Live-only 成功率、规划快照逐命令合法性和冻结目标命中诊断；模型结果/token/failure 只聚合 source evidence，replay 单列，且不进行输出修复或事后放宽场景目标。
+- **MiniMax-M3 live substudy gate**: 新增 Option B 的 24 实例/168 槽位冻结清单，以及 `resolve → sealed preflight → serial resumable run → sealed summarize` 工作流；每个实例固定执行 3 次 live、1 次 recorded capture 和 3 次零网络 replay，只有 exact provider/model/HTTPS endpoint/request contract、逐次实际响应模型、完整 token/recording 工件、无 fallback、sealed preflight 引用且 72 组回放等价全部成立时才通过科学门。token plan 使用 telemetry-only 成本策略，美元阈值不参与调用放行，估算成本仍随 run 留证，API key 只留在服务端环境。
+- **MiniMax structured decisions**: Anthropic-compatible MiniMax-M3 调用现在优先使用官方 `tools/input_schema` 的 `tool_use` 结构化输入，并保留 JSON 文本兼容路径；正式子研究使用不补字段、不丢命令的 exact-schema parser，slot 结果严格 create-only，无效证据不得原地重试。
+- **MiniMax live stability**: MiniMax 调用使用 45 秒 provider 超时下限，PR21 runner 的 episode 收尾窗口始终覆盖 provider 超时，避免把正常的长响应误记为模型 fallback。
+- **Unobserved action anchors**: PR21 动态子研究把模型未产生 action anchor 明确计为评价失败并保留完整 phase-violation 证据；注入器或时序本身的错误仍 fail closed，避免选择性排除“不行动”的模型结果。
+- **Strict invalid-output evidence**: PR21 中已计费但无法解析的模型输出不再触发规则策略代打，也不靠换目录重抽来消失；仅该研究执行器将其转成带 `reasoning.provider_failure_noop` 的零动作失败样本，slot/results manifest 汇总 `model_failure_reasons`。超时、HTTP/凭证、预算和录制错误仍是无效证据，产品运行时的默认 fallback 语义不变。
 - **Pilot benchmark freeze**: 新增逐 cell 的 raw-evidence inventory 和双人复核封存门；最终 freeze 同时绑定 resolved matrix、results manifest、result seal、`run.json` hash、finalized event-log seal 与 source revision，且 reviewer 身份重复、pair 覆盖不全或证据漂移都会 fail closed。
 - **Independent observation treatments**: AuraBench 现在把 `perfect / stale_offline` 与 Agent topology/governance 解耦；每个 episode 在规划前封存同一份 world/root-event 观察帧及内容 hash，首次离线设备显式标为 unavailable 而不复制物理真值，96-cell pilot 通过独立观察配对、公平性和统计分析契约比较两种条件。
 - **AuraBench runtime baselines**: 新增 `single_direct / no_arbiter / flat_priority / aura` 四种 fail-closed 研究配置；运行时会真实切换 Agent topology 与 proposal resolver，仍共用同一 CommandExecutor、设备校验和 evaluator，并在全矩阵汇总时拒绝缺边或固定 provenance 漂移的比较组。
@@ -30,6 +36,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Dynamic recorded replay**: 多阶段动态场景的短期记忆不再把 capture/replay transport provider、运行期 `*_event_id` 与 provenance-sensitive evidence hash 写回下一轮 LLM prompt；v2 录制同时保存请求进入序号、每次响应完成时的已进入请求数与 provider 完成顺序，回放用水位屏障复现真实网络等待期间的并发事件交错；显式 source run ID 和 provider role 只在 PR21 的回放等价投影中规范化，原始事件仍完整保留审计差异。capture/replay 行为评价仍逐项一致，只排除离线回放按设计不会复现的 `first_action_latency_ms` 传输耗时。
 - **Rule-based isolation**: 显式 `rule_based` 即使服务器配置了真实 LLM key 也不会构造 live provider，消除基线静默打网和计费风险。
 - **Run/report race boundaries**: active canonical run 不再被第二个启动静默 supersede；旧 finalizer 不能结束新 run；raw/canonical trace 不再读取仍在追加的事件文件。
 - **Experiment isolation**: canonical run 期间拒绝会改写世界或时钟的交互命令；交互 mutation 与场景启动共用原子边界，事件 recorder 也拒绝跨 run 追加。

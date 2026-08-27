@@ -31,10 +31,12 @@ from backend.agents.types import (
     AgentLLMDecision,
     LLMDecisionRequest,
     PriorityLabel,
+    RawCommandAssessment,
 )
 from backend.engine.event_bus import SimEvent
 from backend.engine.event_types import ALL_ROOT_EVENT_TYPES, ENVIRONMENT_ROOT_EVENT_TYPES
 from backend.engine.state import DeviceState, WorldState
+from backend.execution.validation import validate_command
 
 
 class ProposalReview(BaseModel):
@@ -509,10 +511,25 @@ class BaseAgent(ABC):
                 )
             )
             latency_ms = int((time.monotonic() - started_at) * 1000)
+            provider_failure_reason = llm_decision.provider_failure_reason
+            raw_commands = (
+                []
+                if provider_failure_reason
+                else list(llm_decision.proposed_commands)
+            )
+            candidate_commands = (
+                []
+                if provider_failure_reason
+                else self._filter_commands(llm_decision, allowed_commands)
+            )
             return AgentDecisionEnvelope(
                 agent_id=self.agent_id,
                 agent_name=self.name,
-                mode="llm",
+                mode=(
+                    "provider_failure_noop"
+                    if provider_failure_reason
+                    else "llm"
+                ),
                 trigger_event_type=root_event.event_type,
                 intent=llm_decision.intent,
                 confidence=llm_decision.confidence,
@@ -520,10 +537,17 @@ class BaseAgent(ABC):
                 needs_coordination=llm_decision.needs_coordination,
                 priority=self.determine_priority(world_state, root_event),
                 task_steps=llm_decision.task_steps,
-                candidate_commands=self._filter_commands(
-                    llm_decision,
-                    allowed_commands,
+                raw_candidate_commands=raw_commands,
+                raw_command_assessments=(
+                    []
+                    if provider_failure_reason
+                    else self._assess_raw_commands(
+                        llm_decision,
+                        allowed_commands,
+                        world_state,
+                    )
                 ),
+                candidate_commands=candidate_commands,
                 root_event_id=root_event.event_id,
                 root_event_timestamp=root_event.timestamp,
                 provider_name=getattr(llm_provider, "provider_name", "llm"),
@@ -532,6 +556,8 @@ class BaseAgent(ABC):
                 world_summary=world_summary,
                 relevant_devices=[device.id for device in relevant_devices],
                 relevant_rooms=relevant_rooms,
+                provider_failure_reason=provider_failure_reason,
+                failed_step=("intent_generation" if provider_failure_reason else None),
             )
         except LLMProviderError as exc:
             return self._build_fallback_envelope(
@@ -619,3 +645,38 @@ class BaseAgent(ABC):
             for command in decision.proposed_commands
             if (command.device_id, command.property) in allowed
         ]
+
+    @staticmethod
+    def _assess_raw_commands(
+        decision: AgentLLMDecision,
+        allowed_commands: list[dict[str, Any]],
+        world_state: WorldState,
+    ) -> list[RawCommandAssessment]:
+        """Seal objective command validity against the planning snapshot."""
+
+        allowed = {
+            (spec["device_id"], spec["property"])
+            for spec in allowed_commands
+        }
+        assessments: list[RawCommandAssessment] = []
+        for index, command in enumerate(decision.proposed_commands):
+            admitted = (command.device_id, command.property) in allowed
+            if not admitted:
+                failure_code = "agent_whitelist_rejected"
+            else:
+                failure = validate_command(
+                    world_state,
+                    command.device_id,
+                    command.property.removeprefix("extra."),
+                    command.value,
+                )
+                failure_code = failure.code.value if failure is not None else None
+            assessments.append(
+                RawCommandAssessment(
+                    command_index=index,
+                    admitted_by_agent=admitted,
+                    valid_at_plan_time=admitted and failure_code is None,
+                    failure_code=failure_code,
+                )
+            )
+        return assessments

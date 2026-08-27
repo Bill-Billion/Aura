@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from backend.core.logging import log
+from backend.core.safe_io import read_bounded_regular_file
 from backend.engine.event_bus import SimEvent
 from backend.engine.run_manager import EventLogIntegrity, RunMetadata, canonical_json
 
@@ -57,6 +58,9 @@ RUN_METADATA_FILENAME = "run.json"
 # "同一个 run 目录下有哪些工件" 这件事只有一处说法。
 LLM_RECORDINGS_FILENAME = "llm_recordings.jsonl"
 LLM_RECORDINGS_MANIFEST_FILENAME = "llm_recordings.manifest.json"
+MAX_RUN_METADATA_BYTES = 4 * 1024 * 1024
+MAX_EVENT_LOG_BYTES = 256 * 1024 * 1024
+MAX_EVENT_LOG_EVENTS = 1_000_000
 
 # 仓库根锚定的绝对路径：uvicorn 的工作目录随启动方式漂移，用相对路径会让同一台机器上
 # 的两次启动把工件写进两个地方。
@@ -184,6 +188,7 @@ def _write_json_durable(path: Path, payload: Mapping[str, Any]) -> None:
     ) + "\n"
     try:
         with temp_path.open("w", encoding="utf-8", newline="\n") as handle:
+            os.chmod(temp_path, 0o600)
             handle.write(serialized)
             handle.flush()
             os.fsync(handle.fileno())
@@ -213,11 +218,13 @@ class EventLogWriter:
     ) -> None:
         self.metadata = metadata
         self.directory = run_dir(metadata.run_id, root=root)
-        self.directory.mkdir(parents=True, exist_ok=True)
+        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.directory, 0o700)
         self.events_path = self.directory / EVENTS_FILENAME
         self.metadata_path = self.directory / RUN_METADATA_FILENAME
         # 行缓冲：读侧（/api/runs/{id}/events）可能在 run 还没结束时就来读。
         self._handle = self.events_path.open("a", encoding="utf-8", buffering=1)
+        os.chmod(self.events_path, 0o600)
         self._expected_seq = int(start_seq)
         self._buffer: dict[int, str] = {}
         self._written = 0
@@ -533,8 +540,15 @@ def read_run_metadata(run_id: str, *, root: Path | str | None = None) -> dict[st
             path=path,
         )
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        payload = read_bounded_regular_file(
+            path,
+            max_bytes=MAX_RUN_METADATA_BYTES,
+        )
+        metadata = json.loads(payload.decode("utf-8"))
+        if not isinstance(metadata, dict):
+            raise ValueError("run metadata must be a JSON object")
+        return metadata
+    except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
         raise RunArtifactError(
             RunArtifactErrorCode.corrupt_run_metadata,
             f"run {run_id!r} 的 {RUN_METADATA_FILENAME} 无法解析: {exc}",
@@ -565,8 +579,11 @@ def _inspect_event_log(
             details={"reason": "events_file_missing"},
         )
     try:
-        payload = path.read_bytes()
-    except OSError as exc:
+        payload = read_bounded_regular_file(
+            path,
+            max_bytes=MAX_EVENT_LOG_BYTES,
+        )
+    except (OSError, ValueError) as exc:
         raise RunArtifactError(
             RunArtifactErrorCode.corrupt_event_log,
             f"run {run_id!r} 的 {EVENTS_FILENAME} 无法读取: {exc}",
@@ -585,8 +602,17 @@ def _inspect_event_log(
             details={"reason": "events_file_not_utf8", "error": str(exc)},
         ) from exc
 
+    lines = text.splitlines()
+    if len(lines) > MAX_EVENT_LOG_EVENTS:
+        raise RunArtifactError(
+            RunArtifactErrorCode.corrupt_event_log,
+            f"run {run_id!r} 的 {EVENTS_FILENAME} 事件数超过上限",
+            run_id=run_id,
+            path=path,
+            details={"reason": "event_count_limit_exceeded"},
+        )
     events: list[dict[str, Any]] = []
-    for line_number, raw in enumerate(text.splitlines(), start=1):
+    for line_number, raw in enumerate(lines, start=1):
         stripped = raw.strip()
         if not stripped:
             continue

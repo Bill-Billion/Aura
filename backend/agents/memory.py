@@ -111,9 +111,6 @@ class AgentMemoryStore:
                 f" governance={str(event.data.get('governance') or '-')[:64]}"
                 f" outcomes={','.join(outcomes) or '-'}"
                 f" observable_hash={str(event.data.get('observable_snapshot_hash') or '-')[:64]}"
-                f" proposal_hash={str(event.data.get('proposal_set_hash') or '-')[:64]}"
-                f" approved_hash={str(event.data.get('approved_command_set_hash') or '-')[:64]}"
-                f" rejected_hash={str(event.data.get('rejected_command_set_hash') or '-')[:64]}"
             )
 
         return f"{event.event_type}: {AgentMemoryStore._stable_event_data(event.data)}"
@@ -126,15 +123,19 @@ class AgentMemoryStore:
             return {
                 str(key): AgentMemoryStore._stable_event_data(item)
                 for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
-                if key
+                if str(key)
                 not in {
                     "event_id",
-                    "trigger_event_id",
-                    "caused_by_event_id",
                     "correlation_id",
                     "causal_parent",
                     "run_id",
+                    # Audit transport labels differ deliberately between a
+                    # capture and its offline replay. They are not decision
+                    # context and must not perturb the next replay request key.
+                    "provider",
+                    "latency_ms",
                 }
+                and not str(key).endswith("_event_id")
             }
         if isinstance(value, (list, tuple)):
             return [AgentMemoryStore._stable_event_data(item) for item in value]

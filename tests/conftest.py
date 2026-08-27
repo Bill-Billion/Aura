@@ -1,6 +1,12 @@
-import pytest
+import os
 
+import pytest
 from backend.engine.event_log import configure_runs_root
+
+# Test collection must never inherit the repository's paid-LLM opt-in from
+# .env.local.  Individual access-control tests may still opt in explicitly via
+# monkeypatch after collection, but the default runtime must match keyless CI.
+os.environ["AURA_ALLOW_LIVE_LLM"] = "0"
 
 
 @pytest.fixture

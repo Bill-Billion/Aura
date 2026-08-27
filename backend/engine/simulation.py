@@ -139,6 +139,7 @@ class SimulationEngine:
         llm_provider: LLMProvider | None = None,
         agent_episode_timeout_ms: int | None = None,
         run_artifacts_root: Path | str | None = None,
+        enforce_llm_budget: bool = True,
     ) -> None:
         self.event_bus = event_bus
         self.state_manager = state_manager
@@ -196,6 +197,8 @@ class SimulationEngine:
             llm_provider=llm_provider,
             episode_timeout_ms=agent_episode_timeout_ms,
             command_executor=self.command_executor,
+            run_artifacts_root=run_artifacts_root,
+            enforce_llm_budget=enforce_llm_budget,
         )
         # §8.2 五个域 agent；"注册了谁、什么顺序"的唯一真相在 runtime.DEFAULT_AGENT_FACTORIES
         # ——顺序同时决定 TaskPlan.domain_tasks 序与 canonical trace 行序（S2-T9 门）。
@@ -349,6 +352,11 @@ class SimulationEngine:
             agent_versions=agent_versions,
             run_id=assigned_run_id,
             clear_event_history=clear_event_history,
+            llm_cost_policy=(
+                "enforced"
+                if self.agent_runtime.cost_guard.enforce_budget
+                else "telemetry_only"
+            ),
         )
 
     @property
@@ -500,14 +508,16 @@ class SimulationEngine:
                 raise ValueError(
                     "experiment provenance requires an activated runtime condition"
                 )
-            if policy_selection.baseline_policy is BaselinePolicy.RULE_BASED:
-                experiment_model = "rule_based"
-            elif policy_selection.baseline_policy is BaselinePolicy.LLM_MOCKED:
-                experiment_model = "mocked"
-            else:
-                raise ValueError(
-                    "experiment provenance only supports rule_based or mocked runtime"
-                )
+            experiment_model = {
+                BaselinePolicy.RULE_BASED: "rule_based",
+                BaselinePolicy.LLM_MOCKED: "mocked",
+                BaselinePolicy.LLM_LIVE: "live",
+                BaselinePolicy.LLM_RECORDED: (
+                    "replay"
+                    if policy_selection.recording_source_run_id is not None
+                    else "recorded"
+                ),
+            }[policy_selection.baseline_policy]
             if experiment_runtime.model != experiment_model:
                 raise ValueError("runtime model does not match the selected baseline policy")
             if experiment_runtime.baseline_policy is not policy_selection.baseline_policy:
